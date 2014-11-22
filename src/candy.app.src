@@ -1,0 +1,8 @@
+{application, candy,
+ [{description, "CAN frame viewer"},
+  {vsn, git},
+  {registered, []},
+  {mod,{can_app,[]}},
+  {env, []},
+  {applications,[kernel,stdlib,can,epx]}
+  ]}.
