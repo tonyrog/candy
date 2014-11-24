@@ -31,10 +31,15 @@ The easiest way to start candy is:
 
     erl -s candy
 
-This will create a window and show blank window in cyan background. 
+This will show a blank window with a cyan background.
 candy initialize the can_udp backend by default. In the shell you
 may add other can backends at will.
 
 example:
 
     > can_usb:start(1, [{device, "/dev/ttyUSB0"},{bitrate, 125000}]).
+
+send some can frames:
+
+    > can:send(123, <<1,2,3,4,5,6,7,8>>).
+    > can:send(123, true, false, <<1:32, 2:32>>).
