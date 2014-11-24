@@ -1,6 +1,21 @@
+%%%---- BEGIN COPYRIGHT -------------------------------------------------------
+%%%
+%%% Copyright (C) 2007 - 2014, Rogvall Invest AB, <tony@rogvall.se>
+%%%
+%%% This software is licensed as described in the file COPYRIGHT, which
+%%% you should have received as part of this distribution. The terms
+%%% are also available at http://www.rogvall.se/docs/copyright.txt.
+%%%
+%%% You may opt to use, copy, modify, merge, publish, distribute and/or sell
+%%% copies of the Software, and permit persons to whom the Software is
+%%% furnished to do so, under the terms of the COPYRIGHT file.
+%%%
+%%% This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+%%% KIND, either express or implied.
+%%%
+%%%---- END COPYRIGHT ---------------------------------------------------------
 %%%-------------------------------------------------------------------
 %%% @author Tony Rogvall <tony@rogvall.se>
-%%% @copyright (C) 2014, Tony Rogvall
 %%% @doc
 %%%    CAN frame viewer
 %%% @end
@@ -69,7 +84,7 @@
 	  nrows = 32 :: integer(),     %% number or rows shown
 	  window :: epx:epx_window(),  %% attached window
 	  font   :: epx:epx_font(),
-	  foreground_pixels :: epx:epx_pixmap(),
+	  %% foreground_pixels :: epx:epx_pixmap(),
 	  background_pixels :: epx:epx_pixmap(),
 	  frame,          %% ets: #can_frame{}
 	  frame_layout,   %% ets: #layout{}
@@ -150,8 +165,8 @@ init([]) ->
 	S0#state.right_offset,
     Window = epx:window_create(40, 40, Width, Height,
 			       [button_press,button_release]),
-    Fg = epx:pixmap_create(Width, Height, Format),
-    epx:pixmap_fill(Fg, BgColor),
+    %% Fg = epx:pixmap_create(Width, Height, Format),
+    %% epx:pixmap_fill(Fg, BgColor),
     Bg = epx:pixmap_create(Width, Height, Format),
     epx:pixmap_fill(Bg, BgColor),
     epx:window_attach(Window),
@@ -165,7 +180,7 @@ init([]) ->
 	   glyph_height = H,
 	   glyph_ascent = epx:font_info(Font, ascent),
 	   background_color = BgColor,
-	   foreground_pixels = Fg,
+	   %% foreground_pixels = Fg,
 	   background_pixels = Bg,
 	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
 	   frame_counter = ets:new(frame_counter, []),
@@ -373,7 +388,7 @@ position_layout(Layout, State) ->
     Y = State#state.top_offset + 
 	Layout#layout.pos*(State#state.row_height+State#state.row_pad),
     X = State#state.left_offset,
-    {X1,Y1,Format} = position_format(X, Y, Layout#layout.format, [], State),
+    {X1,_Y1,Format} = position_format(X, Y, Layout#layout.format, [], State),
     Width = (X1-X-2)+1,
     Height = State#state.row_height,
     Layout#layout { x=X, y=Y, width=Width, height=Height,
@@ -458,11 +473,14 @@ pow_(A, B, Prod)  ->
     end.
 
 
-%% frame layout:
-%% Bits:    {P,L}    P is bit number, L is number of bits
-%% Group:   {Base,Signed,[<Bits>]}   Base = 2,10,16, Sign = boolean()
-%% Frame:   [<Group>]
+%% collect_bits
+%% picks collects bits in the order given from 
+%% a list of [{P,L}], with the position P with length L.
+%%
+%% example read reversed 32 bits in groups of 8
+%% [{24,8},{16,8},{8,8},{0,8}]
 %% 
+
 collect_bits(Bits, Data) when is_bitstring(Data) ->
     collect_bits(Bits, Data, <<>>).
 
@@ -535,7 +553,7 @@ layout_from_position(X, Y, State) ->
     Key = ets:first(Tab),
     layout_from_position_(X, Y, Tab, Key).
 
-layout_from_position_(X, Y, Tab, '$end_of_table') ->
+layout_from_position_(_X, _Y, _Tab, '$end_of_table') ->
     false;
 layout_from_position_(X, Y, Tab, FID) ->
     case ets:lookup(Tab, FID) of
