@@ -234,7 +234,7 @@ handle_cast(_Msg, State) ->
 %%--------------------------------------------------------------------
 handle_info({epx_event, Win, close}, State) 
   when Win =:= State#state.window ->
-    io:format("Got window close\n", []),
+    %% io:format("Got window close\n", []),
     {stop, normal, State};
 handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State) 
   when Win =:= State#state.window ->
@@ -248,7 +248,9 @@ handle_info(Frame=#can_frame{id=FID}, State) ->
     case ets:lookup(State#state.frame, FID) of
 	[Frame] -> %% no change
 	    ok;
-	[_Frame0] ->
+	[Frame0] ->
+	    Diff = diff_frames(FID,Frame,Frame0,State),
+	    io:format("frame diff = ~w\n", [Diff]),
 	    %% fixme: create a new change map for animation
 	    ets:insert(State#state.frame, Frame);
 	[] ->
@@ -306,6 +308,22 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+diff_frames(FID,New, Old, State) ->
+    [#layout{format=Format}] = ets:lookup(State#state.frame_layout, FID),
+    diff_frames_(Format, New, Old).
+
+diff_frames_([Fmt|Fs],New,Old) ->
+    BitsDataNew = get_bits(Fmt,New),
+    BitsDataOld = get_bits(Fmt,Old),
+    if BitsDataNew =:= BitsDataOld ->
+	    [false | diff_frames_(Fs, New, Old)];
+       true ->
+	    [true | diff_frames_(Fs, New, Old)]
+    end;
+diff_frames_([], _New, _Old) ->
+    [].
+    
+
 redraw(FID, State) ->
     redraw(FID, State, 0).
 
@@ -321,12 +339,7 @@ redraw(FID, State, MinW) ->
     update_window(State, {X,Y,max(W,MinW),H}).
 
 redraw_frame([Fmt=#fmt {x=X,y=Y,width=W,height=H,bits=Bits}|Fs],Frame,State) ->
-    Data = case Fmt#fmt.field of
-	       data -> extend_bits(Frame#can_frame.data, 64);
-	       id   -> <<(Frame#can_frame.id):32>>;
-	       len  -> <<(Frame#can_frame.len):4>>
-	   end,
-    BitsData = collect_bits(Bits, Data),
+    BitsData = get_bits(Fmt, Frame),
     epx_gc:set_fill_style(none),
     epx_gc:set_foreground_color(black),
     epx:draw_rectangle(State#state.background_pixels, {X,Y,W,H}),
@@ -365,6 +378,15 @@ redraw_frame([Fmt=#fmt {x=X,y=Y,width=W,height=H,bits=Bits}|Fs],Frame,State) ->
     redraw_frame(Fs,Frame,State);
 redraw_frame([],_Frame,_State) ->
     ok.
+
+get_bits(Fmt, Frame) ->
+    Data = case Fmt#fmt.field of
+	       data -> extend_bits(Frame#can_frame.data, 64);
+	       id   -> <<(Frame#can_frame.id):32>>;
+	       len  -> <<(Frame#can_frame.len):4>>
+	   end,
+    collect_bits(Fmt#fmt.bits, Data).
+
 
 extend_bits(Data, MinSize) when bit_size(Data) >= MinSize ->
     Data;
