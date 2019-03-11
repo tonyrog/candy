@@ -26,8 +26,8 @@
 -behaviour(gen_server).
 
 %% API
--export([start/0]).
--export([start_link/0]).
+-export([start/0, start/1]).
+-export([start_link/0, start_link/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -39,77 +39,74 @@
 
 -compile(export_all).
 
+-define(FONT_SIZE, 14).
+-define(BACKGROUND_COLOR,        {0,255,255}).     %% cyan
+-define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
+-define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
+-define(TEXT_COLOR,              {0,0,0,0}).       %% black text
+
 -record(fmt,
 	{
-	  x :: non_neg_integer(),
-	  y :: non_neg_integer(),
-	  width :: non_neg_integer(),
-	  height :: non_neg_integer(),
-	  hidden = false :: boolean(),
-	  type = unsigned :: unsigned | signed | {enum,tuple()},
-	  field = none,
-	  base = 16 :: 2 | 8 | 16 | 10,
-	  signed = false :: boolean(),
-	  bits = [] :: [{Pos::non_neg_integer(),Length::non_neg_integer()}]
+	 x :: non_neg_integer(),
+	 y :: non_neg_integer(),
+	 width :: non_neg_integer(),
+	 height :: non_neg_integer(),
+	 hidden = false :: boolean(),
+	 type = unsigned :: unsigned | signed | {enum,tuple()},
+	 field = none :: none | id | len | data,
+	 base = 16 :: 0 | 2 | 8 | 16 | 10,
+	 signed = false :: boolean(),
+	 bits = [] :: [{Pos::non_neg_integer(),Length::non_neg_integer()}]
 	}).
 
 -record(layout,
 	{
-	  id,      %% frame id
-	  pos,     %% list position
-	  x     :: non_neg_integer(),   %% x offset
-	  y     :: non_neg_integer(),   %% y offset
-	  width :: non_neg_integer(),   %% total width
-	  height :: non_neg_integer(),  %% total height
-	  format = [%% id field is dynamically inserted 
-		    #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
-		    #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
-		    #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
-		    #fmt { field=len,base=16,type=unsigned,bits=[{0,4}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
-		    #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
-		   ]
+	 id,      %% frame id
+	 pos,     %% list position
+	 x     :: non_neg_integer(),   %% x offset
+	 y     :: non_neg_integer(),   %% y offset
+	 width :: non_neg_integer(),   %% total width
+	 height :: non_neg_integer(),  %% total height
+	 format = {} :: tuple()        %% {#fmt{},...}
 	}).
 
 -record(state,
 	{
-	  width  :: integer(),
-	  height :: integer(),
-	  nrows = 32 :: integer(),     %% number or rows shown
-	  window :: epx:epx_window(),  %% attached window
-	  font   :: epx:epx_font(),
-	  %% foreground_pixels :: epx:epx_pixmap(),
-	  background_pixels :: epx:epx_pixmap(),
-	  frame,          %% ets: #can_frame{}
-	  frame_layout,   %% ets: #layout{}
-	  frame_counter,  %% ets: ID -> Counter
-	  glyph_width   :: unsigned(),
-	  glyph_height  :: unsigned(),
-	  glyph_ascent  :: integer(),
-	  background_color :: epx:epx_color(),
-	  top_offset    = 5,
-	  left_offset   = 5,
-	  right_offset  = 5,
-	  bottom_offset = 5,
-	  row_width     = 0,
-	  row_height    = 0,
-	  row_pad = 3
+	 width  :: integer(),
+	 height :: integer(),
+	 nrows = 32 :: integer(),     %% number or rows shown
+	 window :: epx:epx_window(),  %% attached window
+	 font   :: epx:epx_font(),
+	 %% foreground_pixels :: epx:epx_pixmap(),
+	 background_pixels :: epx:epx_pixmap(),
+	 frame,          %% ets: #can_frame{}
+	 frame_layout,   %% ets: #layout{}
+	 frame_counter,  %% ets: ID -> Counter
+	 frame_anim,     %% ets: {ID,FmtPos} -> Counter
+	 glyph_width   :: unsigned(),
+	 glyph_height  :: unsigned(),
+	 glyph_ascent  :: integer(),
+	 background_color :: epx:epx_color(),
+	 top_offset    = 5,
+	 left_offset   = 5,
+	 right_offset  = 5,
+	 bottom_offset = 5,
+	 row_width     = 0,
+	 row_height    = 0,
+	 row_pad = 3,
+	 tick :: reference()
 	}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-
 start() ->
-    dep_start(),
+    start(any).
+start(Model) ->
+    (catch error_logger:tty(false)),
+    application:ensure_all_started(?MODULE),
     can_udp:start(),
-    gen_server:start(?MODULE, [], []).
+    gen_server:start(?MODULE, [Model], []).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -119,16 +116,13 @@ start() ->
 %% @end
 %%--------------------------------------------------------------------
 start_link() ->
-    dep_start(),
+    start_link(any).
+start_link(Model) ->
+    (catch error_logger:tty(false)),
+    application:ensure_all_started(?MODULE),
     can_udp:start(),
-    gen_server:start_link(?MODULE, [], []).
+    gen_server:start_link(?MODULE, [Model], []).
 
-
-dep_start() ->
-    application:start(uart),
-    application:start(can),
-    application:start(epx).
-   
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -144,17 +138,16 @@ dep_start() ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([]) ->
+init([Model]) ->
     can_router:attach(),
     Format = argb,
-    {ok,Font} = epx_font:match([{name,"Courier New"},{size,12}]),
+    {ok,Font} = epx_font:match([{name,"Courier New"},{size,?FONT_SIZE}]),
     epx_gc:set_font(Font),
     S0 = #state{},
     {W,H}  = epx_font:dimension(Font,"0"),
     RowHeight = H + 2,
     Height = S0#state.top_offset+S0#state.nrows*(RowHeight+S0#state.row_pad)
 	- S0#state.row_pad + S0#state.bottom_offset,
-    BgColor = cyan,
     %% FORMAT= ID X|R|E L 01 23 45 67 01 23 45 67
     %% maximum width = 
     %%   ID: 3FF (11-bit) | 1FFFFFFF (29-bit)
@@ -165,10 +158,8 @@ init([]) ->
 	S0#state.right_offset,
     Window = epx:window_create(40, 40, Width, Height,
 			       [button_press,button_release]),
-    %% Fg = epx:pixmap_create(Width, Height, Format),
-    %% epx:pixmap_fill(Fg, BgColor),
     Bg = epx:pixmap_create(Width, Height, Format),
-    epx:pixmap_fill(Bg, BgColor),
+    epx:pixmap_fill(Bg, ?BACKGROUND_COLOR),
     epx:window_attach(Window),
     epx:pixmap_attach(Bg),
     S1 = S0#state{
@@ -179,17 +170,73 @@ init([]) ->
 	   glyph_width  = W,
 	   glyph_height = H,
 	   glyph_ascent = epx:font_info(Font, ascent),
-	   background_color = BgColor,
+	   background_color = ?BACKGROUND_COLOR,
 	   %% foreground_pixels = Fg,
 	   background_pixels = Bg,
 	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
-	   frame_counter = ets:new(frame_counter, []),
 	   frame_layout  = ets:new(frame_layout, [{keypos,#layout.id}]),
+	   frame_counter = ets:new(frame_counter, []),
+	   frame_anim    = ets:new(frame_anim, []),
 	   row_width = Width,
 	   row_height = RowHeight
 	  },
-    update_window(S1),
-    {ok, S1}.
+    S2 = load_frame_layout(Model, S1),
+    update_window(S2),
+    {ok, S2}.
+
+%% Load data display for various models (test)
+load_frame_layout(prius, State) ->
+    %% Break information bit 7 press=1, release=0
+    load_pid(0, 16#030,
+	     [#fmt { field=data, base=2, type=unsigned, bits=[{0,1}]}],
+	     State),
+    %% Steering?
+    load_pid(1, 16#025, 
+	     [#fmt { field=data, base=10, type=unsigned, bits=[{0,16}]}], 
+	     State),
+
+    %% Speed
+    load_pid(2, 16#0B4,
+	     [#fmt { field=data, base=10, type=unsigned,
+		     bits=[{40,16}]}], 
+	     State),
+    %% Speed
+    load_pid(3, 16#244,
+	     [
+	      %% speed, 0x150=10km/h, 0x300=20km 0x700=50km/h 
+	      #fmt { field=data, base=10, type=signed,
+		     bits=[{32,16}]},
+	      %% gas pedal
+	      #fmt { field=data, base=10, type=unsigned,
+		     bits=[{56,8}]}
+	     ], State),
+    State;
+load_frame_layout(_, State) ->
+    State.
+
+
+load_pid(Pos, Pid, FormList, State) ->
+    Format = 
+	list_to_tuple(
+	  [
+	   #fmt { field=id,base=16,type=unsigned,bits=[{21,11}]},
+	   #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
+	   #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
+	   #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
+	   #fmt { field=len,base=16,type=unsigned,bits=[{0,4}]} |
+	   FormList ]),
+    L0 = #layout {
+	    id = Pid,
+	    pos = Pos,
+	    format = Format
+	   },
+    L1 = position_layout(L0, State),
+    ets:insert(State#state.frame_layout, L1),
+    ets:insert(State#state.frame_counter, {Pid, 0}),
+    ets:insert(State#state.frame, #can_frame{id=Pid,len=8,
+					     data=(<<0,0,0,0,0,0,0,0>>)
+					    }),
+    redraw(Pid, State).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -247,35 +294,48 @@ handle_info({epx_event, _Win, {button_release,[left],{_X,_Y,_}}}, State) ->
 handle_info(Frame=#can_frame{id=FID}, State) ->
     case ets:lookup(State#state.frame, FID) of
 	[Frame] -> %% no change
-	    ok;
+	    ets:update_counter(State#state.frame_counter, FID, 1),
+	    {noreply, State};
 	[Frame0] ->
+	    ets:update_counter(State#state.frame_counter, FID, 1),
 	    Diff = diff_frames(FID,Frame,Frame0,State),
-	    io:format("frame diff = ~w\n", [Diff]),
-	    %% fixme: create a new change map for animation
-	    ets:insert(State#state.frame, Frame);
-	[] ->
-	    %% fixme: flash the row?
-	    Pos = ets:info(State#state.frame, size),
+	    [ ets:insert(State#state.frame_anim,{{FID,Pos},255}) ||
+		Pos <- Diff ],
 	    ets:insert(State#state.frame, Frame),
-	    Layout0 = #layout { id=FID, pos=Pos },
-	    %% concat id field first
-	    Format0 = Layout0#layout.format,
-	    Format1 =
+	    redraw(FID, State),
+	    {noreply, tick_restart(State)};
+	[] ->
+	    ets:insert(State#state.frame, Frame),
+	    IDFmt = 
 		if FID band ?CAN_EFF_FLAG =/= 0 ->
-			[#fmt { field=id,base=16,type=unsigned,bits=[{3,29}]} |
-			 Format0];
+			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
 		   true ->
-			[#fmt { field=id,base=16,type=unsigned,bits=[{21,11}]} |
-			 Format0]
+			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
 		end,
-	    Layout1 = Layout0#layout { format = Format1},
+	    Format = default_format(IDFmt),
+	    [ ets:insert(State#state.frame_anim,{{FID,Pos},255}) ||
+		Pos <- lists:seq(1,tuple_size(Format))  ],
+	    LayoutPos = ets:info(State#state.frame, size),
+	    Layout1 = #layout { id=FID, pos=LayoutPos, format=Format},
 	    Layout2 = position_layout(Layout1, State),
 	    ets:insert(State#state.frame_layout, Layout2),
-	    ets:insert(State#state.frame_counter, {FID, 0})
-    end,
-    ets:update_counter(State#state.frame_counter, FID, 1),
-    redraw(FID, State),
+	    ets:insert(State#state.frame_counter, {FID, 1}),
+	    redraw(FID, State),
+	    {noreply, tick_restart(State)}
+    end;
+handle_info({timeout,Ref, tick}, State) when State#state.tick =:= Ref ->
+    case redraw_anim(State) of
+	false ->
+	    {noreply, State#state { tick = undefined }};
+	true ->
+	    update_window(State),
+	    {noreply, tick_start(State)}
+    end;
+
+handle_info(_Info, State) ->
+    io:format("Got info ~p\n", [_Info]),
     {noreply, State}.
+
 
 %%--------------------------------------------------------------------
 %% @private
@@ -308,21 +368,93 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-diff_frames(FID,New, Old, State) ->
-    [#layout{format=Format}] = ets:lookup(State#state.frame_layout, FID),
-    diff_frames_(Format, New, Old).
+tick_start(State) ->
+    State#state { tick = erlang:start_timer(100, self(), tick)}.
 
-diff_frames_([Fmt|Fs],New,Old) ->
+tick_restart(State) when State#state.tick =:= undefined ->
+    tick_start(State);
+tick_restart(State) ->
+    State.
+
+tick_stop(State) when State#state.tick =:= undefined ->
+    State;
+tick_stop(State) ->
+    erlang:cancel_time(State#state.tick),
+    State#state { tick = undefined }.
+    
+
+default_format(IDFmt) ->
+    {
+     IDFmt,
+     #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
+     #fmt { field=len,base=16,type=unsigned,bits=[{0,4}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
+    }.
+
+bits_int8(Pos)  -> [{Pos,8}].
+bits_int16(Pos) -> [{Pos,16}].
+bits_int32(Pos) -> [{Pos,32}].
+
+bits_int16_LE(Pos) -> [{Pos+8,8},{Pos,8}].
+bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
+
+diff_frames(FID, New, Old, State) ->
+    [#layout{format=Format}] = ets:lookup(State#state.frame_layout, FID),
+    diff_frames_(1,Format,FID,New,Old,[],State).
+
+diff_frames_(Pos,Format,FID,New,Old,Acc,State) when Pos =< tuple_size(Format) ->
+    Fmt = element(Pos, Format),
     BitsDataNew = get_bits(Fmt,New),
     BitsDataOld = get_bits(Fmt,Old),
     if BitsDataNew =:= BitsDataOld ->
-	    [false | diff_frames_(Fs, New, Old)];
+	    diff_frames_(Pos+1,Format,FID,New,Old,Acc,State);
        true ->
-	    [true | diff_frames_(Fs, New, Old)]
+	    diff_frames_(Pos+1,Format,FID,New,Old,[Pos|Acc],State)
     end;
-diff_frames_([], _New, _Old) ->
-    [].
-    
+diff_frames_(_Pos,_Format,_FID,_New,_Old,Acc,_State) ->
+    Acc.
+
+redraw_anim(State) ->
+    case ets:first(State#state.frame_anim) of
+	'$end_of_table' -> 
+	    false;
+	First ->
+	    {Remove,Update} = redraw_anim_(First, [], [], State),
+	    ets:delete(State#state.frame_anim, Remove),
+	    lists:foreach(
+	      fun(Key) ->
+		      %% fixme: use update couter
+		      case ets:lookup(State#state.frame_anim, Key) of
+			  [] -> ok;
+			  [{_,Val}] ->
+			      Val1 = max(0, Val-10),
+			      ets:insert(State#state.frame_anim, {Key,Val1})
+		      end
+	      end, Update),
+	    Update =/= []
+    end.
+
+redraw_anim_(Key={FID,Pos}, Remove, Update, State) ->
+    [Frame] = ets:lookup(State#state.frame, FID),
+    Next = ets:next(State#state.frame_anim, Key),
+    case redraw_pos(FID,Pos,Frame,State) of
+	true -> %% remove
+	    redraw_anim_(Next, [Key|Remove], Update, State);
+	false ->
+	    redraw_anim_(Next, Remove, [Key|Update], State)
+    end;
+redraw_anim_('$end_of_table', Remove, Update, State) ->
+    {Remove, Update}.
+
 
 redraw(FID, State) ->
     redraw(FID, State, 0).
@@ -330,23 +462,52 @@ redraw(FID, State) ->
 redraw(FID, State, MinW) ->
     [#layout{ x=X,y=Y,width=W,height=H,format=Format}] =
 	ets:lookup(State#state.frame_layout, FID),
-    [Frame] = ets:lookup(State#state.frame, FID),
     %% Count = ets:lookup_element(State#state.frame_counter, FID, 2),
     epx_gc:set_fill_style(solid),
-    epx_gc:set_fill_color(white),
+    epx_gc:set_fill_color(?LAYOUT_BACKGROUND_COLOR),
     epx:draw_rectangle(State#state.background_pixels, {X,Y,W,H}),
-    redraw_frame(Format, Frame, State),
+    [Frame] = ets:lookup(State#state.frame, FID),
+    redraw_frame(FID,1,Format,Frame,State),
     update_window(State, {X,Y,max(W,MinW),H}).
 
-redraw_frame([Fmt=#fmt {x=X,y=Y,width=W,height=H,bits=Bits}|Fs],Frame,State) ->
+redraw_frame(FID,Pos,Format,Frame,State) when Pos =< tuple_size(Format) ->
+    Fmt = element(Pos, Format),
+    redraw_fmt(FID,Pos,Fmt,Frame,State),
+    redraw_frame(FID,Pos+1,Format,Frame,State);
+redraw_frame(_FID,_Pos,_Format,_Frame,_State) ->
+    ok.
+
+redraw_pos(FID,Pos,Frame,State) ->
+    [#layout{ format=Format}] = ets:lookup(State#state.frame_layout, FID),
+    redraw_pos(FID,Pos,Format,Frame,State).
+
+redraw_pos(FID,Pos,Format,Frame,State) ->
+    Fmt = element(Pos,Format),
+    redraw_fmt(FID,Pos,Fmt,Frame,State).
+
+redraw_fmt(FID,Pos,Fmt,Frame,State) ->
+    #fmt {x=X,y=Y,width=W,height=H} = Fmt,
+    Remove = case ets:lookup(State#state.frame_anim, {FID,Pos}) of
+		  [] -> %% no highlight
+		     true;
+		  [{_,Val}] ->
+		     {R,G,B} = ?LAYOUT_BACKGROUND_COLOR,
+		     epx_gc:set_fill_style(solid),
+		     Val2 = Val div 2,
+		     epx_gc:set_fill_color({R-Val2,G-Val2,B-Val2}),
+		     epx:draw_rectangle(State#state.background_pixels, 
+					{X,Y,W,H}),
+		     Val =:= 0
+	     end,
     BitsData = get_bits(Fmt, Frame),
+    %% draw shape
     epx_gc:set_fill_style(none),
-    epx_gc:set_foreground_color(black),
+    epx_gc:set_foreground_color(?FRAME_BORDER_COLOR),
     epx:draw_rectangle(State#state.background_pixels, {X,Y,W,H}),
     %% draw base indicator, only for data fields
     if Fmt#fmt.field =:= data ->
 	    case Fmt#fmt.base of
-		2  -> 
+		2  ->
 		    epx:pixmap_put_pixels(State#state.background_pixels,
 					  X+1,Y+1,6,7,argb,bin_icon(),blend),
 		    epx:draw_rectangle(State#state.background_pixels,{X,Y,8,9});
@@ -362,22 +523,21 @@ redraw_frame([Fmt=#fmt {x=X,y=Y,width=W,height=H,bits=Bits}|Fs],Frame,State) ->
 		    epx:pixmap_put_pixels(State#state.background_pixels,
 					  X+1,Y+1,6,7,argb,dec_icon(),blend),
 		    epx:draw_rectangle(State#state.background_pixels,{X,Y,8,9});
-		0  -> 
+		0  ->
 		    false
 	    end;
        true ->
 	    false
     end,
-    epx_gc:set_foreground_color(16#00000000), %% black
-    String = fmt_bits(Fmt#fmt.type,Fmt#fmt.base, BitsData),
+    epx_gc:set_foreground_color(?TEXT_COLOR),
+    String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
     Ya = Y+1+State#state.glyph_ascent,
     Offs = if Fmt#fmt.base > 0, Fmt#fmt.field =:= data -> 6+2;
 	      true -> 2
 	   end,
     epx:draw_string(State#state.background_pixels, X+Offs, Ya, String),
-    redraw_frame(Fs,Frame,State);
-redraw_frame([],_Frame,_State) ->
-    ok.
+    Remove.
+
 
 get_bits(Fmt, Frame) ->
     Data = case Fmt#fmt.field of
@@ -386,7 +546,6 @@ get_bits(Fmt, Frame) ->
 	       len  -> <<(Frame#can_frame.len):4>>
 	   end,
     collect_bits(Fmt#fmt.bits, Data).
-
 
 extend_bits(Data, MinSize) when bit_size(Data) >= MinSize ->
     Data;
@@ -410,13 +569,13 @@ position_layout(Layout, State) ->
     Y = State#state.top_offset + 
 	Layout#layout.pos*(State#state.row_height+State#state.row_pad),
     X = State#state.left_offset,
-    {X1,_Y1,Format} = position_format(X, Y, Layout#layout.format, [], State),
+    {X1,_Y1,Format} = position_format(X, Y, 1, Layout#layout.format, [], State),
     Width = (X1-X-2)+1,
     Height = State#state.row_height,
-    Layout#layout { x=X, y=Y, width=Width, height=Height,
-		    format=Format }.
+    Layout#layout { x=X,y=Y,width=Width,height=Height,format=Format }.
 
-position_format(X, Y, [Fmt|Fs], Acc, State) ->
+position_format(X,Y,Pos,Format,Acc,State) when Pos =< tuple_size(Format) ->
+    Fmt = element(Pos, Format),
     Width0 = case Fmt#fmt.type of
 		 unsigned ->
 		     Size = lists:sum([Len || {_Pos,Len} <- Fmt#fmt.bits]),
@@ -437,10 +596,9 @@ position_format(X, Y, [Fmt|Fs], Acc, State) ->
     Width = Wind + Width0 + 4,
     Height = State#state.row_height,
     Fmt1 = Fmt#fmt { x=X, y=Y, width=Width, height=Height },
-    position_format(X+Width+2, Y, Fs, [Fmt1|Acc], State);
-position_format(X, Y, [], Acc, _State) ->
-    {X, Y, lists:reverse(Acc)}.
-
+    position_format(X+Width+2, Y, Pos+1, Format, [Fmt1|Acc], State);
+position_format(X, Y, _Pos, _Format, Acc, _State) ->
+    {X, Y, list_to_tuple(lists:reverse(Acc)) }.
 
 fmt_bits(unsigned,Base,BitsData) ->
     Size = bit_size(BitsData),
@@ -502,14 +660,14 @@ pow_(A, B, Prod)  ->
 %% example read reversed 32 bits in groups of 8
 %% [{24,8},{16,8},{8,8},{0,8}]
 %% 
-
-collect_bits(Bits, Data) when is_bitstring(Data) ->
-    collect_bits(Bits, Data, <<>>).
-
-collect_bits([{P,L}|Ps], Data, Acc) ->
+collect_bits([{P,L}|Ps], Data) when is_bitstring(Data) ->
     <<_:P, Bits:L/bitstring, _/bitstring>> = Data,
-    collect_bits(Ps, Data, <<Acc/bitstring, Bits/bitstring>>);
-collect_bits([], _Data, Acc) ->
+    collect_bits_(Ps, Data, Bits).
+
+collect_bits_([{P,L}|Ps], Data, Acc) ->
+    <<_:P, Bits:L/bitstring, _/bitstring>> = Data,
+    collect_bits_(Ps, Data, <<Acc/bitstring, Bits/bitstring>>);
+collect_bits_([], _Data, Acc) ->
     Acc.
 
 %%
@@ -541,15 +699,15 @@ toggle_frame_base(X,Y,State) ->
     end.
 
 toggle_fmt(X, Y, Layout) ->
-    Format = Layout#layout.format,
-    case toggle_fmt_(X, Y, Format) of
-	Format -> false;
-	NewFormat ->
-	    Layout#layout { format=NewFormat}
+    case toggle_fmt_(X, Y, 1, Layout#layout.format) of
+	false -> false;
+	Format1 ->
+	    Layout#layout { format=Format1 }
     end.
 
 %% change base 2->8->16->10->2
-toggle_fmt_(X, Y, [Fmt=#fmt{x=X1,y=Y1,width=W,height=H}|Fs]) ->
+toggle_fmt_(X, Y, Pos, Format) when Pos =< tuple_size(Format) ->
+    Fmt = #fmt{x=X1,y=Y1,width=W,height=H} = element(Pos, Format),
     if X >= X1, Y >= Y1, X < X1+W, Y < Y1+H ->
 	    if Fmt#fmt.field =:= data, Fmt#fmt.type =:= unsigned ->
 		    NextBase = case Fmt#fmt.base of
@@ -559,16 +717,16 @@ toggle_fmt_(X, Y, [Fmt=#fmt{x=X1,y=Y1,width=W,height=H}|Fs]) ->
 				   16 -> 10;
 				   10 -> 2
 			       end,
-		    [Fmt#fmt { base = NextBase }|Fs];
+		    setelement(Pos, Format, Fmt#fmt {base = NextBase});
 	       true ->
-		    [Fmt|Fs]
+		    false
 	    end;
+       %% fixeme: assume that fmt X is sorted? and abort when missed?
        true ->
-	    [Fmt|toggle_fmt_(X, Y, Fs)]
+	    toggle_fmt_(X,Y,Pos+1,Format)
     end;
-toggle_fmt_(_X, _Y, []) ->
-    [].
-
+toggle_fmt_(_X, _Y, _Pos, _Format) ->
+    false.
 
 layout_from_position(X, Y, State) ->
     Tab = State#state.frame_layout,
