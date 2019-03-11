@@ -42,8 +42,10 @@
 -define(FONT_SIZE, 14).
 -define(BACKGROUND_COLOR,        {0,255,255}).     %% cyan
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
+-define(HIGHLIGHT_COLOR,         {255,0,0}).       %% red hight light
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
+-define(TEXT_HIGHLIGHT_COLOR,    {0,255,255,255}). %% white hight light
 
 -record(fmt,
 	{
@@ -452,7 +454,7 @@ redraw_anim_(Key={FID,Pos}, Remove, Update, State) ->
 	false ->
 	    redraw_anim_(Next, Remove, [Key|Update], State)
     end;
-redraw_anim_('$end_of_table', Remove, Update, State) ->
+redraw_anim_('$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
 
@@ -487,18 +489,7 @@ redraw_pos(FID,Pos,Format,Frame,State) ->
 
 redraw_fmt(FID,Pos,Fmt,Frame,State) ->
     #fmt {x=X,y=Y,width=W,height=H} = Fmt,
-    Remove = case ets:lookup(State#state.frame_anim, {FID,Pos}) of
-		  [] -> %% no highlight
-		     true;
-		  [{_,Val}] ->
-		     {R,G,B} = ?LAYOUT_BACKGROUND_COLOR,
-		     epx_gc:set_fill_style(solid),
-		     Val2 = Val div 2,
-		     epx_gc:set_fill_color({R-Val2,G-Val2,B-Val2}),
-		     epx:draw_rectangle(State#state.background_pixels, 
-					{X,Y,W,H}),
-		     Val =:= 0
-	     end,
+    {Remove,TextColor} = highlight(FID,Pos,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
     %% draw shape
     epx_gc:set_fill_style(none),
@@ -529,7 +520,7 @@ redraw_fmt(FID,Pos,Fmt,Frame,State) ->
        true ->
 	    false
     end,
-    epx_gc:set_foreground_color(?TEXT_COLOR),
+    epx_gc:set_foreground_color(TextColor),
     String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
     Ya = Y+1+State#state.glyph_ascent,
     Offs = if Fmt#fmt.base > 0, Fmt#fmt.field =:= data -> 6+2;
@@ -537,6 +528,42 @@ redraw_fmt(FID,Pos,Fmt,Frame,State) ->
 	   end,
     epx:draw_string(State#state.background_pixels, X+Offs, Ya, String),
     Remove.
+
+%% draw hightlight background return text color and flag to signal remove
+highlight(FID, Pos, Rect, State) ->
+    case ets:lookup(State#state.frame_anim, {FID,Pos}) of
+	[] ->
+	    {true, ?TEXT_COLOR};
+	[{_,0}] ->
+	    Color = ?LAYOUT_BACKGROUND_COLOR,
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(Color),
+	    epx:draw_rectangle(State#state.background_pixels,Rect),
+	    {true, ?TEXT_COLOR};
+	[{_,Val}] ->
+	    Color = blend(Val, ?HIGHLIGHT_COLOR, ?LAYOUT_BACKGROUND_COLOR),
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(Color),
+	    epx:draw_rectangle(State#state.background_pixels,Rect),
+	    Text = blend(Val, ?TEXT_HIGHLIGHT_COLOR, ?TEXT_COLOR),
+	    {false, Text}
+    end.
+
+blend(Val, {Rh,Gh,Bh}, {Rb,Gb,Bb}) ->
+    F1 = Val/255,
+    F0 = 1-F1,
+    R = trunc(F1*Rh + F0*Rb),
+    G = trunc(F1*Gh + F0*Gb),
+    B = trunc(F1*Bh + F0*Bb),
+    {R,G,B};
+blend(Val, {Ah,Rh,Gh,Bh}, {Ab,Rb,Gb,Bb}) ->
+    F1 = Val/255,
+    F0 = 1-F1,
+    A = trunc(F1*Ah + F0*Ab),
+    R = trunc(F1*Rh + F0*Rb),
+    G = trunc(F1*Gh + F0*Gb),
+    B = trunc(F1*Bh + F0*Bb),
+    {A,R,G,B}.
 
 
 get_bits(Fmt, Frame) ->
