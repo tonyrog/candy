@@ -71,6 +71,8 @@ timediff(_,_New, ?CAN_NO_TIMESTAMP) -> 1;
 timediff(canusb,New, New) -> 1;  %% just yeild a bit
 timediff(canusb,New, Old) when New > Old -> New - Old;
 timediff(canusb,New, Old) -> 60000 - (Old - New);
+timediff(pcan, New, Old) when New > Old -> New - Old;
+timediff(pcan, _, _) -> 1;
 timediff(vbox, New, Old) when New > Old -> New - Old;
 timediff(vbox, _, _) ->  1.
 
@@ -79,9 +81,9 @@ decode(<<"Dearborn ", _/binary>>) -> ignore;
 decode(<<"--------", _/binary>>) -> ignore;
 decode(<<"Created ", _/binary>>) -> ignore;
 decode(<<"Timestamp ", _/binary>>) -> ignore;
-decode(<<" ", _/binary>>) -> ignore;
 decode(<<"\n">>) -> ignore;
 decode(<<"Msg ID ", _/binary>>) -> ignore;
+decode(<<";", _/binary>>) -> ignore;   %% PCAN comment
 %% CANUSB $T
 decode(<<$T,ID29:8/binary,L,Tail/binary>>) ->
     ID = binary_to_integer(ID29,16),
@@ -109,17 +111,41 @@ decode(<<$t,ID11:3/binary,L,Tail/binary>>) ->
 	    {error, bad_format}
     end;
 decode(Line) ->
-    %% test for VBOX? tab format
-    case binary:split(Line, <<"\t">>, [global]) of
-	[ID0, Time, <<"CH#",_N>>, <<L>>, Message, <<"RX\n">>] ->
-	    ID = binary_to_integer(ID0,16),
-	    Ext = (ID > ?CAN_SFF_MASK),  %% must be extended
+    Parts = case re:split(Line, "[\t\s\n]+", [trim]) of
+		[<<>>|LParts] -> LParts; %% skip leading blans
+		Parts0 -> Parts0
+	    end,
+    case Parts of
+	[ID0, Time, <<"CH#",_N>>, <<L>> | Rest] ->
 	    Len = binary_to_integer(<<L>>, 16),
-	    Stamp = decode_ts(Time),
-	    {ok, vbox, can:create(ID,Len,Ext,false,0,data_1(Message),Stamp)};
+	    case collect_message(Len, Rest, <<>>) of
+		{Data, [<<"RX">>]} ->
+		    ID = binary_to_integer(ID0,16),
+		    Ext = (ID > ?CAN_SFF_MASK),  %% must be extended
+		    Stamp = decode_ts(Time),
+		    {ok, vbox, can:create(ID,Len,Ext,false,0,Data,Stamp)};
+		_ ->
+		    {error,bad_format}
+	    end;
+	[_MsgNum, Time, <<"Rx">>, ID0, <<L>> | Rest] ->
+	    Len = binary_to_integer(<<L>>, 16),
+	    case collect_message(Len, Rest, <<>>) of
+		{Data, []} ->
+		    ID = binary_to_integer(ID0,16),
+		    Ext = (ID > ?CAN_SFF_MASK),  %% must be extended
+		    Stamp = trunc(binary_to_float(Time)),
+		    {ok, pcan, can:create(ID,Len,Ext,false,0,Data,Stamp)};
+		_ ->
+		    {error,bad_format}
+	    end;
 	_ ->
 	    {error, bad_format}
     end.
+
+collect_message(0, Rest, Data) ->  {Data, Rest};
+collect_message(I, [Byte|Bs], Data) -> 
+    B = binary_to_integer(Byte, 16),
+    collect_message(I-1, Bs, <<Data/binary, B>>).
 
 %% convert ascii data to binary
 %% 010203 .. even number of hex digits
