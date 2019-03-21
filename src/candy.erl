@@ -609,7 +609,7 @@ merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when
 			[{P1,L1+L2}];
 		    {Bits1,Bits2} ->
 			Bs = Bits1++Bits2,
-			io:format("warning: Bits appended\n", [Bs]),
+			io:format("warning: Bits appended ~w\n", [Bs]),
 			Bs
 		end,
 	    Fmt3 = Fmt1#fmt { type=Type, bits=Bits },
