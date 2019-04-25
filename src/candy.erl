@@ -562,7 +562,7 @@ command($s, Selected, State={S,D}) when D#d.ctrl ->
 			    [integer_to_list(FID,16), Bs]),
 		  ["0x",integer_to_list(FID,16),
 		   [[[" ",integer_to_list(B),":",
-		      integer_to_list(L)] || {B,L} <- G]
+		      integer_to_list(Len)] || {B,Len} <- G]
 		    || G <- Bs],
 		   "\n" | Acc]
 	  end, [], FIDs),    
