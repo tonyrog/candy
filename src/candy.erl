@@ -375,6 +375,7 @@ handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
 handle_info({epx_event, Win, close}, State={S,_D}) 
   when Win =:= S#s.window ->
     %% io:format("Got window close\n", []),
+    erlang:halt(0),   %% temporary hack
     {stop, normal, State};
 handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State={S,D}) 
   when Win =:= S#s.window ->
