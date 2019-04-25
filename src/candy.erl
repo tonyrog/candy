@@ -494,7 +494,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%
 %% Commands on Selected elements
-%%   x            hexa decimal format
+%%   x            hexadecimal format
 %%   d            decimal format
 %%   b            binary format
 %%   o            octal format
@@ -549,17 +549,26 @@ command($G, Selected, State={S,D}) when D#d.ctrl, D#d.shift ->
     State;
 command($s, Selected, State={S,D}) when D#d.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foreach(
-      fun(FID) ->
-	      Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
-	      PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-	      [L] = ets:lookup(S#s.frame_layout, FID),
-	      Format = L#layout.format,
-	      FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
-	      Bs = [Fmt#fmt.bits || Fmt <- FmtList],
-	      io:format("SAVE FID=0x~s Bits=~w\n",
-			[integer_to_list(FID,16), Bs])
-      end, FIDs),
+    Bytes = 
+	lists:foldr(
+	  fun(FID,Acc) ->
+		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+		  [L] = ets:lookup(S#s.frame_layout, FID),
+		  Format = L#layout.format,
+		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
+		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
+		  io:format("SAVE FID=0x~s Bits=~w\n",
+			    [integer_to_list(FID,16), Bs]),
+		  ["0x",integer_to_list(FID,16),
+		   [[[" ",integer_to_list(B),":",
+		      integer_to_list(L)] || {B,L} <- G]
+		    || G <- Bs],
+		   "\n" | Acc]
+	  end, [], FIDs),    
+    file:write_file("candy.bits", 
+		    [Bytes,
+		     " This line and the following lines are comments\n"]),
     State;
 command(Symbol, Selected, State) ->
     io:format("command ~p selected=~p\n", [Symbol, Selected]),

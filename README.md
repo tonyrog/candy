@@ -43,3 +43,15 @@ send some can frames:
 
     > can:send(123, <<1,2,3,4,5,6,7,8>>).
     > can:send(123, true, false, <<1:32, 2:32>>).
+
+# Commands
+
+Commands used on selected elements:
+
+    x            hexadecimal format
+    d            decimal format
+    b            binary format
+    o            octal format
+    ^g           group selected bits
+    shift - ^g   ungroup selected bits
+    ^s           save selected frame id and bits in file candy.bits
