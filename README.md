@@ -52,6 +52,6 @@ Key commands used on selected elements:
     d              decimal format
     b              binary format
     o              octal format
-    Ctril+G        group selected bits
+    Ctrl+G         group selected bits
     Shift Ctrl+G   ungroup selected bits
     Ctrl+S         save selected frame id and bits in file candy.bits
