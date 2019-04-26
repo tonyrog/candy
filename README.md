@@ -46,12 +46,12 @@ send some can frames:
 
 # Commands
 
-Commands used on selected elements:
+Key commands used on selected elements:
 
-    x            hexadecimal format
-    d            decimal format
-    b            binary format
-    o            octal format
-    ^g           group selected bits
-    shift - ^g   ungroup selected bits
-    ^s           save selected frame id and bits in file candy.bits
+    x              hexadecimal format
+    d              decimal format
+    b              binary format
+    o              octal format
+    Ctril+G        group selected bits
+    Shift Ctrl+G   ungroup selected bits
+    Ctrl+S         save selected frame id and bits in file candy.bits
