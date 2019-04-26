@@ -138,7 +138,7 @@
 start() ->
     start(any).
 start(Model) ->
-    %% (catch error_logger:tty(false)),
+    (catch error_logger:tty(false)),
     application:ensure_all_started(?MODULE),
     can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
@@ -493,14 +493,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %%
-%% Commands on Selected elements
-%%   x            hexadecimal format
-%%   d            decimal format
-%%   b            binary format
-%%   o            octal format
-%%   ^g           group selected bits
-%%   shift - ^g   ungroup selected bits
-%%   ^s           save information
+%% Commands on Selected elements:
+%%   x              Hexadecimal format
+%%   d              Decimal format
+%%   b              Binary format
+%%   o              Octal format
+%%   ctrl+G         Group selected bits
+%%   Shift+Ctrl+G   Ungroup selected bits
+%%   Ctrl+S         Save information
+%%
+%%   q              quit
+%%   h              split/ungroup all bits
+%%
 %% Global commands
 %%
 command($x, Selected, State) ->
@@ -547,6 +551,10 @@ command($G, Selected, State={S,D}) when D#d.ctrl, D#d.shift ->
 	      update_layout(L, L1, State)	      
       end, FIDs),
     State;
+command($h, _Selected, State) -> 
+    %% split all bit fields into bits
+    %% FIXME
+    State;
 command($s, Selected, State={S,D}) when D#d.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
     Bytes = 
@@ -569,6 +577,9 @@ command($s, Selected, State={S,D}) when D#d.ctrl ->
     file:write_file("candy.bits", 
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
+    State;
+command($s, _Selected, State) ->
+    erlang:halt(0),
     State;
 command(Symbol, Selected, State) ->
     io:format("command ~p selected=~p\n", [Symbol, Selected]),
