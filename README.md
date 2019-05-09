@@ -6,9 +6,9 @@ at a reasonable speed.
 
 epx is used to diplay the can frames in a format that look something like
 
-    +------+ +-+ +-+ +-+ +-+ +--+ +--+ +--+ +--+ +--+ +--+ +--+ +--+
-    | ID   | |X| |R| |E| |L| |01| |02| |03| |04| |05| |06| |07| |08|
-    +------+ +-+ +-+ +-+ +-+ +--+ +--+ +--+ +--+ +--+ +--+ +--+ +--+
+    +--+----+ +-+-+-+-+ +--+--+--+--+--+--+--+--+
+    |ID|Freq| |X|R|E|L| |01|02|03|04|05|06|07|08|
+    +--+----+ +-+-+-+-+ +--+--+--+--+--+--+--+--+
 
 The ID field is in hex and is 3 hex digits wide (11 bits) if the 
 basic frame format is used. If the frame is in extended frame format (X flag) 
@@ -33,25 +33,21 @@ The easiest way to start candy is:
 
 This will show a blank window with a cyan background.
 candy initialize the can_udp backend by default. In the shell you
-may add other can backends at will.
-
-example:
-
-    > can_usb:start(1, [{device, "/dev/ttyUSB0"},{bitrate, 125000}]).
-
-send some can frames:
-
-    > can:send(123, <<1,2,3,4,5,6,7,8>>).
-    > can:send(123, true, false, <<1:32, 2:32>>).
+may add other can backends at will. Or backends may be added by
+configuration file (README can)
 
 # Commands
 
 Key commands used on selected elements:
 
-    x              hexadecimal format
-    d              decimal format
-    b              binary format
-    o              octal format
-    Ctrl+G         group selected bits
-    Shift Ctrl+G   ungroup selected bits
-    Ctrl+S         save selected frame id and bits in file candy.bits
+    X              Display hexadecimal format
+    D              Display decimal format
+    B              Display binary format
+    O              Display octal format
+	Q              Quit application	
+	G              Group selected bits
+	Shift+G        Ungroup selected bits
+    1-8            Split in groups of 1 to 8 bits
+	T              Toggle groups, switch place
+    Ctrl+S         Save selected frame id and bits in file candy.bits
+

@@ -138,7 +138,7 @@
 start() ->
     start(any).
 start(Model) ->
-    (catch error_logger:tty(false)),
+    (catch error_logger:tty(true)),
     application:ensure_all_started(?MODULE),
     can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
@@ -377,17 +377,15 @@ handle_info({epx_event, Win, close}, State={S,_D})
     %% io:format("Got window close\n", []),
     erlang:halt(0),   %% temporary hack
     {stop, normal, State};
-handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State={S,D}) 
+handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State={S,D})
   when Win =:= S#s.window ->
     case layout_from_position(X, Y, State)  of
 	false ->
-	    D1 = D#d { selected = [] },
-	    {noreply, {S, D1}};
+	    {noreply, deselect(State, [])};
 	Layout ->
 	    case fmt_from_position(X, Y, Layout) of
 		false ->
-		    D1 = D#d { selected = [] },
-		    {noreply, {S, D1}};
+		    {noreply, deselect(State, [])};
 
 		{_I, Fmt} when Fmt#fmt.field =:= hide ->
 		    Layout1 = Layout#layout { style = collapsed },
@@ -410,9 +408,7 @@ handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State={S,D})
 
 		{I, _Fmt} ->
 		    FID = Layout#layout.id,
-		    D1 = D#d { selected = [{FID,I}] },
-                    State1 =  {S,D1},
-		    redraw(FID, State1),
+		    State1 = deselect(State, [{FID,I}]),
 		    {noreply, State1}
 	    end
     end;
@@ -494,16 +490,17 @@ code_change(_OldVsn, State, _Extra) ->
 
 %%
 %% Commands on Selected elements:
-%%   x              Hexadecimal format
-%%   d              Decimal format
-%%   b              Binary format
-%%   o              Octal format
-%%   ctrl+G         Group selected bits
-%%   Shift+Ctrl+G   Ungroup selected bits
+%%   X              Hexadecimal format
+%%   D              Decimal format
+%%   B              Binary format
+%%   O              Octal format
+%%   Q              Quit application
+%%   --
+%%   G              Group selected bits
+%%   Shift+G        Ungroup selected bits
+%%   1-8            Split in groups of 1 to 8 bits
+%%   T              Swap groups
 %%   Ctrl+S         Save information
-%%
-%%   q              quit
-%%   h              split/ungroup all bits
 %%
 %% Global commands
 %%
@@ -519,42 +516,24 @@ command($o, Selected, State) ->
 command($b, Selected, State) ->
     set_base(Selected, 2, State),
     State;
-command($g, Selected, State={S,D}) when D#d.ctrl ->
-    %% merge bitfields
+command($G, Selected, State={_S,D}) when D#d.shift ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foreach(
-      fun(FID) ->
-	      Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
-	      PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-	      [L] = ets:lookup(S#s.frame_layout, FID),
-	      Format = L#layout.format,
-	      FmtList1 = merge_fmts(1, tuple_to_list(Format), [], PosList),
-	      Format1 = list_to_tuple(FmtList1),
-	      L1 = L#layout { format=Format1 },
-	      ets:insert(S#s.frame_layout,L1),
-	      update_layout(L, L1, State)
-      end, FIDs),
+    lists:foreach(fun(FID) -> split_half_fid(FID, Selected, State) end, FIDs),
     State;
-command($G, Selected, State={S,D}) when D#d.ctrl, D#d.shift ->
-    %% split bitfields (in half)
+
+command($g, Selected, State = {S,D}) ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foreach(
-      fun(FID) ->
-	      Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
-	      PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-	      [L] = ets:lookup(S#s.frame_layout, FID),
-	      Format = L#layout.format,
-	      FmtList1 = split_fmts(1, tuple_to_list(Format), [], PosList),
-	      Format1 = list_to_tuple(FmtList1),
-	      L1 = L#layout { format=Format1 },
-	      ets:insert(S#s.frame_layout,L1),
-	      update_layout(L, L1, State)	      
-      end, FIDs),
-    State;
-command($h, _Selected, State) -> 
-    %% split all bit fields into bits
-    %% FIXME
-    State;
+    %% select min pos foreach FID and keep as selected
+    Selected1 = lists:foldl(
+		  fun(FID, Acc) ->
+			  MinPos = lists:min([Pos || {F,Pos} <- Selected, 
+						     F =:= FID]),
+			  [{FID,MinPos}|Acc]
+		  end, [], FIDs),
+    State1 = {S, D#d { selected = Selected1 }},
+    lists:foreach(fun(FID) -> merge_fid(FID, Selected, State1) end, FIDs),
+    State1;
+
 command($s, Selected, State={S,D}) when D#d.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
     Bytes = 
@@ -578,15 +557,27 @@ command($s, Selected, State={S,D}) when D#d.ctrl ->
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
     State;
-command($s, _Selected, State) ->
+command($q, _Selected, State) ->
     erlang:halt(0),
+    State;
+command(I, Selected, State) when I >= $1, I =< $8 ->
+    FIDs = lists:usort([FID || {FID,_} <- Selected]),
+    lists:foreach(fun(FID) -> split_fid(FID, Selected, I-$0,State) end, FIDs),
     State;
 command(Symbol, Selected, State) ->
     io:format("command ~p selected=~p\n", [Symbol, Selected]),
     State.
 
+
+%% deselect all and selecte the NewSelected
+deselect({S,D}, NewSelected) ->
+    FIDs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
+    State = {S, D#d { selected = NewSelected }},
+    lists:foreach(fun(FID) -> redraw(FID, State) end, FIDs),
+    State.
+
 %% Set base to 'Base' in selected cells
-set_base(Selected, Base, State={S,_D}) ->		      
+set_base(Selected, Base, State={S,_D}) ->
     lists:foreach(
       fun({FID,I}) ->
 	      [L=#layout{format=Format}] = ets:lookup(S#s.frame_layout,FID),
@@ -602,7 +593,6 @@ set_base(Selected, Base, State={S,_D}) ->
 	      end
       end, Selected).
 
-
 select_fmts(I,[Fmt|FmtList],Acc,Sel) when  Fmt#fmt.field =:= data ->
     case lists:member(I, Sel) of
 	true -> select_fmts(I+1,FmtList,[Fmt|Acc],Sel);
@@ -612,6 +602,41 @@ select_fmts(I,[_|FmtList],Acc,Sel) ->
     select_fmts(I+1,FmtList,Acc,Sel);
 select_fmts(_I,[],Acc,_Sel) ->
     lists:reverse(Acc).
+
+%% split Selected group in FID in sizes of Size bits
+split_fid(FID, Selected, Size,State={S,_D}) ->
+    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+    PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+    [L] = ets:lookup(S#s.frame_layout, FID),
+    Format = L#layout.format,
+    FmtList1 = split_size(1, Size, tuple_to_list(Format), [], PosList),
+    Format1 = list_to_tuple(FmtList1),
+    L1 = L#layout { format=Format1 },
+    ets:insert(S#s.frame_layout,L1),
+    update_layout(L, L1, State).
+
+
+split_half_fid(FID, Selected, State={S,_D}) ->
+    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+    PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+    [L] = ets:lookup(S#s.frame_layout, FID),
+    Format = L#layout.format,
+    FmtList1 = split_halfs(1, tuple_to_list(Format), [], PosList),
+    Format1 = list_to_tuple(FmtList1),
+    L1 = L#layout { format=Format1 },
+    ets:insert(S#s.frame_layout,L1),
+    update_layout(L, L1, State).
+
+merge_fid(FID, Selected, State={S,_D}) ->
+    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+    PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+    [L] = ets:lookup(S#s.frame_layout, FID),
+    Format = L#layout.format,
+    FmtList1 = merge_fmts(1, tuple_to_list(Format), [], PosList),
+    Format1 = list_to_tuple(FmtList1),
+    L1 = L#layout { format=Format1 },
+    ets:insert(S#s.frame_layout,L1),
+    update_layout(L, L1, State).
 
 %% merge selected data bit fields
 merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when 
@@ -625,8 +650,8 @@ merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when
 	    Bits = 
 		case {Fmt1#fmt.bits,Fmt2#fmt.bits} of
 		    {[{P1,L1}],[{P2,L2}]} when P1+L1 =:= P2 ->
-			io:format("merged ~p and ~p to ~p\n",
-				  [{P1,L1},{P2,L2},{P1,L1+L2}]),
+			%% io:format("merged ~p and ~p to ~p\n",
+			%% [{P1,L1},{P2,L2},{P1,L1+L2}]),
 			[{P1,L1+L2}];
 		    {Bits1,Bits2} ->
 			Bs = Bits1++Bits2,
@@ -643,30 +668,59 @@ merge_fmts(I, [Fmt|FmtList], Acc, Sel) ->
 merge_fmts(_I, [], Acc, _Sel) ->
     lists:reverse(Acc).
 
-
 %% split selected data bit fields in halfs
-split_fmts(I,[Fmt|FmtList],Acc,Sel) when  Fmt#fmt.field =:= data ->
+split_halfs(I,[Fmt|FmtList],Acc,Sel) when  Fmt#fmt.field =:= data ->
     case lists:member(I, Sel) of
 	true ->
 	    case Fmt#fmt.bits of
 		[{Pos,Len}] when Len > 1 ->
-		    L1 = Len div 2,
-		    L2 = Len - L1,
-		    Fmt1 = Fmt#fmt{ bits=[{Pos,L1}] },
-		    Fmt2 = Fmt#fmt{ bits=[{Pos+L1,L2}] },
-		    split_fmts(I+1,FmtList,[Fmt2,Fmt1|Acc], Sel);
+		    Chunk = (Len+1) div 2,
+		    Acc1 = make_bit_chunks(Fmt, Pos, Chunk, Len, Acc),
+		    split_halfs(I+1,FmtList,Acc1, Sel);
 		_ -> %% FIXME a bit more work
 		    io:format("fixme: split bits ~w\n", [Fmt#fmt.bits]),
-		    split_fmts(I+1,FmtList,[Fmt|Acc],Sel)
+		    split_halfs(I+1,FmtList,[Fmt|Acc],Sel)
 	    end;
 	false ->
-	    split_fmts(I+1, FmtList, [Fmt|Acc], Sel)
+	    split_halfs(I+1, FmtList, [Fmt|Acc], Sel)
     end;
-split_fmts(I, [Fmt|FmtList], Acc, Sel) ->
-    split_fmts(I+1, FmtList, [Fmt|Acc], Sel);
-split_fmts(_I, [], Acc, _Sel) ->
+split_halfs(I, [Fmt|FmtList], Acc, Sel) ->
+    split_halfs(I+1, FmtList, [Fmt|Acc], Sel);
+split_halfs(_I, [], Acc, _Sel) ->
     lists:reverse(Acc).
-    
+
+%% split selected data bit fields in size chunks
+split_size(I,Size,[Fmt|FmtList],Acc,Sel) when Fmt#fmt.field =:= data ->
+    case lists:member(I, Sel) of
+	true ->
+	    case Fmt#fmt.bits of
+		[{Pos,Len}] when Len > 1 ->
+		    Chunk = if Size =:= half -> (Len+1) div 2;
+			       Size =< Len -> Size;
+			       true -> Len
+			    end,
+		    %% {Pos,L1}, {Pos+L1,L1} {Pos+2*L1,L1} ... {Pos+N*L1,L2}
+		    Acc1 = make_bit_chunks(Fmt, Pos, Chunk, Len, Acc),
+		    split_size(I+1,Size,FmtList,Acc1, Sel);
+		_ -> %% FIXME a bit more work
+		    io:format("fixme: split bits ~w\n", [Fmt#fmt.bits]),
+		    split_size(I+1,Size,FmtList,[Fmt|Acc],Sel)
+	    end;
+	false ->
+	    split_size(I+1, Size, FmtList, [Fmt|Acc], Sel)
+    end;
+split_size(I, Size, [Fmt|FmtList], Acc, Sel) ->
+    split_size(I+1, Size, FmtList, [Fmt|Acc], Sel);
+split_size(_I, _Size, [], Acc, _Sel) ->
+    lists:reverse(Acc).
+
+make_bit_chunks(Fmt, Pos, Chunk, Remain, Acc) when Chunk =< Remain ->
+    make_bit_chunks(Fmt,Pos+Chunk, Chunk, Remain-Chunk,
+		   [Fmt#fmt{ bits=[{Pos,Chunk}]}|Acc]);
+make_bit_chunks(_Fmt, _Pos, _Chunk, 0, Acc) ->
+    Acc;
+make_bit_chunks(Fmt, Pos, _Chunk, Remain, Acc) ->
+    [Fmt#fmt{ bits=[{Pos,Remain}]}|Acc].
 
 tick_start(_State={S,D}) ->
     {S, D#d { tick = erlang:start_timer(100, self(), tick)}}.
@@ -895,23 +949,23 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
     end,
     Remove.
 
-%% "delete" the layout by drawing screen background color
+%% "delete" the layout by drawing layout background color
 draw_layout_background(Layout, State) ->
     Color = Layout#layout.color,
-    draw_layout_rectangle(Layout, Color#color.background, State).
+    draw_layout_rectangle(Layout, Color#color.background, State,
+			  Layout#layout.width).
 
 %% prepare layout by painting the layout background color
 clear_layout_background(Layout, State={S,_}) ->
-    draw_layout_rectangle(Layout, S#s.background_color, State).
+    draw_layout_rectangle(Layout, S#s.background_color, State, 
+			  S#s.width).
 
-draw_layout_rectangle(Layout, Color, _State={S,_}) ->
+draw_layout_rectangle(Layout, Color, _State={S,_}, Width) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color),
-    epx:draw_rectangle(S#s.background_pixels,
-		       {Layout#layout.x,
-			Layout#layout.y,
-			Layout#layout.width,
-			Layout#layout.height}).
+    Rect = {Layout#layout.x,Layout#layout.y,Width,Layout#layout.height},
+    epx:draw_rectangle(S#s.background_pixels, Rect).
+
 
 %% draw hightlight background return text color and flag to signal remove
 highlight(FID, Pos, Color, Rect, _State={S,_}) ->
@@ -1126,7 +1180,7 @@ update_layout(OldLayout, NewLayout, State={S,_D}) ->
     clear_layout_background(OldLayout, State),
     Layout = position_layout(NewLayout, State),
     ets:insert(S#s.frame_layout, Layout),
-    redraw_layout(Layout, State, Layout#layout.width).
+    redraw_layout(Layout, State, S#s.width). %% Layout#layout.width).
 
 layout_from_position(X, Y, _State={S,_D}) ->
     Tab = S#s.frame_layout,
