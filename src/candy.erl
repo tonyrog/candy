@@ -27,11 +27,13 @@
 
 %% API
 -export([start/0, start/1]).
+-export([status/0]).
 -export([start_link/0, start_link/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
+-import(lists, [foldl/3]).
 
 -include_lib("can/include/can.hrl").
 
@@ -46,6 +48,15 @@
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
 -define(TEXT_HIGHLIGHT_COLOR,    {0,255,255,255}). %% white hight light
+-define(SCROLL_BAR_SIZE,         16).
+-define(SCROLL_BAR_COLOR,        {240,240,240}).
+-define(SCROLL_HNDL_SIZE,        10).
+-define(SCROLL_HNDL_COLOR,       {127,127,127}).
+-define(SCROLL_HORIZONTAL,       bottom).
+-define(SCROLL_VERTICAL,         right).
+
+-define(XSTEP, 0).
+-define(YSTEP, 8).
 
 -record(fmt,
 	{
@@ -96,7 +107,7 @@
 	 window :: epx:epx_window(),  %% attached window
 	 font   :: epx:epx_font(),
 	 %% foreground_pixels :: epx:epx_pixmap(),
-	 background_pixels :: epx:epx_pixmap(),
+	 pixels :: epx:epx_pixmap(),
 	 frame,          %% ets: #can_frame{}
 	 frame_layout,   %% ets: #layout{}
 	 frame_counter,  %% ets: ID -> Counter
@@ -123,7 +134,20 @@
 	 ctrl   = false,
 	 shift  = false,
 	 tick :: undefined | reference(),
-	 selected = []
+	 selected = [],
+	 view_xpos = 0,   %% scroll x
+	 view_ypos = 0,   %% scroll y
+	 view_left = 0    :: integer(),
+	 view_right = 0   :: integer(),
+	 view_top = 0     :: integer(),
+	 view_bottom = 0  :: integer(),
+	 hscroll          :: undefined | epx:epx_rect(),
+	 hhndl            :: undefined | epx:epx_rect(),
+	 vscroll          :: undefined | epx:epx_rect(),
+	 vhndl            :: undefined | epx:epx_rect(),
+	 motion           :: undefined |
+			     {vhndl,epx:epx_point()} |
+			     {hhndl,epx:epx_point()}
 	}).
 
 %%
@@ -132,13 +156,16 @@
 %%  {#s{}, #d{}}
 %%
 
+status() ->
+    io:format("candy is running\n").
+
 %%%===================================================================
 %%% API
 %%%===================================================================
 start() ->
     start(any).
 start(Model) ->
-    (catch error_logger:tty(true)),
+    (catch error_logger:tty(false)),
     application:ensure_all_started(?MODULE),
     can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
@@ -175,7 +202,6 @@ start_link(Model) ->
 %%--------------------------------------------------------------------
 init([Model]) ->
     can_router:attach(),
-    Format = argb,
     {ok,Font} = epx_font:match([{name,"Courier New"},{size,?FONT_SIZE}]),
     epx_gc:set_font(Font),
     S0 = #s{},
@@ -194,12 +220,12 @@ init([Model]) ->
 	S0#s.right_offset,
     Window = epx:window_create(40, 40, Width, Height,
 			       [button_press,button_release,
-				key_press, key_release]),
-    Bg = epx:pixmap_create(Width, Height, Format),
+				key_press, key_release, configure]),
+    Bg = epx:pixmap_create(Width, Height, argb),
     epx:pixmap_fill(Bg, ?BACKGROUND_COLOR),
     epx:window_attach(Window),
     epx:pixmap_attach(Bg),
-
+    epx:window_adjust(Window, [{name, "Candy"}]),
     S1 = S0#s {
 	   width = Width,
 	   height = Height,
@@ -210,7 +236,7 @@ init([Model]) ->
 	   glyph_ascent = epx:font_info(Font, ascent),
 	   background_color = ?BACKGROUND_COLOR,
 	   %% foreground_pixels = Fg,
-	   background_pixels = Bg,
+	   pixels = Bg,
 	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
 	   frame_layout  = ets:new(frame_layout, [{keypos,#layout.id}]),
 	   frame_counter = ets:new(frame_counter, []),
@@ -225,37 +251,35 @@ init([Model]) ->
     ets:insert(S1#s.frame_counter, {layout_pos, 0}),
     ets:insert(S1#s.frame_counter, {collapsed_pos, 0}),
     State1 = load_frame_layout(Model, State),
-    update_window(State1),
-    {ok, State1}.
+    {ok, update_window(State1)}.
 
 %% Load data display for various models (test)
 load_frame_layout(prius, State) ->
     %% Break information bit 7 press=1, release=0
-    load_pid(16#030, "Break",
-	     [#fmt { field=data, base=2, type=unsigned, bits=[{0,1}]}],
-	     State),
-    %% Steering?
-    load_pid(16#025, "Steer",
-	     [#fmt { field=data, base=10, type=unsigned, bits=[{0,16}]}], 
-	     State),
-
-    %% Speed
-    load_pid(16#0B4, "Speed",
-	     [#fmt { field=data, base=10, type=unsigned,
-		     bits=[{40,16}]}], 
-	     State),
-    %% Speed
-    load_pid(16#244, "Veloc",
-	     [
-	      %% speed, 0x150=10km/h, 0x300=20km 0x700=50km/h 
-	      #fmt { field=data, base=10, type=signed,
-		     bits=[{32,16}]},
-	      %% gas pedal
-	      #fmt { field=data, base=10, type=unsigned,
-		     bits=[{56,8}]}
-	     ], State),
-    State;
+    load_pid_list(
+      [{16#030, "Break",
+	[#fmt { field=data, base=2, type=unsigned, bits=[{0,1}]}]},
+       {16#025, "Steer",
+	[#fmt { field=data, base=10, type=unsigned, bits=[{0,16}]}]},
+       {16#0B4, "Speed",
+	[#fmt { field=data, base=10, type=unsigned,
+		bits=[{40,16}]}]},
+       {16#244, "Veloc",
+	[
+	 %% speed, 0x150=10km/h, 0x300=20km 0x700=50km/h 
+	 #fmt { field=data, base=10, type=signed,
+		bits=[{32,16}]},
+	 %% gas pedal
+	 #fmt { field=data, base=10, type=unsigned,
+		bits=[{56,8}]}
+	]}], State);
 load_frame_layout(_, State) ->
+    State.
+
+load_pid_list([{FID,Name,FormList}|List], State) ->
+    State1 = load_pid(FID,Name,FormList,State),
+    load_pid_list(List, State1);
+load_pid_list([], State) ->
     State.
 
 %% Note! just 11-bit format now!
@@ -279,12 +303,12 @@ load_pid(FID, Name, FormList, State={S,_D}) ->
 	    format = Format
 	   },
     L1 = position_layout(L0, State),
-    ets:insert(S#s.frame_layout, L1),
+    State1 = insert_layout(L1, State),
     ets:insert(S#s.frame_counter, {FID, 0}),
     ets:insert(S#s.frame, #can_frame{id=FID,len=8,
 					     data=(<<0,0,0,0,0,0,0,0>>)
 					    }),
-    redraw(FID, State).
+    redraw(FID, State1).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -352,105 +376,37 @@ handle_info(Frame=#can_frame{id=FID}, State={S,_}) ->
 	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
 		Pos <- lists:seq(1,tuple_size(Format))  ],
 
-	    LayoutPos = ets:update_counter(S#s.frame_counter,
-					   layout_pos, 1),
+	    LayoutPos = ets:update_counter(S#s.frame_counter,layout_pos,1),
 
-	    Layout1 = #layout { id=FID, pos=LayoutPos, format=Format},
+	    Layout1 = #layout { id=FID, pos=LayoutPos, format=Format },
 	    Layout2 = position_layout(Layout1, State),
-	    ets:insert(S#s.frame_layout, Layout2),
+
+	    State1 = insert_layout(Layout2, State),
 	    ets:insert(S#s.frame_counter, {FID, 1}),
 	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
-	    redraw(FID, State),
-	    {noreply, tick_restart(State)}
+	    %% redraw(FID, State1),
+	    State2 = redraw_layout(Layout2, State1),
+	    State3 = repaint_layout(Layout2, State2, 0),
+	    {noreply, tick_restart(State3)}
     end;
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
     case redraw_anim(State) of
 	false ->
 	    {noreply, {S, D#d { tick = undefined }}};
 	true ->
-	    update_window(State),
-	    {noreply, tick_start(State)}
+	    State1 = update_window(State),
+	    {noreply, tick_start(State1)}
     end;
 
-handle_info({epx_event, Win, close}, State={S,_D}) 
-  when Win =:= S#s.window ->
-    %% io:format("Got window close\n", []),
-    erlang:halt(0),   %% temporary hack
-    {stop, normal, State};
-handle_info({epx_event, Win, {button_press,[left],{X,Y,_}}}, State={S,D})
-  when Win =:= S#s.window ->
-    case layout_from_position(X, Y, State)  of
-	false ->
-	    {noreply, deselect(State, [])};
-	Layout ->
-	    case fmt_from_position(X, Y, Layout) of
-		false ->
-		    {noreply, deselect(State, [])};
-
-		{_I, Fmt} when Fmt#fmt.field =:= hide ->
-		    Layout1 = Layout#layout { style = collapsed },
-		    update_layout(Layout, Layout1, State),
-		    {noreply, State};
-		
-		{_I, Fmt} when Fmt#fmt.field =:= id,
-			       Layout#layout.style =:= collapsed ->
-		    Layout1 = Layout#layout { style = normal },
-		    update_layout(Layout, Layout1, State),
-		    {noreply, State};
-
-		{I, _Fmt} when D#d.shift ->  %% add to selection
-		    FID = Layout#layout.id,
-		    Selected = lists:usort([{FID,I}|D#d.selected]),
-		    D1 = D#d { selected = Selected },
-                    State1 =  {S,D1},
-		    redraw(FID, State1),
-		    {noreply, State1};
-
-		{I, _Fmt} ->
-		    FID = Layout#layout.id,
-		    State1 = deselect(State, [{FID,I}]),
-		    {noreply, State1}
-	    end
+handle_info({epx_event, Win, Event}, State={S,_}) when S#s.window =:= Win ->
+    try epx_event(Event, State) of
+	Return -> Return
+    catch
+	error:Reason:Stack ->
+	    io:format("crash: ~p\n", [Reason]),
+	    io:format("~p\n", [Stack]),
+	    {noreply, State}
     end;
-handle_info({epx_event, _Win, {button_release,[left],{_X,_Y,_}}}, State) ->
-    {noreply, State};
-
-handle_info({epx_event, Win, {key_press, Sym, Mod, _Code}}, _State={S,D}) when
-      Win =:= S#s.window ->
-    Shift = case lists:member(shift,Mod) of
-		true -> true;
-		false -> D#d.shift
-	    end,
-    Ctrl = case lists:member(ctrl,Mod) of
-	       true -> true;
-	       false -> D#d.ctrl
-	   end,
-    Alt = case lists:member(alt,Mod) of
-	      true -> true;
-	      false -> D#d.alt				   
-	  end,
-    D1 = D#d { shift=Shift, ctrl=Ctrl, alt=Alt},
-    State2 = command(Sym, D#d.selected, {S,D1}),
-    {noreply, State2};    
-
-handle_info({epx_event, Win, {key_release, _Sym, Mod, _code}},_State={S,D}) 
-  when Win =:= S#s.window ->
-    %% %% io:format("Key release ~p mod=~p\n", [_Sym,Mod]),
-    Shift = case lists:member(shift,Mod) of
-		true -> false;
-		false -> D#d.shift
-	    end,
-    Ctrl = case lists:member(ctrl,Mod) of
-	       true -> false;
-	       false -> D#d.ctrl
-	   end,
-    Alt = case lists:member(alt,Mod) of
-	      true -> false;
-	      false -> D#d.alt
-	  end,
-    D1 = D#d { shift = Shift, ctrl = Ctrl, alt = Alt },
-    {noreply, {S,D1}};
-
 
 handle_info(_Info, State) ->
     io:format("Got info ~p\n", [_Info]),
@@ -469,7 +425,7 @@ handle_info(_Info, State) ->
 %% @end
 %%--------------------------------------------------------------------
 terminate(_Reason, {S,_D}) ->
-    epx:pixmap_detach(S#s.background_pixels),
+    epx:pixmap_detach(S#s.pixels),
     epx:window_detach(S#s.window),
     ok.
 
@@ -488,6 +444,212 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+
+epx_event(close, State={_S,_D}) ->
+    %% io:format("Got window close\n", []),
+    erlang:halt(0),   %% temporary hack
+    {stop, normal, State};
+epx_event({button_press,[left],{X0,Y0,_}}, State={_S,D}) ->
+    case scroll_hit({X0,Y0}, State) of
+	false ->
+	    Pos = {X0+D#d.view_xpos, Y0+ D#d.view_ypos},
+	    case layout_from_position(Pos, State) of
+		false ->
+		    {noreply, deselect(State, [])};
+		Layout ->
+		    {noreply, cell_hit(Pos,Layout,State)}
+	    end;
+	State1 ->
+	    {noreply, State1}
+    end;
+
+epx_event({button_release,[left],{_X,_Y,_}}, State={S,D}) ->
+    case D#d.motion of
+	undefined ->
+	    {noreply, State};
+	{vhndl,_Delta} ->
+	    epx:window_disable_events(S#s.window, [motion]),
+	    {noreply, {S,D#d { motion = undefined }}};
+	{hhndl,_Delta} ->
+	    epx:window_disable_events(S#s.window, [motion]),
+	    {noreply, {S,D#d { motion = undefined }}}
+    end;
+
+epx_event({motion,_Button,{X1,Y1,_}},State={S,D}) ->
+    case D#d.motion of
+	{vhndl,{_DX,Dy}} ->
+	    {_,_,_,H} = D#d.vscroll,
+	    VH = (D#d.view_bottom - D#d.view_top),
+	    Y2  = trunc((Y1-Dy)*(VH/H)),
+	    B = max(0,(D#d.view_bottom + S#s.bottom_offset)-H),
+	    Y  = if Y2 < 0 -> 0;
+		    Y2 > B -> B;
+		    true -> Y2
+		 end,
+	    State1 = {S, D#d { view_ypos = Y }},
+	    {noreply,redraw(State1)};
+	{hhndl,{Dx,_Dy}} ->
+	    {_,_,W,_} = D#d.hscroll,
+	    VW = (D#d.view_right - D#d.view_left),
+	    X2  = trunc((X1-Dx)*(VW/W)),
+	    R = max(0, (D#d.view_right-S#s.right_offset)-W),
+	    X = if X2 < 0 -> 0;
+		   X2 > R -> R;
+		   true -> X2
+		end,
+	    State1 = {S, D#d { view_xpos = X }},
+	    {noreply,redraw(State1)}; 
+	_ ->
+	    {noreply,State}
+    end;
+
+epx_event({button_press,[wheel_down],{_X,_Y,_}},State) ->
+    {noreply, State};
+epx_event({button_release,[wheel_down],{_X,_Y,_}},State={S,_D}) ->
+    flush_wheel(S#s.window),
+    {noreply, scroll_down(State)};
+
+epx_event({button_press,[wheel_up],{_X,_Y,_}},State) ->
+    {noreply, State};
+epx_event({button_release,[wheel_up],{_X,_Y,_}},State={S,_D}) ->
+    flush_wheel(S#s.window),
+    {noreply, scroll_up(State)};
+
+epx_event({button_press,[wheel_left],{_X,_Y,_}}, State) ->
+    {noreply, State};
+epx_event({button_release,[wheel_left],{_X,_Y,_}},State={S,_D}) ->
+    flush_wheel(S#s.window),
+    {noreply, scroll_left(State)};
+
+epx_event({button_press,[wheel_right],{_X,_Y,_}}, State) ->
+    {noreply, State};    
+epx_event({button_release,[wheel_right],{_X,_Y,_}},State={S,_D}) ->
+    flush_wheel(S#s.window),
+    {noreply, scroll_right(State)};
+
+epx_event({key_press, Sym, Mod, _Code}, _State={S,D}) ->
+    Shift = case lists:member(shift,Mod) of
+		true -> true;
+		false -> D#d.shift
+	    end,
+    Ctrl = case lists:member(ctrl,Mod) of
+	       true -> true;
+	       false -> D#d.ctrl
+	   end,
+    Alt = case lists:member(alt,Mod) of
+	      true -> true;
+	      false -> D#d.alt				   
+	  end,
+    D1 = D#d { shift=Shift, ctrl=Ctrl, alt=Alt},
+    State2 = command(Sym, D#d.selected, {S,D1}),
+    {noreply, State2};    
+
+epx_event({key_release, _Sym, Mod, _code},_State={S,D}) ->
+    %% %% io:format("Key release ~p mod=~p\n", [_Sym,Mod]),
+    Shift = case lists:member(shift,Mod) of
+		true -> false;
+		false -> D#d.shift
+	    end,
+    Ctrl = case lists:member(ctrl,Mod) of
+	       true -> false;
+	       false -> D#d.ctrl
+	   end,
+    Alt = case lists:member(alt,Mod) of
+	      true -> false;
+	      false -> D#d.alt
+	  end,
+    D1 = D#d { shift = Shift, ctrl = Ctrl, alt = Alt },
+    {noreply, {S,D1}};
+
+epx_event({configure, Rect},_State={S,D}) ->
+    {_X,_Y,W,H} = flush_configure(S#s.window, Rect),
+    Pixels = resize_pixmap(S#s.pixels, W, H),
+    State1 = {S#s { width=W, height=H,  pixels=Pixels }, D},
+    redraw(State1),
+    {noreply, State1};
+epx_event(Event, State) ->
+    io:format("Got epx event ~p\n", [Event]),
+    {noreply, State}.
+
+scroll_hit(Pos, _State={S,D}) ->
+    case epx_rect:contains(D#d.hscroll, Pos) of
+	true ->
+	    case epx_rect:contains(D#d.hhndl, Pos) of
+		true ->
+		    epx:window_enable_events(S#s.window, [motion]),
+		    {Xv,Yv,_,_} = D#d.hhndl,
+		    {Xp,Yp} = Pos,
+		    Delta = {Xp-Xv, Yp-Yv},
+		    {S,D#d{motion={hhndl,Delta}}};
+		false ->
+		    {_,_,W,_} = D#d.hscroll,
+		    {_,_,Vw,_} = D#d.vhndl,
+		    {Xp,_Yp} = Pos,
+		    VW = (D#d.view_right - D#d.view_left),
+		    X2  = trunc((Xp-(Vw div 2))*(VW/W)),
+		    R = max(0, (D#d.view_right-S#s.right_offset)-W),
+		    X = if X2 < 0 -> 0;
+			   X2 > R -> R;
+			   true -> X2
+			end,
+		    State1 = {S, D#d { view_xpos = X }},
+		    redraw(State1)
+	    end;
+	false ->
+	    case epx_rect:contains(D#d.vscroll, Pos) of
+		true ->
+		    case epx_rect:contains(D#d.vhndl, Pos) of
+			true ->
+			    epx:window_enable_events(S#s.window, [motion]),
+			    {Xv,Yv,_,_} = D#d.vhndl,
+			    {Xp,Yp} = Pos,
+			    Delta = {Xp-Xv, Yp-Yv},
+			    %% activate motion
+			    {S,D#d{motion={vhndl,Delta}}};
+			false ->
+			    {_,_,_,H} = D#d.vscroll,
+			    {_,_,_,Vh} = D#d.vhndl,
+			    {_Xp,Yp} = Pos,
+			    VH = (D#d.view_bottom - D#d.view_top),
+			    Y2  = trunc((Yp-(Vh div 2))*(VH/H)),
+			    B = max(0,(D#d.view_bottom+S#s.bottom_offset)-H),
+			    Y  = if Y2 < 0 -> 0;
+				    Y2 > B -> B;
+				    true -> Y2
+				 end,
+			    State1 = {S, D#d { view_ypos = Y }},
+			    redraw(State1)
+		    end;
+		false ->
+		    false
+	    end
+    end.
+
+cell_hit(Pos, Layout, State={S,D}) ->
+    case fmt_from_position(Pos, Layout) of
+	false ->
+	    deselect(State, []);
+	{_I, Fmt} when Fmt#fmt.field =:= hide ->
+	    Layout1 = Layout#layout { style = collapsed },
+	    update_layout(Layout, Layout1, State);
+		
+	{_I, Fmt} when Fmt#fmt.field =:= id,
+		       Layout#layout.style =:= collapsed ->
+	    Layout1 = Layout#layout { style = normal },
+	    update_layout(Layout, Layout1, State);
+
+	{I, _Fmt} when D#d.shift ->  %% add to selection
+	    FID = Layout#layout.id,
+	    Selected = lists:usort([{FID,I}|D#d.selected]),
+	    D1 = D#d { selected = Selected },
+	    State1 =  {S,D1},
+	    redraw(FID, State1);
+
+	{I, _Fmt} ->
+	    FID = Layout#layout.id,
+	    deselect(State, [{FID,I}])
+    end.
+
 %%
 %% Commands on Selected elements:
 %%   X              Hexadecimal format
@@ -505,43 +667,37 @@ code_change(_OldVsn, State, _Extra) ->
 %% Global commands
 %%
 command($x, Selected, State) ->
-    set_base(Selected, 16, State),
-    State;
+    set_base(Selected, 16, State);
 command($d, Selected, State) ->
-    set_base(Selected, 10, State),
-    State;
+    set_base(Selected, 10, State);
 command($o, Selected, State) ->
-    set_base(Selected, 8, State),
-    State;
+    set_base(Selected, 8, State);
 command($b, Selected, State) ->
-    set_base(Selected, 2, State),
-    State;
+    set_base(Selected, 2, State);
 command($G, Selected, State={_S,D}) when D#d.shift ->
-    FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foreach(fun(FID) -> split_half_fid(FID, Selected, State) end, FIDs),
-    State;
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
 
-command($g, Selected, State = {S,D}) ->
-    FIDs = lists:usort([FID || {FID,_} <- Selected]),
+command($g, Selected, _State = {S,D}) ->
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
     %% select min pos foreach FID and keep as selected
     Selected1 = lists:foldl(
 		  fun(FID, Acc) ->
 			  MinPos = lists:min([Pos || {F,Pos} <- Selected, 
 						     F =:= FID]),
 			  [{FID,MinPos}|Acc]
-		  end, [], FIDs),
+		  end, [], Fs),
     State1 = {S, D#d { selected = Selected1 }},
-    lists:foreach(fun(FID) -> merge_fid(FID, Selected, State1) end, FIDs),
-    State1;
+    foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
 
-command($s, Selected, State={S,D}) when D#d.ctrl ->
+command($s, Selected, State={_S,D}) when D#d.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
     Bytes = 
 	lists:foldr(
 	  fun(FID,Acc) ->
 		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
 		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-		  [L] = ets:lookup(S#s.frame_layout, FID),
+		  L = lookup_layout(State, FID),
 		  Format = L#layout.format,
 		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
 		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
@@ -552,7 +708,7 @@ command($s, Selected, State={S,D}) when D#d.ctrl ->
 		      integer_to_list(Len)] || {B,Len} <- G]
 		    || G <- Bs],
 		   "\n" | Acc]
-	  end, [], FIDs),    
+	  end, [], FIDs),
     file:write_file("candy.bits", 
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
@@ -561,37 +717,69 @@ command($q, _Selected, State) ->
     erlang:halt(0),
     State;
 command(I, Selected, State) when I >= $1, I =< $8 ->
-    FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foreach(fun(FID) -> split_fid(FID, Selected, I-$0,State) end, FIDs),
-    State;
-command(Symbol, Selected, State) ->
-    io:format("command ~p selected=~p\n", [Symbol, Selected]),
-    State.
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, State, Fs);
 
+command(up, _Selected, State) ->
+    scroll_up(State);
+command(down, _Selected, State) ->
+    scroll_down(State);
+
+command(_Symbol, _Selected, State) ->
+    io:format("command ~p selected=~p\n", [_Symbol, _Selected]),
+    State.
 
 %% deselect all and selecte the NewSelected
 deselect({S,D}, NewSelected) ->
-    FIDs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
+    Fs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
     State = {S, D#d { selected = NewSelected }},
-    lists:foreach(fun(FID) -> redraw(FID, State) end, FIDs),
-    State.
+    State1 = foldl(fun(FID,Si) -> redraw_(FID, Si) end, State, Fs),
+    update_window(State1).
+
+scroll_up(_State={S,D}) ->
+    Y = max(0, D#d.view_ypos - ?YSTEP),
+    State1 = {S, D#d { view_ypos = Y }},
+    redraw(State1).
+
+scroll_down(_State={S,D}) ->
+    H = if D#d.hscroll =:= undefined -> S#s.height;
+	   true -> S#s.height - ?SCROLL_BAR_SIZE
+	end,
+    B = max(0, (D#d.view_bottom+S#s.bottom_offset) - H),
+    Y = min(D#d.view_ypos + ?YSTEP, B),
+    State1 = {S, D#d { view_ypos = Y }},
+    redraw(State1).
+
+scroll_left(_State={S,D}) ->
+    X = max(0, D#d.view_xpos -  ?XSTEP),
+    State1 = {S, D#d { view_xpos = X }},
+    redraw(State1).
+
+scroll_right(_State={S,D}) ->
+    W = if D#d.vscroll =:= undefined -> S#s.width;
+	   true ->  S#s.width - ?SCROLL_BAR_SIZE
+	end,
+    R = max(0, (D#d.view_right - S#s.right_offset) - W),
+    X = min(D#d.view_xpos + ?XSTEP, R),
+    State1 = {S, D#d { view_xpos = X }},
+    redraw(State1).
 
 %% Set base to 'Base' in selected cells
-set_base(Selected, Base, State={S,_D}) ->
-    lists:foreach(
-      fun({FID,I}) ->
-	      [L=#layout{format=Format}] = ets:lookup(S#s.frame_layout,FID),
+set_base(Selected, Base, State) ->
+    foldl(
+      fun({FID,I}, Si) ->
+	      L= #layout{format=Format} = lookup_layout(FID,Si),
 	      Fmt = element(I, Format),
 	      if Fmt#fmt.field =:= data ->
 		      Fmt1 = Fmt#fmt { base = Base },
 		      Format1 = setelement(I, Format, Fmt1),
 		      L1 = L#layout{format=Format1},
-		      ets:insert(S#s.frame_layout,L1),
-		      update_layout(L, L1, State);
+		      Si1 = insert_layout(L1, Si),
+		      update_layout(L, L1, Si1);
 		 true ->
-		      ignore
+		      Si
 	      end
-      end, Selected).
+      end, State, Selected).
 
 select_fmts(I,[Fmt|FmtList],Acc,Sel) when  Fmt#fmt.field =:= data ->
     case lists:member(I, Sel) of
@@ -604,39 +792,38 @@ select_fmts(_I,[],Acc,_Sel) ->
     lists:reverse(Acc).
 
 %% split Selected group in FID in sizes of Size bits
-split_fid(FID, Selected, Size,State={S,_D}) ->
+split_fid(FID, Selected, Size,State) ->
     Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    [L] = ets:lookup(S#s.frame_layout, FID),
+    L = lookup_layout(FID, State),
     Format = L#layout.format,
     FmtList1 = split_size(1, Size, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    ets:insert(S#s.frame_layout,L1),
-    update_layout(L, L1, State).
+    State1 = insert_layout(L1, State),
+    update_layout(L, L1, State1).
 
-
-split_half_fid(FID, Selected, State={S,_D}) ->
+split_half_fid(FID, Selected, State) ->
     Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    [L] = ets:lookup(S#s.frame_layout, FID),
+    L = lookup_layout(FID, State),
     Format = L#layout.format,
     FmtList1 = split_halfs(1, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    ets:insert(S#s.frame_layout,L1),
-    update_layout(L, L1, State).
+    State1 = insert_layout(L1, State),
+    update_layout(L, L1, State1).
 
-merge_fid(FID, Selected, State={S,_D}) ->
+merge_fid(FID, Selected, State) ->
     Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    [L] = ets:lookup(S#s.frame_layout, FID),
+    L = lookup_layout(FID, State),
     Format = L#layout.format,
     FmtList1 = merge_fmts(1, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    ets:insert(S#s.frame_layout,L1),
-    update_layout(L, L1, State).
+    State1 = insert_layout(L1, State),
+    update_layout(L, L1, State1).
 
 %% merge selected data bit fields
 merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when 
@@ -762,9 +949,8 @@ bits_int32(Pos) -> [{Pos,32}].
 bits_int16_LE(Pos) -> [{Pos+8,8},{Pos,8}].
 bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
 
-diff_frames(FID, New, Old, State={S,_}) ->
-    [Layout] = ets:lookup(S#s.frame_layout, FID),
-    #layout{format=Format} = Layout,
+diff_frames(FID, New, Old, State) ->
+    #layout{format=Format} = Layout = lookup_layout(FID, State),
     case diff_frames_(1,Format,FID,New,Old,[],State) of
 	[] -> [];
 	_Diff when Layout#layout.style =:= collapsed -> 
@@ -817,39 +1003,64 @@ redraw_anim_(Key={FID,Pos}, Remove, Update, State={S,_}) ->
 redraw_anim_('$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
+redraw(State={S,_D}) ->
+    Tab = S#s.frame_layout,
+    epx:pixmap_fill(S#s.pixels, ?BACKGROUND_COLOR),
+    Key = ets:first(Tab),
+    State1 = redraw_all(Tab, Key, State),
+    NeedH = case need_horizontal_scrollbar(State1) of
+		true ->  ?SCROLL_HORIZONTAL;
+		false -> none
+	    end,
+    NeedV = case need_vertical_scrollbar(State1) of
+		true -> ?SCROLL_VERTICAL;
+		false -> none
+	    end,
+    State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,NeedH),
+    State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,NeedV),
+    update_window(State3).
+    
+redraw_all(_Tab, '$end_of_table', State) ->
+    State;
+redraw_all(Tab, FID, State) ->
+    State1 = redraw_(FID, State),
+    redraw_all(Tab, ets:next(Tab, FID), State1).
+
+redraw_(FID, State) ->
+    Layout = lookup_layout(FID, State),
+    redraw_layout(Layout, State).
 
 redraw(FID, State) ->
     redraw(FID, State, 0).
 
-redraw(FID, State={S,_D}, MinW) ->
-    [Layout] = ets:lookup(S#s.frame_layout, FID),
-    redraw_layout(Layout, State, MinW).
+redraw(FID, State, MinW) ->
+    Layout = lookup_layout(FID, State),
+    State1 = redraw_layout(Layout, State),
+    repaint_layout(Layout, State1, MinW).
 
-redraw_layout(Layout, State={S,_D}, MinW) ->
-    #layout{ id=FID, color=Color,x=X,y=Y,width=W,height=H,format=Format} = 
-	Layout,
+redraw_layout(Layout, State={S,_D}) ->
+    #layout{ id=FID, color=Color,format=Format} = Layout,
     %% Count = ets:lookup_element(S#s.frame_counter, FID, 2),
     draw_layout_background(Layout, State),
     [Frame] = ets:lookup(S#s.frame, FID),
     case Layout#layout.style of
 	collapsed ->
-	    redraw_fmt(FID,?ID_FMT_POSITION,Color,
-		       element(?ID_FMT_POSITION,Format),Frame,State);
+	    _Remove = redraw_fmt(FID,?ID_FMT_POSITION,Color,
+				 element(?ID_FMT_POSITION,Format),Frame,State),
+	    State;
 	_ ->
 	    redraw_frame(FID,1,Color,Format,Frame,State)
-    end,
-    update_window(State, {X,Y,max(W,MinW),H}).
+    end.
 
 redraw_frame(FID,Pos,Color,Format,Frame,State) when Pos =< tuple_size(Format) ->
     Fmt = element(Pos, Format),
-    redraw_fmt(FID,Pos,Color,Fmt,Frame,State),
+    _Remove = redraw_fmt(FID,Pos,Color,Fmt,Frame,State),
     redraw_frame(FID,Pos+1,Color,Format,Frame,State);
-redraw_frame(_FID,_Pos,_Color,_Format,_Frame,_State) ->
-    ok.
+redraw_frame(_FID,_Pos,_Color,_Format,_Frame,State) ->
+    State.
 
-redraw_pos(FID,Pos,Frame,State={S,_}) ->
-    [Layout] = ets:lookup(S#s.frame_layout, FID),
-    #layout{ color=Color, format=Format} = Layout,
+redraw_pos(FID,Pos,Frame,State) ->
+    #layout{ color=Color, format=Format} = Layout = lookup_layout(FID, State),
     if Layout#layout.style =:= collapsed ->
 	    redraw_pos(FID,?ID_FMT_POSITION,Color,Format,Frame,State);
        true ->
@@ -865,7 +1076,9 @@ redraw_pos(FID,Pos,Color,Format,Frame,State) ->
     end.
 
 redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
-    #fmt {x=X,y=Y,width=W,height=H} = Fmt,
+    #fmt {x=X0,y=Y0,width=W,height=H} = Fmt,
+    X = X0 - D#d.view_xpos,
+    Y = Y0 - D#d.view_ypos,
     {Remove,TextColor} = highlight(FID,Pos,Color,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
     %% draw shape
@@ -878,7 +1091,7 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 		true -> epx_gc:set_border_width(2);
 		_ -> epx_gc:set_border_width(0)
 	    end,
-	    epx:draw_rectangle(S#s.background_pixels, {X,Y,W,H}),
+	    epx:draw_rectangle(S#s.pixels, {X,Y,W,H}),
 	    epx_gc:set_border_width(0);
        true ->
 	    ok
@@ -888,21 +1101,21 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
     if Fmt#fmt.field =:= data ->
 	    case Fmt#fmt.base of
 		2  ->
-		    epx:pixmap_put_pixels(S#s.background_pixels,
+		    epx:pixmap_put_pixels(S#s.pixels,
 					  X+1,Y+1,6,7,argb,bin_icon(),blend),
-		    epx:draw_rectangle(S#s.background_pixels,{X,Y,8,9});
+		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
 		8  ->
-		    epx:pixmap_put_pixels(S#s.background_pixels,
+		    epx:pixmap_put_pixels(S#s.pixels,
 					  X+1,Y+1,6,7,argb,oct_icon(),blend),
-		    epx:draw_rectangle(S#s.background_pixels,{X,Y,8,9});
+		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
 		16 ->
-		    epx:pixmap_put_pixels(S#s.background_pixels,
+		    epx:pixmap_put_pixels(S#s.pixels,
 					  X+1,Y+1,6,7,argb,hex_icon(),blend),
-		    epx:draw_rectangle(S#s.background_pixels,{X,Y,8,9});
+		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
 		10 ->
-		    epx:pixmap_put_pixels(S#s.background_pixels,
+		    epx:pixmap_put_pixels(S#s.pixels,
 					  X+1,Y+1,6,7,argb,dec_icon(),blend),
-		    epx:draw_rectangle(S#s.background_pixels,{X,Y,8,9});
+		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
 		0  ->
 		    false
 	    end;
@@ -934,10 +1147,10 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 		end,
 	    Ya = Y+1+S#s.glyph_ascent,
 	    Offs = 2,
-	    epx:draw_string(S#s.background_pixels,X+Offs,Ya,String);
+	    epx:draw_string(S#s.pixels,X+Offs,Ya,String);
 	hide ->
 	    epx:pixmap_copy_area(S#s.hide, 
-				 S#s.background_pixels,
+				 S#s.pixels,
 				 0, 0, X+2, Y+2, 16, 16, [blend]);
 	_ ->
 	    String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
@@ -945,7 +1158,7 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 	    Offs = if Fmt#fmt.base > 0, Fmt#fmt.field =:= data -> 6+2;
 		      true -> 2
 		   end,
-	    epx:draw_string(S#s.background_pixels, X+Offs, Ya, String)
+	    epx:draw_string(S#s.pixels, X+Offs, Ya, String)
     end,
     Remove.
 
@@ -960,12 +1173,92 @@ clear_layout_background(Layout, State={S,_}) ->
     draw_layout_rectangle(Layout, S#s.background_color, State, 
 			  S#s.width).
 
-draw_layout_rectangle(Layout, Color, _State={S,_}, Width) ->
+draw_layout_rectangle(Layout, Color, _State={S,D}, Width) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color),
-    Rect = {Layout#layout.x,Layout#layout.y,Width,Layout#layout.height},
-    epx:draw_rectangle(S#s.background_pixels, Rect).
+    X = Layout#layout.x - D#d.view_xpos,
+    Y = Layout#layout.y - D#d.view_ypos,
+    Rect = {X,Y,Width,Layout#layout.height},
+    epx:draw_rectangle(S#s.pixels, Rect).
 
+draw_scrollbar(State, left, HBar) ->
+    draw_vertical_scrollbar(State, 0, HBar);
+draw_scrollbar(State={S,_D}, right, HBar) ->
+    draw_vertical_scrollbar(State, S#s.width-?SCROLL_BAR_SIZE, HBar);
+draw_scrollbar(State, top, VBar) ->
+    draw_horizontal_scrollbar(State, 0, VBar);
+draw_scrollbar(State={S,_D}, bottom, VBar) ->
+    draw_horizontal_scrollbar(State, S#s.height-?SCROLL_BAR_SIZE, VBar).
+
+need_vertical_scrollbar(_State={S,D}) ->
+    WH = S#s.height,
+    VH = D#d.view_bottom - D#d.view_top,
+    VH > WH.
+
+draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
+    WH = if HBar =:= none -> S#s.height;
+	    true -> S#s.height - ?SCROLL_BAR_SIZE
+	 end,
+    VH = D#d.view_bottom - D#d.view_top,
+    if VH > WH ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
+	    Y0 = case HBar of
+		     none   -> 0;
+		     bottom -> 0;
+		     top    -> ?SCROLL_BAR_SIZE
+		 end,
+	    Rect = {X0,Y0,?SCROLL_BAR_SIZE,WH},
+	    DrawRect = {X0,0,?SCROLL_BAR_SIZE,S#s.height},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
+	    Part = WH / VH,
+	    HandleLength = trunc(Part*WH),
+	    Top = D#d.view_ypos,
+	    HandlePos = trunc(Part*Top),
+	    Pad = (?SCROLL_BAR_SIZE - ?SCROLL_HNDL_SIZE) div 2,
+	    HRect = {X0+Pad,Y0+HandlePos,?SCROLL_HNDL_SIZE,HandleLength},
+	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
+	    {S,D#d { vscroll=Rect, vhndl=HRect }};
+       true ->
+	    {S,D#d { vscroll=undefined, vhndl=undefined }}
+    end.
+
+need_horizontal_scrollbar(_State={S,D}) ->
+    WW = S#s.width,
+    VW = D#d.view_right - D#d.view_left,
+    VW > WW.
+	    
+%% fixme remove vertical scrollbar if present!
+draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
+    WW = if VBar =:= none -> S#s.width;
+	    true -> S#s.width - ?SCROLL_BAR_SIZE
+	 end,
+    VW = D#d.view_right - D#d.view_left,
+    if VW > WW ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
+	    X0 = case VBar of
+		     none -> 0;
+		     left -> 0;
+		     right -> ?SCROLL_BAR_SIZE
+		 end,
+	    Rect = {X0,Y0,WW,?SCROLL_BAR_SIZE},
+	    DrawRect = {0,Y0,S#s.width,?SCROLL_BAR_SIZE},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
+	    Part = WW / VW,
+	    Left = D#d.view_xpos,
+	    HandleLength = trunc(Part*WW),
+	    HandlePos = trunc(Part*Left),
+	    Pad = (?SCROLL_BAR_SIZE - ?SCROLL_HNDL_SIZE) div 2,
+	    HRect = {HandlePos,Y0+Pad,HandleLength,?SCROLL_HNDL_SIZE},
+	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
+	    {S,D#d { hscroll=Rect, hhndl=HRect }};
+       true ->
+	    {S,D#d { hscroll=undefined, hhndl=undefined }}
+    end.		
+    
 
 %% draw hightlight background return text color and flag to signal remove
 highlight(FID, Pos, Color, Rect, _State={S,_}) ->
@@ -975,7 +1268,7 @@ highlight(FID, Pos, Color, Rect, _State={S,_}) ->
 	[{_,0}] ->
 	    epx_gc:set_fill_style(solid),
 	    epx_gc:set_fill_color(Color#color.background),
-	    epx:draw_rectangle(S#s.background_pixels,Rect),
+	    epx:draw_rectangle(S#s.pixels,Rect),
 	    {true,  Color#color.foreground};
 	[{_,Val}] ->
 	    B1 =  Color#color.background1,
@@ -983,7 +1276,7 @@ highlight(FID, Pos, Color, Rect, _State={S,_}) ->
 	    B  = blend(Val, B1, B0),
 	    epx_gc:set_fill_style(solid),
 	    epx_gc:set_fill_color(B),
-	    epx:draw_rectangle(S#s.background_pixels,Rect),
+	    epx:draw_rectangle(S#s.pixels,Rect),
 	    T1 =  Color#color.foreground1,
 	    T0 =  Color#color.foreground,
 	    T  = blend(Val, T1, T0),
@@ -1027,14 +1320,24 @@ extend_bits(Data, MinSize) ->
     Size = bit_size(Data),
     Pad = MinSize - Size,
     <<Data/bitstring, 0:Pad>>.
+
+repaint_layout(Layout, State) ->
+    repaint_layout(Layout, State, 0).
+repaint_layout(Layout, State={_S,D}, MinW) ->
+    #layout { x=X0, y=Y0, width=W0, height=H0 } = Layout,
+    W1 = max(W0,MinW),
+    H1 = H0,
+    X1 = X0 - D#d.view_xpos,
+    Y1 = Y0 - D#d.view_ypos,
+    update_window(State, {X1,Y1,W1,H1}).
     
+update_window(State={S,_D},_R={X,Y,W,H}) ->
+    epx:pixmap_draw(S#s.pixels, S#s.window, X, Y, X, Y, W, H),
+    epx:sync(S#s.window),
+    State.
+
 update_window(State={S,_D}) ->
     update_window(State, {0,0,S#s.width,S#s.height}).
-    
-update_window({S,_D},{X,Y,W,H}) ->
-%%    epx:pixmap_copy_to(S#s.foreground_pixels,
-%%		       S#s.background_pixels),
-    epx:pixmap_draw(S#s.background_pixels, S#s.window, X, Y, X, Y, W, H).
 
 %% recalulate Layout
 position_layout(Layout, State) ->
@@ -1176,42 +1479,67 @@ collect_bits_([{P,L}|Ps], Data, Acc) ->
 collect_bits_([], _Data, Acc) ->
     Acc.
 
-update_layout(OldLayout, NewLayout, State={S,_D}) ->
+lookup_layout(FID, _State={S,_D}) ->
+    [L] = ets:lookup(S#s.frame_layout, FID),  %% lookup element
+    L.
+
+insert_layout(Layout, _State={S,D}) ->
+    ets:insert(S#s.frame_layout, Layout),
+    L = min(Layout#layout.x, D#d.view_left),
+    R = max(Layout#layout.x + Layout#layout.width, D#d.view_right),
+    T = min(Layout#layout.y, D#d.view_top),
+    B = max(Layout#layout.y + Layout#layout.height, D#d.view_bottom),
+    {S, D#d { view_left=L, view_right=R, view_top=T, view_bottom=B }}.
+
+update_layout(OldLayout, NewLayout, State={S,D}) ->
     clear_layout_background(OldLayout, State),
     Layout = position_layout(NewLayout, State),
-    ets:insert(S#s.frame_layout, Layout),
-    redraw_layout(Layout, State, S#s.width). %% Layout#layout.width).
+    State1 = insert_layout(Layout, State),
+    redraw_layout(Layout, State1),
+    MinW = if D#d.vscroll =:= undefined ->
+		   S#s.width;
+	      true ->
+		   S#s.width - ?SCROLL_BAR_SIZE
+	   end,
+    if OldLayout#layout.x =/= Layout#layout.x;
+       OldLayout#layout.y =/= Layout#layout.y ->
+	    %% if layout moved update old position
+	    repaint_layout(OldLayout, State1, MinW);
+       true ->
+	    ok
+    end,
+    repaint_layout(Layout, State1, MinW).
 
-layout_from_position(X, Y, _State={S,_D}) ->
+layout_from_position(Pos, _State={S,_D}) ->
     Tab = S#s.frame_layout,
     Key = ets:first(Tab),
-    layout_from_position_(X, Y, Tab, Key).
+    layout_from_position_(Pos, Tab, Key).
 
-layout_from_position_(_X, _Y, _Tab, '$end_of_table') ->
+layout_from_position_(_Pos, _Tab, '$end_of_table') ->
     false;
-layout_from_position_(X, Y, Tab, FID) ->
+layout_from_position_(Pos={X,Y}, Tab, FID) ->
     case ets:lookup(Tab, FID) of
 	[] ->
-	    layout_from_position_(X, Y, Tab, ets:next(Tab, FID));
+	    layout_from_position_(Pos, Tab, ets:next(Tab, FID));
 	[Layout=#layout{x=X1,y=Y1,width=W,height=H}] ->
 	    if X >= X1, Y >= Y1, X < X1+W, Y < Y1+H ->
 		    Layout;
 	       true ->
-		    layout_from_position_(X, Y, Tab, ets:next(Tab, FID))
+		    layout_from_position_(Pos, Tab, ets:next(Tab, FID))
 	    end
     end.
 
-fmt_from_position(X, Y, Layout) ->
-    fmt_from_position_(X, Y, 1, Layout#layout.format).
+fmt_from_position(Pos, Layout) ->
+    fmt_from_position_(Pos, 1, Layout#layout.format).
 
-fmt_from_position_(X, Y, I, Format) when I =< tuple_size(Format) ->
+fmt_from_position_(Pos={X,Y}, I, Format) when I =< tuple_size(Format) ->
     F = #fmt{x=X1,y=Y1,width=W,height=H} = element(I, Format),
     if X >= X1, Y >= Y1, X < X1+W, Y < Y1+H ->    
 	    {I, F};
        true ->
-	    fmt_from_position_(X, Y, I+1, Format)
+	    fmt_from_position_(Pos, I+1, Format)
     end;
-fmt_from_position_(_X, _Y, _I, _Format) ->
+fmt_from_position_(_Pos, _I, _Format) ->
     false.
 
 %%
@@ -1279,3 +1607,53 @@ hide_pixels() ->
     epx:draw_line(Pix, {3,3}, {11,11}),
     epx:draw_line(Pix, {11,3}, {3,11}),
     Pix.
+
+flush_wheel(Window) ->
+    receive
+	{epx_event,Window,{_,[wheel_down],_}} ->
+	    flush_wheel(Window);
+	{epx_event,Window,{_,[wheel_left],_}} ->
+	    flush_wheel(Window);
+	{epx_event,Window,{_,[wheel_right],_}} ->
+	    flush_wheel(Window);
+	{epx_event,Window,{_,[wheel_up],_}} ->
+	    flush_wheel(Window)
+    after 0 ->
+	    ok
+    end.
+
+flush_configure(Win, Rect) ->
+    receive
+	{epx_event, Win, {configure, Rect1}} ->
+	    flush_configure(Win, Rect1)
+    after 0 ->
+	    Rect
+    end.
+
+flush_expose(Win, Rect) ->
+    receive
+	{epx_event, Win, {expose, Rect1}} ->
+	    flush_expose(Win, Rect1)
+    after 0 ->
+	    Rect
+    end.
+
+resize_pixmap(undefined, W, H) ->
+    Pixmap = next_pixmap(W,H),
+    epx:pixmap_attach(Pixmap),
+    Pixmap;
+resize_pixmap(Pixmap, W, H) ->
+    case epx:pixmap_info(Pixmap,[width,height]) of
+	[{width,PW},{height,PH}] when PW < W; PH < H ->
+	    epx:pixmap_detach(Pixmap),
+	    Pixmap1 = next_pixmap(W,H),
+	    epx:pixmap_attach(Pixmap1),
+	    Pixmap1;
+	_ ->
+	    Pixmap
+    end.
+
+next_pixmap(W,H) ->
+    NPW = 1 bsl ceil(math:log2(W)),
+    NPH = 1 bsl ceil(math:log2(H)),
+    epx:pixmap_create(NPW, NPH, argb).
