@@ -55,8 +55,8 @@
 -define(SCROLL_HORIZONTAL,       bottom).
 -define(SCROLL_VERTICAL,         right).
 
--define(XSTEP, 0).
--define(YSTEP, 8).
+-define(XSTEP, 4).
+-define(YSTEP, 4).
 
 -record(fmt,
 	{
@@ -1004,21 +1004,42 @@ redraw_anim_('$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
 redraw(State={S,_D}) ->
+    HBar = horizontal_scrollbar(State),
+    VBar = vertical_scrollbar(State),
+    ClipRect = clip_rect(State, HBar, VBar),
     Tab = S#s.frame_layout,
     epx:pixmap_fill(S#s.pixels, ?BACKGROUND_COLOR),
+    SaveClip = epx:pixmap_info(S#s.pixels, clip),
+    epx:pixmap_set_clip(S#s.pixels, ClipRect),
     Key = ets:first(Tab),
     State1 = redraw_all(Tab, Key, State),
-    NeedH = case need_horizontal_scrollbar(State1) of
-		true ->  ?SCROLL_HORIZONTAL;
-		false -> none
-	    end,
-    NeedV = case need_vertical_scrollbar(State1) of
-		true -> ?SCROLL_VERTICAL;
-		false -> none
-	    end,
-    State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,NeedH),
-    State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,NeedV),
+    epx:pixmap_set_clip(S#s.pixels, SaveClip),
+    State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,HBar),
+    State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,VBar),
     update_window(State3).
+
+%% decfine clip rect for content drawing depending on scrollbar information
+clip_rect(_State={S,_D}, none, none) ->
+    {0,0,S#s.width,S#s.height};
+clip_rect(_State={S,_D}, none, right) ->
+    {0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height};
+clip_rect(_State={S,_D}, none, left) ->
+    {?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height};
+clip_rect(_State={S,_D}, bottom, none) ->
+    {0,0,S#s.width,S#s.height-?SCROLL_BAR_SIZE};
+clip_rect(_State={S,_D}, bottom, right) ->
+    {0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+clip_rect(_State={S,_D}, bottom, left) ->
+    {?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+
+clip_rect(_State={S,_D}, top, none) ->
+    {0,?SCROLL_BAR_SIZE,S#s.width,S#s.height-?SCROLL_BAR_SIZE};
+clip_rect(_State={S,_D}, top, right) ->
+    {0,?SCROLL_BAR_SIZE,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+clip_rect(_State={S,_D}, top, left) ->
+    {?SCROLL_BAR_SIZE,?SCROLL_BAR_SIZE,
+     S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE}.
+    
     
 redraw_all(_Tab, '$end_of_table', State) ->
     State;
@@ -1028,17 +1049,27 @@ redraw_all(Tab, FID, State) ->
 
 redraw_(FID, State) ->
     Layout = lookup_layout(FID, State),
-    redraw_layout(Layout, State).
+    redraw_layout_(Layout, State).
 
 redraw(FID, State) ->
     redraw(FID, State, 0).
 
-redraw(FID, State, MinW) ->
+redraw(FID, State={_S,_D}, MinW) ->
     Layout = lookup_layout(FID, State),
     State1 = redraw_layout(Layout, State),
     repaint_layout(Layout, State1, MinW).
 
 redraw_layout(Layout, State={S,_D}) ->
+    HBar = horizontal_scrollbar(State),
+    VBar = vertical_scrollbar(State),
+    SaveClip = epx:pixmap_info(S#s.pixels, clip),
+    ClipRect = clip_rect(State, HBar, VBar),
+    epx:pixmap_set_clip(S#s.pixels, ClipRect),
+    State1 = redraw_layout_(Layout, State),
+    epx:pixmap_set_clip(S#s.pixels, SaveClip),
+    State1.
+
+redraw_layout_(Layout, State={S,_D}) ->
     #layout{ id=FID, color=Color,format=Format} = Layout,
     %% Count = ets:lookup_element(S#s.frame_counter, FID, 2),
     draw_layout_background(Layout, State),
@@ -1190,11 +1221,13 @@ draw_scrollbar(State, top, VBar) ->
 draw_scrollbar(State={S,_D}, bottom, VBar) ->
     draw_horizontal_scrollbar(State, S#s.height-?SCROLL_BAR_SIZE, VBar).
 
-need_vertical_scrollbar(_State={S,D}) ->
+vertical_scrollbar(_State={S,D}) ->
     WH = S#s.height,
     VH = D#d.view_bottom - D#d.view_top,
-    VH > WH.
-
+    if VH > WH ->  ?SCROLL_VERTICAL;
+       true  -> none
+    end.
+	    
 draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
     WH = if HBar =:= none -> S#s.height;
 	    true -> S#s.height - ?SCROLL_BAR_SIZE
@@ -1224,10 +1257,13 @@ draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
 	    {S,D#d { vscroll=undefined, vhndl=undefined }}
     end.
 
-need_horizontal_scrollbar(_State={S,D}) ->
+horizontal_scrollbar(_State={S,D}) ->
     WW = S#s.width,
     VW = D#d.view_right - D#d.view_left,
-    VW > WW.
+    case VW > WW of
+	true -> ?SCROLL_HORIZONTAL;
+	false -> none
+    end.
 	    
 %% fixme remove vertical scrollbar if present!
 draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
