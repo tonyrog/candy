@@ -41,6 +41,15 @@
 
 -compile(export_all).
 
+-ifdef(OTP_RELEASE). %% this implies 21 or higher
+-define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
+-define(GET_STACK(Stacktrace), Stacktrace).
+-else.
+-define(EXCEPTION(Class, Reason, _), Class:Reason).
+-define(GET_STACK(_), erlang:get_stacktrace()).
+-endif.
+
+
 -define(FONT_SIZE, 14).
 -define(BACKGROUND_COLOR,        {0,255,255}).     %% cyan
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
@@ -402,9 +411,9 @@ handle_info({epx_event, Win, Event}, State={S,_}) when S#s.window =:= Win ->
     try epx_event(Event, State) of
 	Return -> Return
     catch
-	error:Reason:Stack ->
+    ?EXCEPTION(error,Reason,Stack) ->
 	    io:format("crash: ~p\n", [Reason]),
-	    io:format("~p\n", [Stack]),
+	    io:format("~p\n", [?GET_STACK(Stack)]),
 	    {noreply, State}
     end;
 
@@ -697,7 +706,7 @@ command($s, Selected, State={_S,D}) when D#d.ctrl ->
 	  fun(FID,Acc) ->
 		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
 		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-		  L = lookup_layout(State, FID),
+		  L = lookup_layout(FID, State),
 		  Format = L#layout.format,
 		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
 		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
@@ -709,7 +718,11 @@ command($s, Selected, State={_S,D}) when D#d.ctrl ->
 		    || G <- Bs],
 		   "\n" | Acc]
 	  end, [], FIDs),
-    file:write_file("candy.bits", 
+    Dir = case os:getenv("HOME") of
+    	       false -> "/tmp";
+	       Home -> Home
+	  end,
+    file:write_file(filename:join(Dir, "candy.bits"), 
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
     State;
