@@ -56,3 +56,27 @@ Other key commands
     Down           Arrow down, scroll down
     PageUp         Page up, scroll one page up
     PageDown       Page down, scroll one page down
+
+# candy.txt format
+
+The candy.txt file is generate with hitting Ctrl-S, if
+a bit group is selected then that bit will be saved
+in the following format.
+
+## single selection
+
+    <frame-id> <byte-index> <byte-mask> <match-on> <match-off>
+
+Example
+
+    0x123 4 0x20 0x20 0x00
+
+Lines not starting with a digit are assumed to be comments
+and are ignores. A decent choice of leading characters for
+comments could be a space or a ';'.
+
+## multiple selection
+
+    <frame-id1> <byte-index> <byte-mask> <match-on> <match-off> ...
+    <frame-id2> <byte-index> <byte-mask> <match-on> <match-off> ...
+    ...
