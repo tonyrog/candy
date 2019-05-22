@@ -793,7 +793,7 @@ scroll_down(State) ->
     redraw(State1).
 
 %% move a page up
-page_up(State={S,D}) ->
+page_up(State={_S,D}) ->
     case D#d.vscroll of
 	undefined ->
 	    State;
@@ -805,7 +805,7 @@ page_up(State={S,D}) ->
 	    redraw(State1)
     end.
 
-page_down(State={S,D}) ->
+page_down(State={_S,D}) ->
     case D#d.vscroll of
 	undefined ->
 	    State;
@@ -1164,7 +1164,7 @@ fold_layout(Fun, Acc, State={S,_D}) ->
     Tab = S#s.frame_layout,
     fold_layout_(Fun, Acc, Tab, ets:first(Tab), State).
 
-fold_layout_(Fun, Acc, _Tab, '$end_of_table', _State) ->
+fold_layout_(_Fun, Acc, _Tab, '$end_of_table', _State) ->
     Acc;
 fold_layout_(Fun, Acc, Tab, FID, State) ->
     Layout = lookup_layout(FID, State),
