@@ -174,7 +174,7 @@ status() ->
 start() ->
     start(any).
 start(Model) ->
-    (catch error_logger:tty(true)),
+    (catch error_logger:tty(false)),
     application:ensure_all_started(?MODULE),
     can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
@@ -374,8 +374,8 @@ handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
 		    {noreply, tick_restart(State)};
 		Diff ->
 		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
-		    redraw(FID, State),
-		    {noreply, tick_restart(State)}
+		    State1 = redraw(FID, State),
+		    {noreply, tick_restart(State1)}
 	    end;
 	[] ->
 	    ets:insert(S#s.frame, Frame),
@@ -586,8 +586,7 @@ epx_event({configure, Rect},_State={S,D}) ->
     {_X,_Y,W,H} = flush_configure(S#s.window, Rect),
     Pixels = resize_pixmap(S#s.pixels, W, H),
     State1 = {S#s { width=W, height=H,  pixels=Pixels }, D},
-    redraw(State1),
-    {noreply, State1};
+    {noreply, redraw(State1)};
 epx_event(Event, State) ->
     io:format("Got epx event ~p\n", [Event]),
     {noreply, State}.
@@ -659,9 +658,9 @@ cell_hit(Pos, Layout, State={S,D}) ->
 	    State2 = insert_layout(Layout1, State1),
 	    {Vx,Vy,Vw,Vh} = view_rect(State2),
 	    {S2,D2} = State2,
-	    D3 = D#d { view_left = Vx, view_top = Vy,
-		       view_right = Vx+Vw-1,
-		       view_bottom = Vy+Vh-1 },
+	    D3 = D2#d { view_left = Vx, view_top = Vy,
+			view_right = Vx+Vw-1,
+			view_bottom = Vy+Vh-1 },
 	    State3 = {S2,D3},
 	    redraw(State3);
 	    
@@ -684,19 +683,23 @@ cell_hit(Pos, Layout, State={S,D}) ->
 
 %%
 %% Commands on Selected elements:
-%%   X              Hexadecimal format
+%%   X              Hexa decimal format
 %%   D              Decimal format
 %%   B              Binary format
 %%   O              Octal format
-%%   Q              Quit application
 %%   --
 %%   G              Group selected bits
 %%   Shift+G        Ungroup selected bits
 %%   1-8            Split in groups of 1 to 8 bits
-%%   T              Swap groups
-%%   Ctrl+S         Save information
+%%   T              Swap groups (not implemented yet)
+%%   Ctrl+S         Save information to $HOME/candy.txt
 %%
 %% Global commands
+%%   Q              Quit application
+%%   up             Arrow up, scroll up
+%%   down           Arrow down, scroll down
+%%   pageup         Page up, scroll one page up
+%%   pagedown       Page down, scroll one page down
 %%
 command($x, Selected, State) ->
     set_base(Selected, 16, State);
@@ -766,8 +769,13 @@ command(up, _Selected, State) ->
 command(down, _Selected, State) ->
     scroll_down(State);
 
+command(pageup, _Selected, State) ->
+    page_up(State);
+command(pagedown, _Selected, State) ->
+    page_down(State);
+
 command(_Symbol, _Selected, State) ->
-    %% io:format("command ~p selected=~p\n", [_Symbol, _Selected]),
+    io:format("unhandled command ~p\n", [_Symbol]),
     State.
 
 %% deselect all and selecte the NewSelected
@@ -776,19 +784,38 @@ deselect({S,D}, NewSelected) ->
     State = {S, D#d { selected = NewSelected }},
     foldl(fun(FID,Si) -> redraw(FID, Si) end, State, Fs).
 
-scroll_up(_State={S,D}) ->
-    Y = max(0, D#d.view_ypos - ?YSTEP),
-    State1 = {S, D#d { view_ypos = Y }},
+scroll_up(State) ->
+    State1 = step_up(State, ?YSTEP),
     redraw(State1).
 
-scroll_down(_State={S,D}) ->
-    H = if D#d.hscroll =:= undefined -> S#s.height;
-	   true -> S#s.height - ?SCROLL_BAR_SIZE
-	end,
-    B = max(0, (D#d.view_bottom+S#s.bottom_offset) - H),
-    Y = min(D#d.view_ypos + ?YSTEP, B),
-    State1 = {S, D#d { view_ypos = Y }},
+scroll_down(State) ->
+    State1 = step_down(State, ?YSTEP),
     redraw(State1).
+
+%% move a page up
+page_up(State={S,D}) ->
+    case D#d.vscroll of
+	undefined ->
+	    State;
+	{_,_,_,H} ->
+	    {_,_,_,VH} = D#d.vhndl,  %% this is the page size in window coords
+	    R = VH/H,  %% page ratio
+	    Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    State1 = step_up(State, Step),
+	    redraw(State1)
+    end.
+
+page_down(State={S,D}) ->
+    case D#d.vscroll of
+	undefined ->
+	    State;
+	{_,_,_,H} ->
+	    {_,_,_,VH} = D#d.vhndl,  %% this is the page size in window coords
+	    R = VH/H,  %% page ratio
+	    Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    State1 = step_down(State, Step),
+	    redraw(State1)
+    end.
 
 scroll_left(_State={S,D}) ->
     X = max(0, D#d.view_xpos -  ?XSTEP),
@@ -804,6 +831,18 @@ scroll_right(_State={S,D}) ->
     State1 = {S, D#d { view_xpos = X }},
     redraw(State1).
 
+step_up(_State={S,D}, Step) ->
+    Y = max(0, D#d.view_ypos - Step),
+    {S, D#d { view_ypos = Y }}.    
+
+step_down(_State={S,D}, Step) ->
+    H = if D#d.hscroll =:= undefined -> S#s.height;
+	   true -> S#s.height - ?SCROLL_BAR_SIZE
+	end,
+    B = max(0, (D#d.view_bottom+S#s.bottom_offset) - H),
+    Y = min(D#d.view_ypos + Step, B),
+    {S, D#d { view_ypos = Y }}.
+    
 %% Set base to 'Base' in selected cells
 set_base(Selected, Base, State) ->
     foldl(
@@ -1313,6 +1352,7 @@ draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
 	    DrawRect = {X0,0,?SCROLL_BAR_SIZE,S#s.height},
 	    epx:draw_rectangle(S#s.pixels, DrawRect),
 	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
+	    %% fixme: save scale factor? keep min HandleLength!
 	    Part = WH / VH,
 	    HandleLength = trunc(Part*WH),
 	    Top = D#d.view_ypos,

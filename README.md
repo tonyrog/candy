@@ -40,14 +40,19 @@ configuration file (README can)
 
 Key commands used on selected elements:
 
-    X              Display hexadecimal format
-    D              Display decimal format
-    B              Display binary format
-    O              Display octal format
-	Q              Quit application	
-	G              Group selected bits
-	Shift+G        Ungroup selected bits
+    X              Hexa decimal format
+    D              Decimal format
+    B              Binary format
+    O              Octal format
+    ---
+    G              Group selected bits
+    Shift+G        Ungroup selected bits
     1-8            Split in groups of 1 to 8 bits
-	T              Toggle groups, switch place
-    Ctrl+S         Save selected frame id and bits in file candy.bits
+    Ctrl+S         Save information to $HOME/candy.txt
 
+Other key commands
+    Q              Quit application
+    Up             Arrow up, scroll up
+    Down           Arrow down, scroll down
+    PageUp         Page up, scroll one page up
+    PageDown       Page down, scroll one page down
