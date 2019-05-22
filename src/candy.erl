@@ -49,7 +49,6 @@
 -define(GET_STACK(_), erlang:get_stacktrace()).
 -endif.
 
-
 -define(FONT_SIZE, 14).
 -define(BACKGROUND_COLOR,        {0,255,255}).     %% cyan
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
@@ -292,7 +291,7 @@ load_pid_list([], State) ->
     State.
 
 %% Note! just 11-bit format now!
-load_pid(FID, Name, FormList, State={S,D}) ->
+load_pid(FID, Name, FormList, _State={S,D}) ->
     NameBits = iolist_to_binary(Name),
     Pos = S#s.next_pos,
     Format = 
@@ -484,6 +483,7 @@ epx_event({button_press,[left],{X0,Y0,_}}, State={_S,D}) ->
     end;
 
 epx_event({button_release,[left],{_X,_Y,_}}, State={S,D}) ->
+    flush_motion(S#s.window),
     case D#d.motion of
 	undefined ->
 	    {noreply, State};
@@ -496,6 +496,7 @@ epx_event({button_release,[left],{_X,_Y,_}}, State={S,D}) ->
     end;
 
 epx_event({motion,_Button,{X1,Y1,_}},State={S,D}) ->
+    flush_motion(S#s.window),
     case D#d.motion of
 	{vhndl,{_DX,Dy}} ->
 	    {_,_,_,H} = D#d.vscroll,
@@ -653,12 +654,17 @@ cell_hit(Pos, Layout, State={S,D}) ->
 	false ->
 	    deselect(State, []);
 	{_I, Fmt} when Fmt#fmt.field =:= hide ->
-	    Layout1 = Layout#layout { style = deleted },
-	    %% fixme: move the other layouts accoringly
-	    %% just move the x value up if x > the delete layout!
-	    %% then update the view height / view width
-	    update_layout(Layout, Layout1, State);
-		
+	    {Layout1,State1} = remove_layout(Layout, State),
+	    %% Note that Layout1 is the "delete" marked Layout
+	    State2 = insert_layout(Layout1, State1),
+	    {Vx,Vy,Vw,Vh} = view_rect(State2),
+	    {S2,D2} = State2,
+	    D3 = D#d { view_left = Vx, view_top = Vy,
+		       view_right = Vx+Vw-1,
+		       view_bottom = Vy+Vh-1 },
+	    State3 = {S2,D3},
+	    redraw(State3);
+	    
 	{_I, Fmt} when Fmt#fmt.field =:= id,
 		       Layout#layout.style =:= collapsed ->
 	    Layout1 = Layout#layout { style = normal },
@@ -1045,10 +1051,8 @@ redraw_anim_('$end_of_table', Remove, Update, _State) ->
 redraw(State={S,_D}) ->
     HBar = horizontal_scrollbar(State),
     VBar = vertical_scrollbar(State),
-    Tab = S#s.frame_layout,
     epx:pixmap_fill(S#s.pixels, ?BACKGROUND_COLOR),
-    Key = ets:first(Tab),
-    State1 = redraw_all(Tab, Key, State),
+    State1 = redraw_all(State),
     State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,HBar),
     State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,VBar),
     update_window(State3).
@@ -1087,12 +1091,12 @@ clip_window_content(State={S,_D}) ->
 %% use for restore saved clip rect
 set_clip_rect(_State={S,_D}, ClipRect) ->
     epx:pixmap_set_clip(S#s.pixels, ClipRect).
-    
-redraw_all(_Tab, '$end_of_table', State) ->
-    State;
-redraw_all(Tab, FID, State) ->
-    State1 = redraw_(FID, State),
-    redraw_all(Tab, ets:next(Tab, FID), State1).
+
+%% redraw all Layouts 
+redraw_all(State) ->
+    each_layout(fun(Layout, State1) ->
+			redraw_layout_(Layout, State1)
+		end, State).
 
 redraw_(FID, State) ->
     Layout = lookup_layout(FID, State),
@@ -1105,6 +1109,29 @@ redraw(FID, State={_S,_D}) ->
     set_clip_rect(State1, SaveClip),
     repaint_layout(Layout, State1, 0).
 
+each_layout(Fun, State={S,_D}) ->
+    Tab = S#s.frame_layout,
+    each_layout_(Fun, Tab, ets:first(Tab), State).
+
+each_layout_(_Fun, _Tab, '$end_of_table', State) ->
+    State;
+each_layout_(Fun, Tab, FID, State) ->
+    Layout = lookup_layout(FID, State),
+    State1 = Fun(Layout, State),
+    each_layout_(Fun, Tab, ets:next(Tab, FID), State1).
+
+
+fold_layout(Fun, Acc, State={S,_D}) ->
+    Tab = S#s.frame_layout,
+    fold_layout_(Fun, Acc, Tab, ets:first(Tab), State).
+
+fold_layout_(Fun, Acc, _Tab, '$end_of_table', _State) ->
+    Acc;
+fold_layout_(Fun, Acc, Tab, FID, State) ->
+    Layout = lookup_layout(FID, State),
+    Acc1 = Fun(Layout, Acc, State),
+    fold_layout_(Fun, Acc1, Tab, ets:next(Tab, FID), State).
+    
 redraw_layout_(Layout, State={S,_D}) ->
     #layout{ id=FID, color=Color,format=Format} = Layout,
     %% Count = ets:lookup_element(S#s.frame_counter, FID, 2),
@@ -1416,13 +1443,46 @@ update_window(State={S,_D},_R={X,Y,W,H}) ->
 update_window(State={S,_D}) ->
     update_window(State, {0,0,S#s.width,S#s.height}).
 
+%% Layout is to be "delete", 
+%% reposition layouts below the Layout, update next_pos
+%% update view_height / view_width
+
+remove_layout(Layout, State) ->
+    State1 =
+	each_layout(fun(L1, Si) ->
+			    Pi = L1#layout.pos,
+			    if Pi > Layout#layout.pos ->
+				    L2 = L1#layout { pos = Pi-1 },
+				    L3 = position_normal(L2, Si),
+				    insert_layout(L3, Si);
+			       true ->
+				    Si
+			    end
+		    end, State),
+    {S1,D1} = State1,
+    S2 = S1#s{ next_pos = S1#s.next_pos-1 },
+    {Layout#layout { style = deleted,
+		     pos=0, x=0,y=0,width=0,height=0
+		   }, {S2,D1}}.
+
+%% calculate new view rect
+view_rect(State) ->
+    fold_layout(fun(L1, Ri, _Si) when L1#layout.style =:= normal;
+				      L1#layout.style =:= fixed ->
+			R = {L1#layout.x,L1#layout.y,
+			     L1#layout.width,L1#layout.height},
+			epx_rect:union(Ri, R);
+		   (_L1, Ri, _Si) ->
+			Ri
+		end, {0,0,0,0}, State).
+
 %% recalulate Layout
 position_layout(Layout, State) ->
     case Layout#layout.style of
-	normal -> position_normal(Layout,State);
-	fixed  -> position_normal(Layout,State);
+	normal    -> position_normal(Layout,State);
+	fixed     -> position_normal(Layout,State);
 	collapsed -> position_collapsed(Layout,State);
-	deleted -> position_deleted(Layout,State)
+	deleted   -> position_deleted(Layout,State)
     end.
 
 position_deleted(Layout, _State) ->
@@ -1724,6 +1784,14 @@ flush_expose(Win, Rect) ->
 	    flush_expose(Win, Rect1)
     after 0 ->
 	    Rect
+    end.
+
+flush_motion(Win) ->
+    receive
+	{epx_event, Win, {motion, _Mod, _Pos}} ->
+	    flush_motion(Win)
+    after 0 ->
+	    ok
     end.
 
 resize_pixmap(undefined, W, H) ->
