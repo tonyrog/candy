@@ -96,7 +96,7 @@
 	{
 	 id  :: integer(),             %% frame id
 	 pos :: integer(),             %% list position
-	 style = normal :: normal | fixed | collapsed | hidden,
+	 style = normal :: normal | fixed | collapsed | hidden | deleted,
 	 color = #color{} :: #color{}, %% color profile
 	 x     :: integer(),           %% x offset
 	 y     :: integer(),           %% y offset
@@ -133,6 +133,7 @@
 	 row_width     = 0,
 	 row_height    = 0,
 	 row_pad = 3,
+	 next_pos = 1,
 	 hide :: epx:epx_pixmap()
 	}).
 
@@ -174,7 +175,7 @@ status() ->
 start() ->
     start(any).
 start(Model) ->
-    (catch error_logger:tty(false)),
+    (catch error_logger:tty(true)),
     application:ensure_all_started(?MODULE),
     can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
@@ -210,6 +211,7 @@ start_link(Model) ->
 %% @end
 %%--------------------------------------------------------------------
 init([Model]) ->
+    process_flag(trap_exit, true),
     can_router:attach(),
     {ok,Font} = epx_font:match([{name,"Courier New"},{size,?FONT_SIZE}]),
     epx_gc:set_font(Font),
@@ -257,8 +259,6 @@ init([Model]) ->
 	  },
     D = #d { },
     State = {S1, D},
-    ets:insert(S1#s.frame_counter, {layout_pos, 0}),
-    ets:insert(S1#s.frame_counter, {collapsed_pos, 0}),
     State1 = load_frame_layout(Model, State),
     {ok, update_window(State1)}.
 
@@ -292,9 +292,9 @@ load_pid_list([], State) ->
     State.
 
 %% Note! just 11-bit format now!
-load_pid(FID, Name, FormList, State={S,_D}) ->
+load_pid(FID, Name, FormList, State={S,D}) ->
     NameBits = iolist_to_binary(Name),
-    Pos = ets:update_counter(S#s.frame_counter, layout_pos, 1),
+    Pos = S#s.next_pos,
     Format = 
 	list_to_tuple(
 	  [
@@ -311,13 +311,14 @@ load_pid(FID, Name, FormList, State={S,_D}) ->
 	    style = fixed, %% do not collapse
 	    format = Format
 	   },
-    L1 = position_layout(L0, State),
-    State1 = insert_layout(L1, State),
+    State1 = {S#s{next_pos=Pos+1}, D},
+    L1 = position_layout(L0, State1),
+    State2 = insert_layout(L1, State1),
     ets:insert(S#s.frame_counter, {FID, 0}),
     ets:insert(S#s.frame, #can_frame{id=FID,len=8,
 					     data=(<<0,0,0,0,0,0,0,0>>)
 					    }),
-    redraw(FID, State1).
+    redraw(FID, State2).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -361,18 +362,22 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
-handle_info(Frame=#can_frame{id=FID}, State={S,_}) ->
+handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
     case ets:lookup(S#s.frame, FID) of
 	[Frame] -> %% no change
 	    ets:update_counter(S#s.frame_counter, FID, 1),
 	    {noreply, State};
 	[Frame0] ->
-	    ets:update_counter(S#s.frame_counter, FID, 1),
-	    Diff = diff_frames(FID,Frame,Frame0,State),
-	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) || Pos <- Diff ],
 	    ets:insert(S#s.frame, Frame),
-	    redraw(FID, State),
-	    {noreply, tick_restart(State)};
+	    ets:update_counter(S#s.frame_counter, FID, 1),
+	    case diff_frames(FID,Frame,Frame0,State) of
+		[] ->
+		    {noreply, tick_restart(State)};
+		Diff ->
+		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
+		    redraw(FID, State),
+		    {noreply, tick_restart(State)}
+	    end;
 	[] ->
 	    ets:insert(S#s.frame, Frame),
 	    IDFmt = 
@@ -385,21 +390,27 @@ handle_info(Frame=#can_frame{id=FID}, State={S,_}) ->
 	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
 		Pos <- lists:seq(1,tuple_size(Format))  ],
 
-	    LayoutPos = ets:update_counter(S#s.frame_counter,layout_pos,1),
-
-	    Layout1 = #layout { id=FID, pos=LayoutPos, format=Format },
+	    LPos = S#s.next_pos,
+	    Layout1 = #layout { id=FID, pos=LPos, format=Format },
 	    Layout2 = position_layout(Layout1, State),
 
-	    State1 = insert_layout(Layout2, State),
+	    State1 = {S#s{ next_pos = LPos+1}, D},
+	    State2 = insert_layout(Layout2, State1),
+
 	    ets:insert(S#s.frame_counter, {FID, 1}),
 	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
-	    %% redraw(FID, State1),
-	    State2 = redraw_layout(Layout2, State1),
-	    State3 = repaint_layout(Layout2, State2, 0),
+	    %% SaveClip = clip_window_content(State1),
+	    %% State2 = redraw_layout_(Layout2, State1),
+	    %% set_clip_rect(State2, SaveClip),
+	    %% State3 = repaint_layout(Layout2, State2, 0),
+	    State3 = redraw(State2),
 	    {noreply, tick_restart(State3)}
     end;
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
-    case redraw_anim(State) of
+    Save = clip_window_content(State),
+    R = redraw_anim(State),
+    set_clip_rect(State, Save),
+    case R of
 	false ->
 	    {noreply, {S, D#d { tick = undefined }}};
 	true ->
@@ -583,9 +594,9 @@ epx_event(Event, State) ->
 scroll_hit(Pos, _State={S,D}) ->
     case epx_rect:contains(D#d.hscroll, Pos) of
 	true ->
+	    epx:window_enable_events(S#s.window, [motion]),
 	    case epx_rect:contains(D#d.hhndl, Pos) of
 		true ->
-		    epx:window_enable_events(S#s.window, [motion]),
 		    {Xv,Yv,_,_} = D#d.hhndl,
 		    {Xp,Yp} = Pos,
 		    Delta = {Xp-Xv, Yp-Yv},
@@ -597,19 +608,17 @@ scroll_hit(Pos, _State={S,D}) ->
 		    VW = (D#d.view_right - D#d.view_left),
 		    X2  = trunc((Xp-(Vw div 2))*(VW/W)),
 		    R = max(0, (D#d.view_right-S#s.right_offset)-W),
-		    X = if X2 < 0 -> 0;
-			   X2 > R -> R;
-			   true -> X2
-			end,
-		    State1 = {S, D#d { view_xpos = X }},
+		    X  = clamp(X2, 0, R),
+		    State1 = {S, D#d { view_xpos = X, 
+				       motion={hhndl,{(Vw div 2),0}} }},
 		    redraw(State1)
 	    end;
 	false ->
 	    case epx_rect:contains(D#d.vscroll, Pos) of
 		true ->
+		    epx:window_enable_events(S#s.window, [motion]),
 		    case epx_rect:contains(D#d.vhndl, Pos) of
 			true ->
-			    epx:window_enable_events(S#s.window, [motion]),
 			    {Xv,Yv,_,_} = D#d.vhndl,
 			    {Xp,Yp} = Pos,
 			    Delta = {Xp-Xv, Yp-Yv},
@@ -622,11 +631,10 @@ scroll_hit(Pos, _State={S,D}) ->
 			    VH = (D#d.view_bottom - D#d.view_top),
 			    Y2  = trunc((Yp-(Vh div 2))*(VH/H)),
 			    B = max(0,(D#d.view_bottom+S#s.bottom_offset)-H),
-			    Y  = if Y2 < 0 -> 0;
-				    Y2 > B -> B;
-				    true -> Y2
-				 end,
-			    State1 = {S, D#d { view_ypos = Y }},
+			    Y  = clamp(Y2, 0, B),
+			    State1 = {S, D#d { view_ypos = Y, 
+					       motion={vhndl,{0,(Vh div 2)}}
+					     }},
 			    redraw(State1)
 		    end;
 		false ->
@@ -634,12 +642,21 @@ scroll_hit(Pos, _State={S,D}) ->
 	    end
     end.
 
+clamp(Value, Min, Max) ->
+    if Value < Min -> Min;
+       Value > Max -> Max;
+       true -> Value
+    end.
+
 cell_hit(Pos, Layout, State={S,D}) ->
     case fmt_from_position(Pos, Layout) of
 	false ->
 	    deselect(State, []);
 	{_I, Fmt} when Fmt#fmt.field =:= hide ->
-	    Layout1 = Layout#layout { style = collapsed },
+	    Layout1 = Layout#layout { style = deleted },
+	    %% fixme: move the other layouts accoringly
+	    %% just move the x value up if x > the delete layout!
+	    %% then update the view height / view width
 	    update_layout(Layout, Layout1, State);
 		
 	{_I, Fmt} when Fmt#fmt.field =:= id,
@@ -710,11 +727,16 @@ command($s, Selected, State={_S,D}) when D#d.ctrl ->
 		  Format = L#layout.format,
 		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
 		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
-		  io:format("SAVE FID=0x~s Bits=~w\n",
-			    [integer_to_list(FID,16), Bs]),
+		  %% io:format("SAVE FID=0x~s Bits=~w\n", [integer_to_list(FID,16), Bs]),
 		  ["0x",integer_to_list(FID,16),
-		   [[[" ",integer_to_list(B),":",
-		      integer_to_list(Len)] || {B,Len} <- G]
+		   [[ %% byte index in decimal
+		     [" ", integer_to_list(B div 8),  
+		      %% byte mask
+		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
+		      %% byte match value HIGH
+		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
+		      %% byte match value LOW
+		      " 0x00" ] || {B,_Len} <- G]
 		    || G <- Bs],
 		   "\n" | Acc]
 	  end, [], FIDs),
@@ -722,7 +744,7 @@ command($s, Selected, State={_S,D}) when D#d.ctrl ->
     	       false -> "/tmp";
 	       Home -> Home
 	  end,
-    file:write_file(filename:join(Dir, "candy.bits"), 
+    file:write_file(filename:join(Dir, "candy.txt"), 
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
     State;
@@ -739,15 +761,14 @@ command(down, _Selected, State) ->
     scroll_down(State);
 
 command(_Symbol, _Selected, State) ->
-    io:format("command ~p selected=~p\n", [_Symbol, _Selected]),
+    %% io:format("command ~p selected=~p\n", [_Symbol, _Selected]),
     State.
 
 %% deselect all and selecte the NewSelected
 deselect({S,D}, NewSelected) ->
     Fs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
     State = {S, D#d { selected = NewSelected }},
-    State1 = foldl(fun(FID,Si) -> redraw_(FID, Si) end, State, Fs),
-    update_window(State1).
+    foldl(fun(FID,Si) -> redraw(FID, Si) end, State, Fs).
 
 scroll_up(_State={S,D}) ->
     Y = max(0, D#d.view_ypos - ?YSTEP),
@@ -964,12 +985,16 @@ bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
 
 diff_frames(FID, New, Old, State) ->
     #layout{format=Format} = Layout = lookup_layout(FID, State),
-    case diff_frames_(1,Format,FID,New,Old,[],State) of
-	[] -> [];
-	_Diff when Layout#layout.style =:= collapsed -> 
-	    %% flash only the ID field
-	    [?ID_FMT_POSITION];
-	Diff -> Diff
+    if Layout#layout.style =:= deleted ->
+	    [];
+       true ->
+	    case diff_frames_(1,Format,FID,New,Old,[],State) of
+		[] -> [];
+		_Diff when Layout#layout.style =:= collapsed -> 
+		    %% flash only the ID field
+		    [?ID_FMT_POSITION];
+		Diff -> Diff
+	    end
     end.
 
 diff_frames_(Pos,Format,FID,New,Old,Acc,State) when Pos =< tuple_size(Format) ->
@@ -1016,17 +1041,14 @@ redraw_anim_(Key={FID,Pos}, Remove, Update, State={S,_}) ->
 redraw_anim_('$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
+%% no need to clip since we always draw scollbar if needed
 redraw(State={S,_D}) ->
     HBar = horizontal_scrollbar(State),
     VBar = vertical_scrollbar(State),
-    ClipRect = clip_rect(State, HBar, VBar),
     Tab = S#s.frame_layout,
     epx:pixmap_fill(S#s.pixels, ?BACKGROUND_COLOR),
-    SaveClip = epx:pixmap_info(S#s.pixels, clip),
-    epx:pixmap_set_clip(S#s.pixels, ClipRect),
     Key = ets:first(Tab),
     State1 = redraw_all(Tab, Key, State),
-    epx:pixmap_set_clip(S#s.pixels, SaveClip),
     State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,HBar),
     State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,VBar),
     update_window(State3).
@@ -1044,7 +1066,6 @@ clip_rect(_State={S,_D}, bottom, right) ->
     {0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
 clip_rect(_State={S,_D}, bottom, left) ->
     {?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
-
 clip_rect(_State={S,_D}, top, none) ->
     {0,?SCROLL_BAR_SIZE,S#s.width,S#s.height-?SCROLL_BAR_SIZE};
 clip_rect(_State={S,_D}, top, right) ->
@@ -1052,7 +1073,20 @@ clip_rect(_State={S,_D}, top, right) ->
 clip_rect(_State={S,_D}, top, left) ->
     {?SCROLL_BAR_SIZE,?SCROLL_BAR_SIZE,
      S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE}.
-    
+
+%% set clip to window content (exclude scrollbar area)
+%% return Old clip rectangle
+clip_window_content(State={S,_D}) ->
+    SaveClip = epx:pixmap_info(S#s.pixels, clip),
+    HBar = horizontal_scrollbar(State),
+    VBar = vertical_scrollbar(State),
+    ClipRect = clip_rect(State, HBar, VBar),
+    epx:pixmap_set_clip(S#s.pixels, ClipRect),
+    SaveClip.
+
+%% use for restore saved clip rect
+set_clip_rect(_State={S,_D}, ClipRect) ->
+    epx:pixmap_set_clip(S#s.pixels, ClipRect).
     
 redraw_all(_Tab, '$end_of_table', State) ->
     State;
@@ -1064,23 +1098,12 @@ redraw_(FID, State) ->
     Layout = lookup_layout(FID, State),
     redraw_layout_(Layout, State).
 
-redraw(FID, State) ->
-    redraw(FID, State, 0).
-
-redraw(FID, State={_S,_D}, MinW) ->
+redraw(FID, State={_S,_D}) ->
+    SaveClip = clip_window_content(State),
     Layout = lookup_layout(FID, State),
-    State1 = redraw_layout(Layout, State),
-    repaint_layout(Layout, State1, MinW).
-
-redraw_layout(Layout, State={S,_D}) ->
-    HBar = horizontal_scrollbar(State),
-    VBar = vertical_scrollbar(State),
-    SaveClip = epx:pixmap_info(S#s.pixels, clip),
-    ClipRect = clip_rect(State, HBar, VBar),
-    epx:pixmap_set_clip(S#s.pixels, ClipRect),
     State1 = redraw_layout_(Layout, State),
-    epx:pixmap_set_clip(S#s.pixels, SaveClip),
-    State1.
+    set_clip_rect(State1, SaveClip),
+    repaint_layout(Layout, State1, 0).
 
 redraw_layout_(Layout, State={S,_D}) ->
     #layout{ id=FID, color=Color,format=Format} = Layout,
@@ -1088,6 +1111,8 @@ redraw_layout_(Layout, State={S,_D}) ->
     draw_layout_background(Layout, State),
     [Frame] = ets:lookup(S#s.frame, FID),
     case Layout#layout.style of
+	deleted ->
+	    State;
 	collapsed ->
 	    _Remove = redraw_fmt(FID,?ID_FMT_POSITION,Color,
 				 element(?ID_FMT_POSITION,Format),Frame,State),
@@ -1105,9 +1130,12 @@ redraw_frame(_FID,_Pos,_Color,_Format,_Frame,State) ->
 
 redraw_pos(FID,Pos,Frame,State) ->
     #layout{ color=Color, format=Format} = Layout = lookup_layout(FID, State),
-    if Layout#layout.style =:= collapsed ->
+    case Layout#layout.style of
+	collapsed ->
 	    redraw_pos(FID,?ID_FMT_POSITION,Color,Format,Frame,State);
-       true ->
+	deleted ->
+	    true;
+	_ ->
 	    redraw_pos(FID,Pos,Color,Format,Frame,State)
     end.
 
@@ -1393,8 +1421,12 @@ position_layout(Layout, State) ->
     case Layout#layout.style of
 	normal -> position_normal(Layout,State);
 	fixed  -> position_normal(Layout,State);
-	collapsed -> position_collapsed(Layout,State)
+	collapsed -> position_collapsed(Layout,State);
+	deleted -> position_deleted(Layout,State)
     end.
+
+position_deleted(Layout, _State) ->
+    Layout#layout { x=0,y=0,width=0,height=0 }.
 
 position_normal(Layout, State={S,_D}) ->
     I = Layout#layout.pos-1,
@@ -1541,23 +1573,30 @@ insert_layout(Layout, _State={S,D}) ->
     {S, D#d { view_left=L, view_right=R, view_top=T, view_bottom=B }}.
 
 update_layout(OldLayout, NewLayout, State={S,D}) ->
+    SaveClip = clip_window_content(State),
+
     clear_layout_background(OldLayout, State),
     Layout = position_layout(NewLayout, State),
     State1 = insert_layout(Layout, State),
-    redraw_layout(Layout, State1),
+    State2 = redraw_layout_(Layout, State1),
+
+    set_clip_rect(State2, SaveClip),
+
     MinW = if D#d.vscroll =:= undefined ->
 		   S#s.width;
 	      true ->
 		   S#s.width - ?SCROLL_BAR_SIZE
 	   end,
     if OldLayout#layout.x =/= Layout#layout.x;
-       OldLayout#layout.y =/= Layout#layout.y ->
-	    %% if layout moved update old position
-	    repaint_layout(OldLayout, State1, MinW);
+       OldLayout#layout.y =/= Layout#layout.y;
+       OldLayout#layout.width =/= Layout#layout.width;
+       OldLayout#layout.height =/= Layout#layout.height ->
+	    %% if layout changed repaint old area
+	    repaint_layout(OldLayout, State2, MinW);
        true ->
 	    ok
     end,
-    repaint_layout(Layout, State1, MinW).
+    repaint_layout(Layout, State2, MinW).
 
 layout_from_position(Pos, _State={S,_D}) ->
     Tab = S#s.frame_layout,
