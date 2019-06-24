@@ -1276,7 +1276,7 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 				   {float,Fw,Fp} -> [$~,(Fw+$0),$.,(Fp+$0),$f];
 				   {float,Fp} -> [$~,$.,(Fp+$0),$f]
 			       end,
-			String1 = io_lib:format(Ffmt, [(1000*N)/Td]),
+			String1 = lists:flatten(io_lib:format(Ffmt, [(1000*N)/Td])),
 			ets:insert(S#s.frame_freq,
 				   {FID,Time1,Count1,String1}),
 			String1;
