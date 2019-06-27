@@ -62,6 +62,20 @@
 -define(SCROLL_HNDL_COLOR,       {127,127,127}).
 -define(SCROLL_HORIZONTAL,       bottom).
 -define(SCROLL_VERTICAL,         right).
+-define(TOP_BAR,                 0).
+-define(LEFT_BAR,                0).
+-define(BOTTOM_BAR,              18).
+-define(RIGHT_BAR,               0).
+
+-define(TOP_BAR_COLOR,           {255,0,0}).
+-define(LEFT_BAR_COLOR,          {0,255,0}).
+-define(RIGHT_BAR_COLOR,         {0,0,255}).
+-define(BOTTOM_BAR_COLOR,        {255,255,255}).
+
+-define(TOP_OFFSET,              5).
+-define(BOTTOM_OFFSET,           5).
+-define(LEFT_OFFSET,             5).
+-define(RIGHT_OFFSET,            5).
 
 -define(XSTEP, 4).
 -define(YSTEP, 4).
@@ -111,6 +125,8 @@
 	{
 	 width  :: integer(),
 	 height :: integer(),
+	 bit_rate = error,
+	 bit_rates = [125000, 250000, 500000],
 	 nrows = 30 :: integer(),     %% number or rows shown
 	 window :: epx:epx_window(),  %% attached window
 	 font   :: epx:epx_font(),
@@ -125,10 +141,10 @@
 	 glyph_height  :: unsigned(),
 	 glyph_ascent  :: integer(),
 	 background_color :: epx:epx_color(),
-	 top_offset    = 5,
-	 left_offset   = 5,
-	 right_offset  = 5,
-	 bottom_offset = 5,
+	 top_offset    = ?TOP_OFFSET+?TOP_BAR,
+	 left_offset   = ?LEFT_OFFSET+?LEFT_BAR,
+	 right_offset  = ?RIGHT_OFFSET+?RIGHT_BAR,
+	 bottom_offset = ?BOTTOM_OFFSET+?BOTTOM_BAR,
 	 row_width     = 0,
 	 row_height    = 0,
 	 row_pad = 3,
@@ -236,7 +252,13 @@ init([Model]) ->
     epx:window_attach(Window),
     epx:pixmap_attach(Bg),
     epx:window_adjust(Window, [{name, "Candy"}]),
+    BitRate = 
+	case get_can_usb_bitrate() of
+	    {ok,BitRate0} ->  BitRate0;
+	    {error,_} -> error
+	end,
     S1 = S0#s {
+	   bit_rate = BitRate,
 	   width = Width,
 	   height = Height,
 	   window = Window,
@@ -764,6 +786,12 @@ command(I, Selected, State) when I >= $1, I =< $8 ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, State, Fs);
 
+command(up, _Selected, State={_,D}) when D#d.alt ->
+    bit_rate_up(State);
+command(down, _Selected, State={_,D}) when D#d.alt ->
+    bit_rate_down(State);
+
+
 command(up, _Selected, State) ->
     scroll_up(State);
 command(down, _Selected, State) ->
@@ -774,9 +802,55 @@ command(pageup, _Selected, State) ->
 command(pagedown, _Selected, State) ->
     page_down(State);
 
+command(left, _Selected, State) ->
+    scroll_left(State);
+command(right, _Selected, State) ->
+    scroll_right(State);
+
+
 command(_Symbol, _Selected, State) ->
     io:format("unhandled command ~p\n", [_Symbol]),
     State.
+
+bit_rate_up(_State={S,D}) ->
+    Rates = S#s.bit_rates,
+    BitRate = case S#s.bit_rate of
+		  error -> hd(Rates);
+		  B -> 
+		      case lists:dropwhile(fun(X) -> X =/= B end, Rates) of
+			  [B] -> hd(Rates);
+			  [] -> hd(Rates);
+			  [B,N|_] -> N
+		      end
+	      end,
+    State = case set_can_usb_bitrate(BitRate) of
+		ok ->
+		    {S#s { bit_rate = BitRate }, D};
+		{error,_} ->
+		    {S#s { bit_rate = error }, D}
+	    end,
+    redraw(State).
+
+
+bit_rate_down(_State={S,D}) ->
+    Rates = lists:reverse(S#s.bit_rates),
+    BitRate = case S#s.bit_rate of
+		  error -> hd(Rates);
+		  B -> 
+		      case lists:dropwhile(fun(X) -> X =/= B end, Rates) of
+			  [B] -> hd(Rates);
+			  [] -> hd(Rates);
+			  [B,P|_] -> P
+		      end
+	      end,
+    State = case set_can_usb_bitrate(BitRate) of
+		ok ->
+		    {S#s { bit_rate = BitRate }, D};
+		{error,_} ->
+		    {S#s { bit_rate = error }, D}
+	    end,
+    redraw(State).
+    
 
 %% deselect all and selecte the NewSelected
 deselect({S,D}, NewSelected) ->
@@ -1094,30 +1168,100 @@ redraw(State={S,_D}) ->
     State1 = redraw_all(State),
     State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,HBar),
     State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,VBar),
-    update_window(State3).
+    State4 = draw_top_bar(State3),
+    State5 = draw_left_bar(State4),
+    State6 = draw_right_bar(State5),
+    State7 = draw_bottom_bar(State6),
+    update_window(State7).
 
-%% decfine clip rect for content drawing depending on scrollbar information
+%% top & bottom bar has priority over left and right...
+draw_top_bar(State={S,_D}) when ?TOP_BAR > 0 ->
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(?TOP_BAR_COLOR), 
+    DrawRect = {0,0,S#s.width,?TOP_BAR},
+    epx:draw_rectangle(S#s.pixels, DrawRect),
+    State;
+draw_top_bar(State) ->
+    State.
+
+draw_bottom_bar(State={S,_D}) when ?BOTTOM_BAR > 0 ->
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(?BOTTOM_BAR_COLOR), 
+    X0 = 0,
+    Y0 = S#s.height-?BOTTOM_BAR,
+    DrawRect = {X0,Y0,S#s.width,?BOTTOM_BAR},
+    epx:draw_rectangle(S#s.pixels, DrawRect),
+    epx_gc:set_foreground_color({0,0,0}),
+    epx_gc:set_fill_style(none),
+    epx:draw_rectangle(S#s.pixels, DrawRect),
+    X1 = X0 + 10,
+    Y1 = Y0+1+S#s.glyph_ascent,
+    epx_gc:set_foreground_color(?TEXT_COLOR),
+    case S#s.bit_rate of
+	error ->
+	    epx:draw_string(S#s.pixels, X1, Y1, 
+			    "BitRate: error");
+	BitRate ->
+	    epx:draw_string(S#s.pixels, X1, Y1, 
+			    "BitRate: " ++ 
+				integer_to_list(BitRate div 1000) 
+			    ++ "k")
+    end,
+    State;
+draw_bottom_bar(State) ->
+    State.    
+
+draw_left_bar(State={S,_D}) when ?LEFT_BAR > 0 ->
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(?LEFT_BAR_COLOR),
+    DrawRect = {0,?TOP_BAR,?LEFT_BAR,
+		S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
+    epx:draw_rectangle(S#s.pixels, DrawRect),
+    State;
+draw_left_bar(State) ->
+    State.
+
+
+draw_right_bar(State={S,_D}) when ?RIGHT_BAR > 0 ->
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(?RIGHT_BAR_COLOR),
+    DrawRect = {S#s.width-?RIGHT_BAR,?TOP_BAR,?RIGHT_BAR,
+		S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
+    epx:draw_rectangle(S#s.pixels, DrawRect),
+    State;
+draw_right_bar(State) ->
+    State.
+
+
+%% define clip rect for content drawing depending on scrollbar information
 clip_rect(_State={S,_D}, none, none) ->
-    {0,0,S#s.width,S#s.height};
+    inside_rect(0,0,S#s.width,S#s.height);
 clip_rect(_State={S,_D}, none, right) ->
-    {0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height};
+    inside_rect(0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height);
 clip_rect(_State={S,_D}, none, left) ->
-    {?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height};
+    inside_rect(?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height);
 clip_rect(_State={S,_D}, bottom, none) ->
-    {0,0,S#s.width,S#s.height-?SCROLL_BAR_SIZE};
+    inside_rect(0,0,S#s.width,S#s.height-?SCROLL_BAR_SIZE);
 clip_rect(_State={S,_D}, bottom, right) ->
-    {0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+    inside_rect(0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
 clip_rect(_State={S,_D}, bottom, left) ->
-    {?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+    inside_rect(?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
 clip_rect(_State={S,_D}, top, none) ->
-    {0,?SCROLL_BAR_SIZE,S#s.width,S#s.height-?SCROLL_BAR_SIZE};
+    inside_rect(0,?SCROLL_BAR_SIZE,S#s.width,S#s.height-?SCROLL_BAR_SIZE);
 clip_rect(_State={S,_D}, top, right) ->
-    {0,?SCROLL_BAR_SIZE,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE};
+    inside_rect(0,?SCROLL_BAR_SIZE,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
 clip_rect(_State={S,_D}, top, left) ->
-    {?SCROLL_BAR_SIZE,?SCROLL_BAR_SIZE,
-     S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE}.
+    inside_rect(?SCROLL_BAR_SIZE,?SCROLL_BAR_SIZE,
+		S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE).
 
-%% set clip to window content (exclude scrollbar area)
+%% exclude side var from clip rect
+inside_rect(X,Y,W,H) ->
+    {X+?LEFT_BAR, Y+?TOP_BAR,
+     W - (?LEFT_BAR+?RIGHT_BAR),
+     H - (?TOP_BAR+?BOTTOM_BAR)}.
+
+
+%% set clip to window content (exclude scrollbar area, and side bars)
 %% return Old clip rectangle
 clip_window_content(State={S,_D}) ->
     SaveClip = epx:pixmap_info(S#s.pixels, clip),
@@ -1320,13 +1464,15 @@ draw_layout_rectangle(Layout, Color, _State={S,D}, Width) ->
     epx:draw_rectangle(S#s.pixels, Rect).
 
 draw_scrollbar(State, left, HBar) ->
-    draw_vertical_scrollbar(State, 0, HBar);
+    draw_vertical_scrollbar(State, ?LEFT_BAR, HBar);
 draw_scrollbar(State={S,_D}, right, HBar) ->
-    draw_vertical_scrollbar(State, S#s.width-?SCROLL_BAR_SIZE, HBar);
+    draw_vertical_scrollbar(State,
+			    S#s.width-?SCROLL_BAR_SIZE-?RIGHT_BAR,HBar);
 draw_scrollbar(State, top, VBar) ->
-    draw_horizontal_scrollbar(State, 0, VBar);
+    draw_horizontal_scrollbar(State, ?TOP_BAR, VBar);
 draw_scrollbar(State={S,_D}, bottom, VBar) ->
-    draw_horizontal_scrollbar(State, S#s.height-?SCROLL_BAR_SIZE, VBar).
+    draw_horizontal_scrollbar(State,
+			      S#s.height-?SCROLL_BAR_SIZE-?BOTTOM_BAR,VBar).
 
 vertical_scrollbar(_State={S,D}) ->
     WH = S#s.height,
@@ -1336,20 +1482,21 @@ vertical_scrollbar(_State={S,D}) ->
     end.
 	    
 draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
-    WH = if HBar =:= none -> S#s.height;
-	    true -> S#s.height - ?SCROLL_BAR_SIZE
+    WH = if HBar =:= none -> S#s.height - (?TOP_BAR+?BOTTOM_BAR);
+	    true -> S#s.height - (?SCROLL_BAR_SIZE+?TOP_BAR+?BOTTOM_BAR)
 	 end,
     VH = D#d.view_bottom - D#d.view_top,
     if VH > WH ->
 	    epx_gc:set_fill_style(solid),
 	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
 	    Y0 = case HBar of
-		     none   -> 0;
-		     bottom -> 0;
-		     top    -> ?SCROLL_BAR_SIZE
+		     none   -> ?TOP_BAR;
+		     bottom -> ?TOP_BAR;
+		     top    -> ?TOP_BAR+?SCROLL_BAR_SIZE
 		 end,
 	    Rect = {X0,Y0,?SCROLL_BAR_SIZE,WH},
-	    DrawRect = {X0,0,?SCROLL_BAR_SIZE,S#s.height},
+	    DrawRect = {X0,?TOP_BAR,?SCROLL_BAR_SIZE,
+			S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
 	    epx:draw_rectangle(S#s.pixels, DrawRect),
 	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
 	    %% fixme: save scale factor? keep min HandleLength!
@@ -1375,20 +1522,21 @@ horizontal_scrollbar(_State={S,D}) ->
 	    
 %% fixme remove vertical scrollbar if present!
 draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
-    WW = if VBar =:= none -> S#s.width;
-	    true -> S#s.width - ?SCROLL_BAR_SIZE
+    WW = if VBar =:= none -> S#s.width - (?LEFT_BAR+?RIGHT_BAR);
+	    true -> S#s.width - (?SCROLL_BAR_SIZE+?LEFT_BAR+?RIGHT_BAR)
 	 end,
     VW = D#d.view_right - D#d.view_left,
     if VW > WW ->
 	    epx_gc:set_fill_style(solid),
 	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
 	    X0 = case VBar of
-		     none -> 0;
-		     left -> 0;
-		     right -> ?SCROLL_BAR_SIZE
+		     none -> ?LEFT_BAR;
+		     left -> ?LEFT_BAR;
+		     right -> ?LEFT_BAR+?SCROLL_BAR_SIZE
 		 end,
 	    Rect = {X0,Y0,WW,?SCROLL_BAR_SIZE},
-	    DrawRect = {0,Y0,S#s.width,?SCROLL_BAR_SIZE},
+	    DrawRect = {?LEFT_BAR,Y0,S#s.width-(?LEFT_BAR+?RIGHT_BAR),
+			?SCROLL_BAR_SIZE},
 	    epx:draw_rectangle(S#s.pixels, DrawRect),
 	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
 	    Part = WW / VW,
@@ -1401,7 +1549,7 @@ draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
 	    {S,D#d { hscroll=Rect, hhndl=HRect }};
        true ->
 	    {S,D#d { hscroll=undefined, hhndl=undefined }}
-    end.		
+    end.
     
 
 %% draw hightlight background return text color and flag to signal remove
@@ -1853,3 +2001,37 @@ next_pixmap(W,H) ->
     NPW = 1 bsl ceil(math:log2(W)),
     NPH = 1 bsl ceil(math:log2(H)),
     epx:pixmap_create(NPW, NPH, argb).
+
+%%
+%% GET and SET can bitrate on the can_usb backend
+%%
+get_can_usb_bitrate() ->
+    get_can_usb_bitrate_(can_router:interfaces()).
+
+%% fixme export can_if from can_router!
+get_can_usb_bitrate_([{can_if,Pid,_Id,_Name,_Mon,
+		       _Param={can_usb,_IfName,_Num,_DevName},
+		       _Atime,_State} | _IFs]) ->
+    can_usb:get_bitrate(Pid);
+get_can_usb_bitrate_([_|IFs]) ->
+    get_can_usb_bitrate_(IFs);
+get_can_usb_bitrate_([]) ->
+    {error, no_backend_found}.
+
+set_can_usb_bitrate(BitRate) ->
+    set_can_usb_bitrate_(can_router:interfaces(), BitRate).
+
+%% fixme export can_if from can_router!
+set_can_usb_bitrate_([{can_if,Pid,_Id,_Name,_Mon,
+		       _Param={can_usb,_IfName,_Num,_DevName},
+		       _Atime,_State} | _IFs], BitRate) ->
+    io:format("Set bit rate: ~w\n", [BitRate]),
+    Result = can_usb:set_bitrate(Pid, BitRate),
+    io:format("Result = ~p\n", [Result]),
+    Result;
+set_can_usb_bitrate_([_|IFs], BitRate) ->
+    set_can_usb_bitrate_(IFs, BitRate);
+set_can_usb_bitrate_([],_BitRate) ->
+    {error, no_backend_found}.
+
+  
