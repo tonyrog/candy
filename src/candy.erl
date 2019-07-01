@@ -127,6 +127,10 @@
 	 height :: integer(),
 	 bit_rate = error,
 	 bit_rates = [125000, 250000, 500000],
+	 if_state  = down,            %% up | down
+	 if_error  = [],              %% interface error code list
+	 if_id     = 0,               %% interface number of can_usb 
+	 if_pid    = 0,               %% interface process of can_usb 
 	 nrows = 30 :: integer(),     %% number or rows shown
 	 window :: epx:epx_window(),  %% attached window
 	 font   :: epx:epx_font(),
@@ -191,8 +195,8 @@ start() ->
     start(any).
 start(Model) ->
     (catch error_logger:tty(false)),
+    low_latency(),
     application:ensure_all_started(?MODULE),
-    can_udp:start(),
     gen_server:start(?MODULE, [Model], []).
 
 %%--------------------------------------------------------------------
@@ -206,9 +210,17 @@ start_link() ->
     start_link(any).
 start_link(Model) ->
     (catch error_logger:tty(false)),
+    low_latency(),
     application:ensure_all_started(?MODULE),
-    can_udp:start(),
     gen_server:start_link(?MODULE, [Model], []).
+
+    %% make sure CANUSB is on full speed (+ other FTDI serial devices)
+low_latency() ->
+    lists:foreach(
+      fun(UsbDev) ->
+	      %% ignore output since only FTDI devices will return ok
+	      os:cmd("setserial "++UsbDev++" low_latency")
+      end, filelib:wildcard("/dev/ttyUSB*")).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -228,6 +240,8 @@ start_link(Model) ->
 init([Model]) ->
     process_flag(trap_exit, true),
     can_router:attach(),
+    can_router:error_reception(on),
+    can_router:if_state_supervision(on),
     {ok,Font} = epx_font:match([{name,"Courier New"},{size,?FONT_SIZE}]),
     epx_gc:set_font(Font),
     S0 = #s{},
@@ -252,13 +266,23 @@ init([Model]) ->
     epx:window_attach(Window),
     epx:pixmap_attach(Bg),
     epx:window_adjust(Window, [{name, "Candy"}]),
-    BitRate = 
-	case get_can_usb_bitrate() of
-	    {ok,BitRate0} ->  BitRate0;
-	    {error,_} -> error
+
+    {IfID,IfPid,IfBitRate} =
+	case get_can_usb_if() of
+	    {error,_} ->
+		{0,undefined,error};
+	    {ok,{IfID0,IfPid0}} ->
+		{IfID0,IfPid0,
+		 case get_can_usb_bitrate(IfPid0) of
+		     {ok,BitRate0} -> BitRate0;
+		     {error,_} -> error
+		 end}
 	end,
+    %% io:format("IfID=~w, IfPid=~w, IfBitRate=~w\n", [IfID, IfPid, IfBitRate]),
     S1 = S0#s {
-	   bit_rate = BitRate,
+	   bit_rate = IfBitRate,
+	   if_id = IfID,
+	   if_pid = IfPid,
 	   width = Width,
 	   height = Height,
 	   window = Window,
@@ -383,6 +407,27 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
+handle_info(_Frame=#can_frame{id=FID}, {S,D}) 
+  when FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
+    %% io:format("got error frame ~w\n", [Frame]),
+    Fs = lists:foldl(
+	   fun({Bit,Flag}, Acc) ->
+		   if FID band Bit =:= Bit -> [Flag|Acc];
+		      true -> Acc
+		   end
+	   end, [], [{?CAN_ERR_TX_TIMEOUT, txtimeout},
+		     {?CAN_ERR_LOSTARB,     lastarb},
+		     {?CAN_ERR_CRTL,        crtl},
+		     {?CAN_ERR_PROT,        prot},
+		     {?CAN_ERR_TRX,         trx},
+		     {?CAN_ERR_ACK,         ack},
+		     {?CAN_ERR_BUSOFF,      busoff},
+		     {?CAN_ERR_BUSERROR,    buserror},
+		     {?CAN_ERR_RESTARTED,   restarted}]),
+    %% io:format(" status = ~w\n", [Fs]),
+    State1 = redraw({S#s { if_error = Fs },D}),
+    {noreply, State1};
+
 handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
     case ets:lookup(S#s.frame, FID) of
 	[Frame] -> %% no change
@@ -449,10 +494,27 @@ handle_info({epx_event, Win, Event}, State={S,_}) when S#s.window =:= Win ->
 	    {noreply, State}
     end;
 
+handle_info({if_state_event, {ID,_IfEnt}, IfState}, State={S,D}) ->
+    %% io:format("Got if_state if=~w, ifstate=~w\n", [ID,IfState]),
+    State1 = if IfState =:= down, ID =:= S#s.if_id ->
+		     redraw({S#s { if_state = down }, D});
+		IfState =:= up, S#s.if_state =:= down ->
+		     case get_can_usb_if() of  %% pickup new interface id
+			 {ok,{IfID,IfPid}} ->
+			     redraw({S#s { if_state = up, if_id=IfID, 
+					   if_pid=IfPid }, D});
+			 error ->
+			     {S#s { if_state = up, if_id=ID, 
+				    if_pid=undefined }, D}
+		     end;
+		true ->
+		     State
+	     end,
+    {noreply, State1};
+
 handle_info(_Info, State) ->
     io:format("Got info ~p\n", [_Info]),
     {noreply, State}.
-
 
 %%--------------------------------------------------------------------
 %% @private
@@ -823,7 +885,7 @@ bit_rate_up(_State={S,D}) ->
 			  [B,N|_] -> N
 		      end
 	      end,
-    State = case set_can_usb_bitrate(BitRate) of
+    State = case set_can_usb_bitrate(S#s.if_pid, BitRate) of
 		ok ->
 		    {S#s { bit_rate = BitRate }, D};
 		{error,_} ->
@@ -843,7 +905,7 @@ bit_rate_down(_State={S,D}) ->
 			  [B,P|_] -> P
 		      end
 	      end,
-    State = case set_can_usb_bitrate(BitRate) of
+    State = case set_can_usb_bitrate(S#s.if_pid, BitRate) of
 		ok ->
 		    {S#s { bit_rate = BitRate }, D};
 		{error,_} ->
@@ -1194,19 +1256,29 @@ draw_bottom_bar(State={S,_D}) when ?BOTTOM_BAR > 0 ->
     epx_gc:set_foreground_color({0,0,0}),
     epx_gc:set_fill_style(none),
     epx:draw_rectangle(S#s.pixels, DrawRect),
-    X1 = X0 + 10,
-    Y1 = Y0+1+S#s.glyph_ascent,
-    epx_gc:set_foreground_color(?TEXT_COLOR),
-    case S#s.bit_rate of
-	error ->
-	    epx:draw_string(S#s.pixels, X1, Y1, 
-			    "BitRate: error");
-	BitRate ->
-	    epx:draw_string(S#s.pixels, X1, Y1, 
-			    "BitRate: " ++ 
-				integer_to_list(BitRate div 1000) 
-			    ++ "k")
-    end,
+
+    %% +-----------+---------------+----------------+
+    %% | Link: up  | BitRate: 250k | Status: busoff |
+    %% +-----------+---------------+----------------+
+    LinkString = case S#s.if_state of
+		     up -> "Link: up";
+		     down -> "Link: down"
+		 end,
+    draw_text(X0+10, Y0, 100, ?BOTTOM_BAR-2, LinkString, State),
+
+    BitRateString =
+	case S#s.bit_rate of
+	    error ->   "BitRate: error";
+	    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)
+	end,
+    draw_text(X0+110, Y0, 130, ?BOTTOM_BAR-2, BitRateString, State),
+
+    ErrorString = 
+	case S#s.if_error of 
+	    [] -> "State: ok";
+	    Es -> "State: "++ format_error(Es)
+	end,
+    draw_text(X0+240, Y0, 80, ?BOTTOM_BAR-2, ErrorString, State),
     State;
 draw_bottom_bar(State) ->
     State.    
@@ -1231,6 +1303,15 @@ draw_right_bar(State={S,_D}) when ?RIGHT_BAR > 0 ->
     State;
 draw_right_bar(State) ->
     State.
+
+draw_text(X0, Y0, _W, _H, Text, {S,_}) ->
+    X = X0,
+    Y = Y0+1+S#s.glyph_ascent,
+    epx_gc:set_foreground_color(?TEXT_COLOR),
+    epx:draw_string(S#s.pixels, X, Y, Text).
+
+format_error(ErrorList) ->
+    string:join([atom_to_list(E) || E <- ErrorList], ",").
 
 
 %% define clip rect for content drawing depending on scrollbar information
@@ -2005,33 +2086,21 @@ next_pixmap(W,H) ->
 %%
 %% GET and SET can bitrate on the can_usb backend
 %%
-get_can_usb_bitrate() ->
-    get_can_usb_bitrate_(can_router:interfaces()).
+get_can_usb_bitrate(Pid) when is_pid(Pid) ->
+    can_usb:get_bitrate(Pid).
 
-%% fixme export can_if from can_router!
-get_can_usb_bitrate_([{can_if,Pid,_Id,_Name,_Mon,
-		       _Param={can_usb,_IfName,_Num,_DevName},
-		       _Atime,_State} | _IFs]) ->
-    can_usb:get_bitrate(Pid);
-get_can_usb_bitrate_([_|IFs]) ->
-    get_can_usb_bitrate_(IFs);
-get_can_usb_bitrate_([]) ->
+set_can_usb_bitrate(Pid, BitRate) when is_pid(Pid) ->
+    can_usb:set_bitrate(Pid, BitRate).
+
+get_can_usb_if() ->
+    get_can_usb_if_(can_router:interfaces()).
+
+%% fixme export can_if from can_router!?
+get_can_usb_if_([{can_if,IfPid,IfID,_Name,_Mon,
+		  _Param={can_usb,_IfName,_Num,_DevName},
+		  _Atime,_State} | _IFs]) ->
+    {ok,{IfID,IfPid}};
+get_can_usb_if_([_|IFs]) ->
+    get_can_usb_if_(IFs);
+get_can_usb_if_([]) ->
     {error, no_backend_found}.
-
-set_can_usb_bitrate(BitRate) ->
-    set_can_usb_bitrate_(can_router:interfaces(), BitRate).
-
-%% fixme export can_if from can_router!
-set_can_usb_bitrate_([{can_if,Pid,_Id,_Name,_Mon,
-		       _Param={can_usb,_IfName,_Num,_DevName},
-		       _Atime,_State} | _IFs], BitRate) ->
-    io:format("Set bit rate: ~w\n", [BitRate]),
-    Result = can_usb:set_bitrate(Pid, BitRate),
-    io:format("Result = ~p\n", [Result]),
-    Result;
-set_can_usb_bitrate_([_|IFs], BitRate) ->
-    set_can_usb_bitrate_(IFs, BitRate);
-set_can_usb_bitrate_([],_BitRate) ->
-    {error, no_backend_found}.
-
-  
