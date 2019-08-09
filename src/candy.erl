@@ -36,8 +36,10 @@
 -import(lists, [foldl/3]).
 
 -include_lib("can/include/can.hrl").
+-include_lib("epx/include/epx_menu.hrl").
+-include_lib("epx/include/epx_window_content.hrl").
 
--type unsigned() :: non_neg_integer().
+%% -type unsigned() :: non_neg_integer().
 
 -compile(export_all).
 
@@ -49,36 +51,48 @@
 -define(GET_STACK(_), erlang:get_stacktrace()).
 -endif.
 
--define(FONT_SIZE, 14).
--define(BACKGROUND_COLOR,        {0,255,255}).     %% cyan
+-define(ld(Key, Env, Default),
+	proplists:get_value(Key, Env, Default#profile.Key)).
+
+-define(ldc(Scheme, Key, Env, Default),
+	epx_profile:color_number(Scheme, ?ld(Key,Env,Default))).
+
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
 -define(HIGHLIGHT_COLOR,         {255,0,0}).       %% red hight light
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
 -define(TEXT_HIGHLIGHT_COLOR,    {0,255,255,255}). %% white hight light
--define(SCROLL_BAR_SIZE,         16).
--define(SCROLL_BAR_COLOR,        {240,240,240}).
--define(SCROLL_HNDL_SIZE,        10).
--define(SCROLL_HNDL_COLOR,       {127,127,127}).
--define(SCROLL_HORIZONTAL,       bottom).
--define(SCROLL_VERTICAL,         right).
--define(TOP_BAR,                 0).
--define(LEFT_BAR,                0).
--define(BOTTOM_BAR,              18).
--define(RIGHT_BAR,               0).
 
--define(TOP_BAR_COLOR,           {255,0,0}).
--define(LEFT_BAR_COLOR,          {0,255,0}).
--define(RIGHT_BAR_COLOR,         {0,0,255}).
--define(BOTTOM_BAR_COLOR,        {255,255,255}).
+%% color profile with default values
+-record(profile,
+	{
+	 scheme                        = logo, %% xterm,
+	 screen_color                  = grey2,
+	 selection_alpha               = 100,
+	 selection_color               = grey,
+	 selection_border_width        = 1,
+	 selection_border_color        = grey10,
 
--define(TOP_OFFSET,              5).
--define(BOTTOM_OFFSET,           5).
--define(LEFT_OFFSET,             5).
--define(RIGHT_OFFSET,            5).
+	 %% menu_info
+	 menu_font_name                = "Arial",
+	 menu_font_size                = 14,
+	 menu_font_color               = grey5,   %% light
+	 menu_background_color         = grey10,  %% dark
+	 menu_border_color             = green,
 
--define(XSTEP, 4).
--define(YSTEP, 4).
+	 %% window_profile
+	 window_font_name              = "Courier New",
+	 window_font_size              = 14,
+	 window_font_color             = grey10,
+	 scroll_bar_color              = grey5,
+	 scroll_hndl_color             = grey6,
+	 scroll_horizontal             = right,
+	 scroll_vertical               = bottom,
+	 top_bar_color                 = red,
+	 left_bar_color                = green,
+	 right_bar_color               = blue,
+	 bottom_bar_color              = red6
+	}).
 
 -record(fmt,
 	{
@@ -125,6 +139,7 @@
 	{
 	 width  :: integer(),
 	 height :: integer(),
+	 winfo :: #window_info{},
 	 bit_rate = error,
 	 bit_rates = [125000, 250000, 500000],
 	 if_state  = down,            %% up | down
@@ -141,14 +156,8 @@
 	 frame_counter,  %% ets: ID -> Counter
 	 frame_freq,     %% ets: {ID,Time,OldCounter}
 	 frame_anim,     %% ets: {ID,FmtPos} -> Counter
-	 glyph_width   :: unsigned(),
-	 glyph_height  :: unsigned(),
-	 glyph_ascent  :: integer(),
-	 background_color :: epx:epx_color(),
-	 top_offset    = ?TOP_OFFSET+?TOP_BAR,
-	 left_offset   = ?LEFT_OFFSET+?LEFT_BAR,
-	 right_offset  = ?RIGHT_OFFSET+?RIGHT_BAR,
-	 bottom_offset = ?BOTTOM_OFFSET+?BOTTOM_BAR,
+
+	 %% background_color :: epx:epx_color(),
 	 row_width     = 0,
 	 row_height    = 0,
 	 row_pad = 3,
@@ -159,24 +168,12 @@
 %% dynamic state elements
 -record(d,
 	{
-	 alt    = false,
-	 ctrl   = false,
-	 shift  = false,
 	 tick :: undefined | reference(),
 	 selected = [],
-	 view_xpos = 0,   %% scroll x
-	 view_ypos = 0,   %% scroll y
-	 view_left = 0    :: integer(),
-	 view_right = 0   :: integer(),
-	 view_top = 0     :: integer(),
-	 view_bottom = 0  :: integer(),
-	 hscroll          :: undefined | epx:epx_rect(),
-	 hhndl            :: undefined | epx:epx_rect(),
-	 vscroll          :: undefined | epx:epx_rect(),
-	 vhndl            :: undefined | epx:epx_rect(),
-	 motion           :: undefined |
-			     {vhndl,epx:epx_point()} |
-			     {hhndl,epx:epx_point()}
+	 %% #keymod?
+	 keymod = #keymod{} :: #keymod{}, %% key modifiers
+	 %% window_content
+	 content :: #window_content{}
 	}).
 
 %%
@@ -192,12 +189,12 @@ status() ->
 %%% API
 %%%===================================================================
 start() ->
-    start(any).
-start(Model) ->
+    start([]).
+start(Options) ->
     (catch error_logger:tty(false)),
     low_latency(),
     application:ensure_all_started(?MODULE),
-    gen_server:start(?MODULE, [Model], []).
+    gen_server:start(?MODULE, Options, []).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -207,12 +204,12 @@ start(Model) ->
 %% @end
 %%--------------------------------------------------------------------
 start_link() ->
-    start_link(any).
-start_link(Model) ->
+    start_link([]).
+start_link(Options) ->
     (catch error_logger:tty(false)),
     low_latency(),
     application:ensure_all_started(?MODULE),
-    gen_server:start_link(?MODULE, [Model], []).
+    gen_server:start_link(?MODULE, Options, []).
 
     %% make sure CANUSB is on full speed (+ other FTDI serial devices)
 low_latency() ->
@@ -237,32 +234,52 @@ low_latency() ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([Model]) ->
+init(Options) ->
     process_flag(trap_exit, true),
+    Env = Options ++ application:get_all_env(candy),
     can_router:attach(),
     can_router:error_reception(on),
     can_router:if_state_supervision(on),
-    {ok,Font} = epx_font:match([{name,"Courier New"},{size,?FONT_SIZE}]),
-    epx_gc:set_font(Font),
     S0 = #s{},
+
+    Profile = load_profile(Env),
+    MProfile = create_menu_profile(Profile),
+    WProfile = create_window_profile(Profile),
+
+    {ok,Font} = epx_font:match([{name,WProfile#window_profile.font_name},
+				{size,WProfile#window_profile.font_size}]),
+    epx_gc:set_font(Font),
     {W,H}  = epx_font:dimension(Font,"0"),
+
+    WInfo = #window_info {
+	       glyph_width  = W,
+	       glyph_height = H,
+	       glyph_ascent = epx:font_info(Font, ascent),
+	       glyph_descent = epx:font_info(Font, descent),
+	       bottom_bar = 18 %% candy use a bottom status bar
+	       %% use default for rest options
+	      },
+    
     RowHeight = H + 2,
     NRows = S0#s.nrows + 2,  %% 2 collapsed frame rows
-    Height = S0#s.top_offset+NRows*(RowHeight+S0#s.row_pad)
-	- S0#s.row_pad + S0#s.bottom_offset,
+    Height = WInfo#window_info.top_offset+NRows*(RowHeight+S0#s.row_pad)
+	- S0#s.row_pad + WInfo#window_info.bottom_offset,
     %% FORMAT= ID X|R|E L 01 23 45 67 01 23 45 67
     %% maximum width = 
     %%   ID: 3FF (11-bit) | 1FFFFFFF (29-bit)
     %% Data: 64 bit : 8*8 (16 char) | 64*1 (64 char) | X|R
     %% Given 8 byte groups in base 2
-    Width = S0#s.left_offset + 
+    Width = WInfo#window_info.left_offset + 
 	1*(8*W+4+2) + 3*(1*W+4+2) + 1*(1*W+4+2) + 8*(6+8*W+4+2) - 2 +
-	S0#s.right_offset,
+	WInfo#window_info.right_offset,
     Window = epx:window_create(40, 40, Width, Height,
 			       [button_press,button_release,
 				key_press, key_release, configure]),
     Bg = epx:pixmap_create(Width, Height, argb),
-    epx:pixmap_fill(Bg, ?BACKGROUND_COLOR),
+    BgColor = epx_profile:color(WProfile#window_profile.scheme,
+				WProfile#window_profile.background_color),
+    epx:pixmap_fill(Bg, BgColor),
+
     epx:window_attach(Window),
     epx:pixmap_attach(Bg),
     epx:window_adjust(Window, [{name, "Candy"}]),
@@ -278,7 +295,6 @@ init([Model]) ->
 		     {error,_} -> error
 		 end}
 	end,
-    %% io:format("IfID=~w, IfPid=~w, IfBitRate=~w\n", [IfID, IfPid, IfBitRate]),
     S1 = S0#s {
 	   bit_rate = IfBitRate,
 	   if_id = IfID,
@@ -287,11 +303,11 @@ init([Model]) ->
 	   height = Height,
 	   window = Window,
 	   font   = Font,
-	   glyph_width  = W,
-	   glyph_height = H,
-	   glyph_ascent = epx:font_info(Font, ascent),
-	   background_color = ?BACKGROUND_COLOR,
-	   %% foreground_pixels = Fg,
+	   winfo = WInfo,
+	   %% glyph_width  = W,
+	   %% glyph_height = H,
+	   %% glyph_ascent = epx:font_info(Font, ascent),
+	   %% background_color = ?BACKGROUND_COLOR,
 	   pixels = Bg,
 	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
 	   frame_layout  = ets:new(frame_layout, [{keypos,#layout.id}]),
@@ -302,8 +318,10 @@ init([Model]) ->
 	   row_height = RowHeight,
 	   hide = hide_pixels()
 	  },
-    D = #d { },
-    State = {S1, D},
+    WContent = #window_content { profile = WProfile },
+    D0 = #d { content = WContent },
+    State = {S1, D0},
+    Model = proplists:get_value(model, Env, any),
     State1 = load_frame_layout(Model, State),
     {ok, update_window(State1)}.
 
@@ -555,7 +573,8 @@ epx_event(close, State={_S,_D}) ->
 epx_event({button_press,[left],{X0,Y0,_}}, State={_S,D}) ->
     case scroll_hit({X0,Y0}, State) of
 	false ->
-	    Pos = {X0+D#d.view_xpos, Y0+ D#d.view_ypos},
+	    %% Pos = {X0+D#d.view_xpos, Y0+ D#d.view_ypos},
+	    Pos = get_view_pos(D, X0, Y0),
 	    case layout_from_position(Pos, State) of
 		false ->
 		    {noreply, deselect(State, [])};
@@ -568,41 +587,47 @@ epx_event({button_press,[left],{X0,Y0,_}}, State={_S,D}) ->
 
 epx_event({button_release,[left],{_X,_Y,_}}, State={S,D}) ->
     flush_motion(S#s.window),
-    case D#d.motion of
+    case get_motion(D) of
 	undefined ->
 	    {noreply, State};
 	{vhndl,_Delta} ->
 	    epx:window_disable_events(S#s.window, [motion]),
-	    {noreply, {S,D#d { motion = undefined }}};
+	    {noreply, {S,set_motion(D, undefined)}};
 	{hhndl,_Delta} ->
 	    epx:window_disable_events(S#s.window, [motion]),
-	    {noreply, {S,D#d { motion = undefined }}}
+	    {noreply, {S,set_motion(D, undefined)}}
     end;
 
 epx_event({motion,_Button,{X1,Y1,_}},State={S,D}) ->
     flush_motion(S#s.window),
-    case D#d.motion of
+    case get_motion(D) of
 	{vhndl,{_DX,Dy}} ->
-	    {_,_,_,H} = D#d.vscroll,
-	    VH = (D#d.view_bottom - D#d.view_top),
+	    BottomOffset = bottom_offset(S),
+	    {_,_,_,H} = get_vscroll(D),
+	    %%VH = (D#d.view_bottom - D#d.view_top),
+	    VH = get_view_height(D),
 	    Y2  = trunc((Y1-Dy)*(VH/H)),
-	    B = max(0,(D#d.view_bottom + S#s.bottom_offset)-H),
+	    B = max(0,(get_view_bottom(D) + BottomOffset)-H),
 	    Y  = if Y2 < 0 -> 0;
 		    Y2 > B -> B;
 		    true -> Y2
 		 end,
-	    State1 = {S, D#d { view_ypos = Y }},
+	    %% State1 = {S, D#d { view_ypos = Y }},
+	    State1 = {S, set_view_ypos(D, Y)},
 	    {noreply,redraw(State1)};
 	{hhndl,{Dx,_Dy}} ->
-	    {_,_,W,_} = D#d.hscroll,
-	    VW = (D#d.view_right - D#d.view_left),
+	    RightOffset = right_offset(S),
+	    {_,_,W,_} = get_hscroll(D),
+	    %% VW = (D#d.view_right - D#d.view_left),
+	    VW = get_view_width(D),
 	    X2  = trunc((X1-Dx)*(VW/W)),
-	    R = max(0, (D#d.view_right-S#s.right_offset)-W),
+	    R = max(0, (get_view_right(D)-RightOffset)-W),
 	    X = if X2 < 0 -> 0;
 		   X2 > R -> R;
 		   true -> X2
 		end,
-	    State1 = {S, D#d { view_xpos = X }},
+	    %% State1 = {S, D#d { view_xpos = X }},
+	    State1 = {S, set_view_xpos(D, X)},
 	    {noreply,redraw(State1)}; 
 	_ ->
 	    {noreply,State}
@@ -633,37 +658,15 @@ epx_event({button_release,[wheel_right],{_X,_Y,_}},State={S,_D}) ->
     {noreply, scroll_right(State)};
 
 epx_event({key_press, Sym, Mod, _Code}, _State={S,D}) ->
-    Shift = case lists:member(shift,Mod) of
-		true -> true;
-		false -> D#d.shift
-	    end,
-    Ctrl = case lists:member(ctrl,Mod) of
-	       true -> true;
-	       false -> D#d.ctrl
-	   end,
-    Alt = case lists:member(alt,Mod) of
-	      true -> true;
-	      false -> D#d.alt				   
-	  end,
-    D1 = D#d { shift=Shift, ctrl=Ctrl, alt=Alt},
-    State2 = command(Sym, D#d.selected, {S,D1}),
+    M = set_mod(D#d.keymod, Mod),
+    D1 = D#d { keymod = M },
+    State2 = command(Sym, D#d.selected, M, {S,D1}),
     {noreply, State2};    
 
 epx_event({key_release, _Sym, Mod, _code},_State={S,D}) ->
     %% %% io:format("Key release ~p mod=~p\n", [_Sym,Mod]),
-    Shift = case lists:member(shift,Mod) of
-		true -> false;
-		false -> D#d.shift
-	    end,
-    Ctrl = case lists:member(ctrl,Mod) of
-	       true -> false;
-	       false -> D#d.ctrl
-	   end,
-    Alt = case lists:member(alt,Mod) of
-	      true -> false;
-	      false -> D#d.alt
-	  end,
-    D1 = D#d { shift = Shift, ctrl = Ctrl, alt = Alt },
+    M = clr_mod(D#d.keymod, Mod),
+    D1 = D#d { keymod = M },
     {noreply, {S,D1}};
 
 epx_event({configure, Rect},_State={S,D}) ->
@@ -675,50 +678,68 @@ epx_event(Event, State) ->
     io:format("Got epx event ~p\n", [Event]),
     {noreply, State}.
 
+%% update mod keys
+set_mod(M, [shift|Mod]) ->  set_mod(M#keymod {shift = true}, Mod);
+set_mod(M, [ctrl|Mod]) ->   set_mod(M#keymod {ctrl = true}, Mod);
+set_mod(M, [alt|Mod]) ->    set_mod(M#keymod {alt = true}, Mod);
+set_mod(M, [_|Mod]) ->      set_mod(M, Mod);
+set_mod(M, []) -> M.
+
+clr_mod(M, [shift|Mod]) ->  clr_mod(M#keymod {shift = false}, Mod);
+clr_mod(M, [ctrl|Mod]) ->   clr_mod(M#keymod {ctrl = false}, Mod);
+clr_mod(M, [alt|Mod]) ->    clr_mod(M#keymod {alt = false}, Mod);
+clr_mod(M, [_|Mod]) ->      clr_mod(M, Mod);
+clr_mod(M, []) -> M.
+
+
 scroll_hit(Pos, _State={S,D}) ->
-    case epx_rect:contains(D#d.hscroll, Pos) of
+    case epx_rect:contains(get_hscroll(D), Pos) of
 	true ->
 	    epx:window_enable_events(S#s.window, [motion]),
-	    case epx_rect:contains(D#d.hhndl, Pos) of
+	    case epx_rect:contains(get_hhndl(D), Pos) of
 		true ->
-		    {Xv,Yv,_,_} = D#d.hhndl,
+		    {Xv,Yv,_,_} = get_hhndl(D),
 		    {Xp,Yp} = Pos,
 		    Delta = {Xp-Xv, Yp-Yv},
-		    {S,D#d{motion={hhndl,Delta}}};
+		    {S,set_motion(D,{hhndl,Delta})};
 		false ->
-		    {_,_,W,_} = D#d.hscroll,
-		    {_,_,Vw,_} = D#d.vhndl,
+		    RightOffset = right_offset(S),
+		    {_,_,W,_} = get_hscroll(D),
+		    {_,_,Vw,_} = get_vhndl(D),
 		    {Xp,_Yp} = Pos,
-		    VW = (D#d.view_right - D#d.view_left),
+		    %% VW = (D#d.view_right - D#d.view_left),
+		    VW = get_view_width(D),
 		    X2  = trunc((Xp-(Vw div 2))*(VW/W)),
-		    R = max(0, (D#d.view_right-S#s.right_offset)-W),
+		    R = max(0, (get_view_right(D)-RightOffset)-W),
 		    X  = clamp(X2, 0, R),
-		    State1 = {S, D#d { view_xpos = X, 
-				       motion={hhndl,{(Vw div 2),0}} }},
+		    %% D1 = D#d { view_xpos = X },
+		    D1 = set_view_xpos(D, X),
+		    State1 = {S, set_motion(D1,{hhndl,{(Vw div 2),0}}) },
 		    redraw(State1)
 	    end;
 	false ->
-	    case epx_rect:contains(D#d.vscroll, Pos) of
+	    case epx_rect:contains(get_vscroll(D), Pos) of
 		true ->
 		    epx:window_enable_events(S#s.window, [motion]),
-		    case epx_rect:contains(D#d.vhndl, Pos) of
+		    case epx_rect:contains(get_vhndl(D), Pos) of
 			true ->
-			    {Xv,Yv,_,_} = D#d.vhndl,
+			    {Xv,Yv,_,_} = get_vhndl(D),
 			    {Xp,Yp} = Pos,
 			    Delta = {Xp-Xv, Yp-Yv},
 			    %% activate motion
-			    {S,D#d{motion={vhndl,Delta}}};
+			    {S,set_motion(D,{vhndl,Delta})};
 			false ->
-			    {_,_,_,H} = D#d.vscroll,
-			    {_,_,_,Vh} = D#d.vhndl,
+			    BottomOffset = bottom_offset(S),
+			    {_,_,_,H} = get_vscroll(D),
+			    {_,_,_,Vh} = get_vhndl(D),
 			    {_Xp,Yp} = Pos,
-			    VH = (D#d.view_bottom - D#d.view_top),
+			    %% VH = (D#d.view_bottom - D#d.view_top),
+			    VH = get_view_height(D),
 			    Y2  = trunc((Yp-(Vh div 2))*(VH/H)),
-			    B = max(0,(D#d.view_bottom+S#s.bottom_offset)-H),
+			    B = max(0,(get_view_bottom(D)+BottomOffset)-H),
 			    Y  = clamp(Y2, 0, B),
-			    State1 = {S, D#d { view_ypos = Y, 
-					       motion={vhndl,{0,(Vh div 2)}}
-					     }},
+			    D1 = set_view_ypos(D, Y),
+			    State1 = {S,set_motion(D1,{vhndl,{0,(Vh div 2)}})},
 			    redraw(State1)
 		    end;
 		false ->
@@ -742,9 +763,10 @@ cell_hit(Pos, Layout, State={S,D}) ->
 	    State2 = insert_layout(Layout1, State1),
 	    {Vx,Vy,Vw,Vh} = view_rect(State2),
 	    {S2,D2} = State2,
-	    D3 = D2#d { view_left = Vx, view_top = Vy,
-			view_right = Vx+Vw-1,
-			view_bottom = Vy+Vh-1 },
+%%	    D3 = D2#d { view_left = Vx, view_top = Vy,
+%%			view_right = Vx+Vw-1,
+%%			view_bottom = Vy+Vh-1 },
+	    D3 = set_view_rect(D2, Vx, Vx+Vw-1, Vy, Vy+Vh-1),
 	    State3 = {S2,D3},
 	    redraw(State3);
 	    
@@ -753,7 +775,7 @@ cell_hit(Pos, Layout, State={S,D}) ->
 	    Layout1 = Layout#layout { style = normal },
 	    update_layout(Layout, Layout1, State);
 
-	{I, _Fmt} when D#d.shift ->  %% add to selection
+	{I, _Fmt} when (D#d.keymod)#keymod.shift ->  %% add to selection
 	    FID = Layout#layout.id,
 	    Selected = lists:usort([{FID,I}|D#d.selected]),
 	    D1 = D#d { selected = Selected },
@@ -785,19 +807,19 @@ cell_hit(Pos, Layout, State={S,D}) ->
 %%   pageup         Page up, scroll one page up
 %%   pagedown       Page down, scroll one page down
 %%
-command($x, Selected, State) ->
+command($x, Selected, _Mod, State) ->
     set_base(Selected, 16, State);
-command($d, Selected, State) ->
+command($d, Selected, _Mod, State) ->
     set_base(Selected, 10, State);
-command($o, Selected, State) ->
+command($o, Selected, _Mod, State) ->
     set_base(Selected, 8, State);
-command($b, Selected, State) ->
+command($b, Selected, _Mod, State) ->
     set_base(Selected, 2, State);
-command($G, Selected, State={_S,D}) when D#d.shift ->
+command($G, Selected, Mod, State) when Mod#keymod.shift ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
 
-command($g, Selected, _State = {S,D}) ->
+command($g, Selected, _Mod, _State = {S,D}) ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     %% select min pos foreach FID and keep as selected
     Selected1 = lists:foldl(
@@ -809,7 +831,7 @@ command($g, Selected, _State = {S,D}) ->
     State1 = {S, D#d { selected = Selected1 }},
     foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
 
-command($s, Selected, State={_S,D}) when D#d.ctrl ->
+command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
     Bytes = 
 	lists:foldr(
@@ -841,36 +863,34 @@ command($s, Selected, State={_S,D}) when D#d.ctrl ->
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
     State;
-command($q, _Selected, State) ->
+command($q, _Selected, _Mod, State) ->
     erlang:halt(0),
     State;
-command(I, Selected, State) when I >= $1, I =< $8 ->
+command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, State, Fs);
 
-command(up, _Selected, State={_,D}) when D#d.alt ->
+command(up, _Selected, Mod, State) when Mod#keymod.alt ->
     bit_rate_up(State);
-command(down, _Selected, State={_,D}) when D#d.alt ->
+command(down, _Selected, Mod, State) when Mod#keymod.alt ->
     bit_rate_down(State);
 
-
-command(up, _Selected, State) ->
+command(up, _Selected, _Mod, State) ->
     scroll_up(State);
-command(down, _Selected, State) ->
+command(down, _Selected, _Mod, State) ->
     scroll_down(State);
 
-command(pageup, _Selected, State) ->
+command(pageup, _Selected, _Mod, State) ->
     page_up(State);
-command(pagedown, _Selected, State) ->
+command(pagedown, _Selected, _Mod, State) ->
     page_down(State);
 
-command(left, _Selected, State) ->
+command(left, _Selected, _Mod, State) ->
     scroll_left(State);
-command(right, _Selected, State) ->
+command(right, _Selected, _Mod, State) ->
     scroll_right(State);
 
-
-command(_Symbol, _Selected, State) ->
+command(_Symbol, _Selected, _Mod, State) ->
     io:format("unhandled command ~p\n", [_Symbol]),
     State.
 
@@ -920,64 +940,70 @@ deselect({S,D}, NewSelected) ->
     State = {S, D#d { selected = NewSelected }},
     foldl(fun(FID,Si) -> redraw(FID, Si) end, State, Fs).
 
-scroll_up(State) ->
-    State1 = step_up(State, ?YSTEP),
+scroll_up(State={S,_}) ->
+    State1 = step_up(State, scroll_ystep(S)),
     redraw(State1).
 
-scroll_down(State) ->
-    State1 = step_down(State, ?YSTEP),
+scroll_down(State={S,_}) ->
+    State1 = step_down(State, scroll_ystep(S)),
     redraw(State1).
 
 %% move a page up
 page_up(State={_S,D}) ->
-    case D#d.vscroll of
+    case get_vscroll(D) of
 	undefined ->
 	    State;
 	{_,_,_,H} ->
-	    {_,_,_,VH} = D#d.vhndl,  %% this is the page size in window coords
+	    {_,_,_,VH} = get_vhndl(D), %% this is the page size in window coords
 	    R = VH/H,  %% page ratio
-	    Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    %%Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    Step = trunc(R*get_view_height(D)),
 	    State1 = step_up(State, Step),
 	    redraw(State1)
     end.
 
 page_down(State={_S,D}) ->
-    case D#d.vscroll of
+    case get_vscroll(D) of
 	undefined ->
 	    State;
 	{_,_,_,H} ->
-	    {_,_,_,VH} = D#d.vhndl,  %% this is the page size in window coords
+	    {_,_,_,VH} = get_vhndl(D), %% this is the page size in window coords
 	    R = VH/H,  %% page ratio
-	    Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    %% Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
+	    Step = trunc(R*get_view_height(D)),
 	    State1 = step_down(State, Step),
 	    redraw(State1)
     end.
 
 scroll_left(_State={S,D}) ->
-    X = max(0, D#d.view_xpos -  ?XSTEP),
-    State1 = {S, D#d { view_xpos = X }},
+    X = max(0, get_view_xpos(D) - scroll_xstep(S)),
+    State1 = {S, set_view_xpos(D, X)},
     redraw(State1).
 
 scroll_right(_State={S,D}) ->
-    W = if D#d.vscroll =:= undefined -> S#s.width;
-	   true ->  S#s.width - ?SCROLL_BAR_SIZE
+    RightOffset = right_offset(S),
+    W = case get_vscroll(D) of
+	    undefined -> S#s.width;
+	    true ->  S#s.width - scroll_bar_size(S)
 	end,
-    R = max(0, (D#d.view_right - S#s.right_offset) - W),
-    X = min(D#d.view_xpos + ?XSTEP, R),
-    State1 = {S, D#d { view_xpos = X }},
+    R = max(0, (get_view_right(D) - RightOffset) - W),
+    X = min(get_view_xpos(D) + scroll_xstep(S), R),
+    State1 = {S, set_view_xpos(D, X)},
     redraw(State1).
 
 step_up(_State={S,D}, Step) ->
-    Y = max(0, D#d.view_ypos - Step),
-    {S, D#d { view_ypos = Y }}.    
+    Y = max(0, get_view_ypos(D) - Step),
+    {S, set_view_ypos(D, Y) }.
 
 step_down(_State={S,D}, Step) ->
-    H = if D#d.hscroll =:= undefined -> S#s.height;
-	   true -> S#s.height - ?SCROLL_BAR_SIZE
+    BottomOffset = bottom_offset(S),
+    H = case get_hscroll(D) of
+	    undefined -> S#s.height;
+	    _ -> S#s.height - scroll_bar_size(S)
 	end,
-    B = max(0, (D#d.view_bottom+S#s.bottom_offset) - H),
-    Y = min(D#d.view_ypos + Step, B),
-    {S, D#d { view_ypos = Y }}.
+    B = max(0, (get_view_bottom(D)+BottomOffset) - H),
+    Y = min(get_view_ypos(D) + Step, B),
+    {S, set_view_ypos(D, Y)}.
     
 %% Set base to 'Base' in selected cells
 set_base(Selected, Base, State) ->
@@ -1223,13 +1249,14 @@ redraw_anim_('$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
 %% no need to clip since we always draw scollbar if needed
-redraw(State={S,_D}) ->
+redraw(State={S,D}) ->
     HBar = horizontal_scrollbar(State),
     VBar = vertical_scrollbar(State),
-    epx:pixmap_fill(S#s.pixels, ?BACKGROUND_COLOR),
+    epx:pixmap_fill(S#s.pixels, background_color(D)),
+
     State1 = redraw_all(State),
-    State2 = draw_scrollbar(State1,?SCROLL_VERTICAL,HBar),
-    State3 = draw_scrollbar(State2,?SCROLL_HORIZONTAL,VBar),
+    State2 = draw_scrollbar(State1,scroll_vertical(S),HBar),
+    State3 = draw_scrollbar(State2,scroll_horizontal(S),VBar),
     State4 = draw_top_bar(State3),
     State5 = draw_left_bar(State4),
     State6 = draw_right_bar(State5),
@@ -1237,76 +1264,85 @@ redraw(State={S,_D}) ->
     update_window(State7).
 
 %% top & bottom bar has priority over left and right...
-draw_top_bar(State={S,_D}) when ?TOP_BAR > 0 ->
-    epx_gc:set_fill_style(solid),
-    epx_gc:set_fill_color(?TOP_BAR_COLOR), 
-    DrawRect = {0,0,S#s.width,?TOP_BAR},
-    epx:draw_rectangle(S#s.pixels, DrawRect),
-    State;
-draw_top_bar(State) ->
-    State.
+draw_top_bar(State={S,D}) ->
+    case bar(S) of
+	{_Left,_Right,0,_Bottom} ->
+	    State;
+	{_Left,_Right,Top,_Bottom} ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(top_bar_color(D)), 
+	    DrawRect = {0,0,S#s.width,Top},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    State
+    end.
 
-draw_bottom_bar(State={S,_D}) when ?BOTTOM_BAR > 0 ->
-    epx_gc:set_fill_style(solid),
-    epx_gc:set_fill_color(?BOTTOM_BAR_COLOR), 
-    X0 = 0,
-    Y0 = S#s.height-?BOTTOM_BAR,
-    DrawRect = {X0,Y0,S#s.width,?BOTTOM_BAR},
-    epx:draw_rectangle(S#s.pixels, DrawRect),
-    epx_gc:set_foreground_color({0,0,0}),
-    epx_gc:set_fill_style(none),
-    epx:draw_rectangle(S#s.pixels, DrawRect),
+draw_bottom_bar(State={S,D}) ->
+    case bar(S) of
+	{_Left,_Right,_Top,0} ->
+	    State;
+	{_Left,_Right,_Top,Bottom} ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(bottom_bar_color(D)), 
+	    X0 = 0,
+	    Y0 = S#s.height-Bottom,
+	    DrawRect = {X0,Y0,S#s.width,Bottom},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    epx_gc:set_foreground_color({0,0,0}),
+	    epx_gc:set_fill_style(none),
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
 
-    %% +-----------+---------------+----------------+
-    %% | Link: up  | BitRate: 250k | Status: busoff |
-    %% +-----------+---------------+----------------+
-    LinkString = case S#s.if_state of
-		     up -> "Link: up";
-		     down -> "Link: down"
-		 end,
-    draw_text(X0+10, Y0, 100, ?BOTTOM_BAR-2, LinkString, State),
+	    %% +-----------+---------------+----------------+
+	    %% | Link: up  | BitRate: 250k | Status: busoff |
+	    %% +-----------+---------------+----------------+
+	    LinkString = case S#s.if_state of
+			     up -> "Link: up";
+			     down -> "Link: down"
+			 end,
+	    draw_text(X0+10, Y0, 100, Bottom-2, LinkString, State),
 
-    BitRateString =
-	case S#s.bit_rate of
-	    error ->   "BitRate: error";
-	    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)
-	end,
-    draw_text(X0+110, Y0, 130, ?BOTTOM_BAR-2, BitRateString, State),
+	    BitRateString =
+		case S#s.bit_rate of
+		    error ->   "BitRate: error";
+		    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)
+		end,
+	    draw_text(X0+110, Y0, 130, Bottom-2, BitRateString, State),
 
-    ErrorString = 
-	case S#s.if_error of 
-	    [] -> "State: ok";
-	    Es -> "State: "++ format_error(Es)
-	end,
-    draw_text(X0+240, Y0, 80, ?BOTTOM_BAR-2, ErrorString, State),
-    State;
-draw_bottom_bar(State) ->
-    State.    
+	    ErrorString = 
+		case S#s.if_error of 
+		    [] -> "State: ok";
+		    Es -> "State: "++ format_error(Es)
+		end,
+	    draw_text(X0+240, Y0, 80, Bottom-2, ErrorString, State),
+	    State
+    end.
 
-draw_left_bar(State={S,_D}) when ?LEFT_BAR > 0 ->
-    epx_gc:set_fill_style(solid),
-    epx_gc:set_fill_color(?LEFT_BAR_COLOR),
-    DrawRect = {0,?TOP_BAR,?LEFT_BAR,
-		S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
-    epx:draw_rectangle(S#s.pixels, DrawRect),
-    State;
-draw_left_bar(State) ->
-    State.
+draw_left_bar(State={S,D}) ->
+    case bar(S) of
+	{0,_,_,_} -> State;
+	{Left,_Right,Top,Bottom} ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(left_bar_color(D)),
+	    DrawRect = {0,Top,Left, S#s.height-(Top+Bottom)},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    State
+    end.
 
-
-draw_right_bar(State={S,_D}) when ?RIGHT_BAR > 0 ->
-    epx_gc:set_fill_style(solid),
-    epx_gc:set_fill_color(?RIGHT_BAR_COLOR),
-    DrawRect = {S#s.width-?RIGHT_BAR,?TOP_BAR,?RIGHT_BAR,
-		S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
-    epx:draw_rectangle(S#s.pixels, DrawRect),
-    State;
-draw_right_bar(State) ->
-    State.
+draw_right_bar(State={S,D}) ->
+    case bar(S) of
+	{_Left,0,_Top,_Bottom} -> State;
+	{_Left,Right,Top,Bottom} ->
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(right_bar_color(D)),
+	    DrawRect = {S#s.width-Right,Top,Right,
+			S#s.height-(Top+Bottom)},
+	    epx:draw_rectangle(S#s.pixels, DrawRect),
+	    State
+    end.
 
 draw_text(X0, Y0, _W, _H, Text, {S,_}) ->
     X = X0,
-    Y = Y0+1+S#s.glyph_ascent,
+    GA = glyph_ascent(S),
+    Y = Y0+1+GA,
     epx_gc:set_foreground_color(?TEXT_COLOR),
     epx:draw_string(S#s.pixels, X, Y, Text).
 
@@ -1316,31 +1352,38 @@ format_error(ErrorList) ->
 
 %% define clip rect for content drawing depending on scrollbar information
 clip_rect(_State={S,_D}, none, none) ->
-    inside_rect(0,0,S#s.width,S#s.height);
+    inside_rect(S,0,0,S#s.width,S#s.height);
 clip_rect(_State={S,_D}, none, right) ->
-    inside_rect(0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height);
+    Size = scroll_bar_size(S),
+    inside_rect(S,0,0,S#s.width-Size,S#s.height);
 clip_rect(_State={S,_D}, none, left) ->
-    inside_rect(?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height);
+    Size = scroll_bar_size(S),
+    inside_rect(S,Size,0,S#s.width-Size,S#s.height);
 clip_rect(_State={S,_D}, bottom, none) ->
-    inside_rect(0,0,S#s.width,S#s.height-?SCROLL_BAR_SIZE);
+    Size = scroll_bar_size(S),
+    inside_rect(S,0,0,S#s.width,S#s.height-Size);
 clip_rect(_State={S,_D}, bottom, right) ->
-    inside_rect(0,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
+    Size = scroll_bar_size(S),
+    inside_rect(S,0,0,S#s.width-Size,S#s.height-Size);
 clip_rect(_State={S,_D}, bottom, left) ->
-    inside_rect(?SCROLL_BAR_SIZE,0,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
+    Size = scroll_bar_size(S),
+    inside_rect(S,Size,0,S#s.width-Size,
+		S#s.height-Size);
 clip_rect(_State={S,_D}, top, none) ->
-    inside_rect(0,?SCROLL_BAR_SIZE,S#s.width,S#s.height-?SCROLL_BAR_SIZE);
+    Size = scroll_bar_size(S),
+    inside_rect(S,0,Size,S#s.width,S#s.height-Size);
 clip_rect(_State={S,_D}, top, right) ->
-    inside_rect(0,?SCROLL_BAR_SIZE,S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE);
+    Size = scroll_bar_size(S),
+    inside_rect(S,0,Size,S#s.width-Size,S#s.height-Size);
 clip_rect(_State={S,_D}, top, left) ->
-    inside_rect(?SCROLL_BAR_SIZE,?SCROLL_BAR_SIZE,
-		S#s.width-?SCROLL_BAR_SIZE,S#s.height-?SCROLL_BAR_SIZE).
+    Size = scroll_bar_size(S),
+    inside_rect(S,Size,Size,
+		S#s.width-Size,S#s.height-Size).
 
 %% exclude side var from clip rect
-inside_rect(X,Y,W,H) ->
-    {X+?LEFT_BAR, Y+?TOP_BAR,
-     W - (?LEFT_BAR+?RIGHT_BAR),
-     H - (?TOP_BAR+?BOTTOM_BAR)}.
-
+inside_rect(S,X,Y,W,H) ->
+    {Left,Right,Top,Bottom} = bar(S),
+    {X+Left, Y+Top, W - (Left+Right), H - (Top+Bottom)}.
 
 %% set clip to window content (exclude scrollbar area, and side bars)
 %% return Old clip rectangle
@@ -1440,8 +1483,9 @@ redraw_pos(FID,Pos,Color,Format,Frame,State) ->
 
 redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
     #fmt {x=X0,y=Y0,width=W,height=H} = Fmt,
-    X = X0 - D#d.view_xpos,
-    Y = Y0 - D#d.view_ypos,
+    %% X = X0 - D#d.view_xpos,
+    %% Y = Y0 - D#d.view_ypos,
+    {X,Y} = get_rview_pos(D, X0, Y0),
     {Remove,TextColor} = highlight(FID,Pos,Color,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
     %% draw shape
@@ -1508,7 +1552,8 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 		   true ->
 			String0
 		end,
-	    Ya = Y+1+S#s.glyph_ascent,
+	    GA = glyph_ascent(S),
+	    Ya = Y+1+GA,
 	    Offs = 2,
 	    epx:draw_string(S#s.pixels,X+Offs,Ya,String);
 	hide ->
@@ -1517,7 +1562,8 @@ redraw_fmt(FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 				 0, 0, X+2, Y+2, 16, 16, [blend]);
 	_ ->
 	    String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
-	    Ya = Y+1+S#s.glyph_ascent,
+	    GA = glyph_ascent(S),
+	    Ya = Y+1+GA,
 	    Offs = if Fmt#fmt.base > 0, Fmt#fmt.field =:= data -> 6+2;
 		      true -> 2
 		   end,
@@ -1532,106 +1578,242 @@ draw_layout_background(Layout, State) ->
 			  Layout#layout.width).
 
 %% prepare layout by painting the layout background color
-clear_layout_background(Layout, State={S,_}) ->
-    draw_layout_rectangle(Layout, S#s.background_color, State, 
-			  S#s.width).
+clear_layout_background(Layout, State={S,D}) ->
+    Color = background_color(D),
+    draw_layout_rectangle(Layout, Color, State, S#s.width).
 
 draw_layout_rectangle(Layout, Color, _State={S,D}, Width) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color),
-    X = Layout#layout.x - D#d.view_xpos,
-    Y = Layout#layout.y - D#d.view_ypos,
+    %% X = Layout#layout.x - D#d.view_xpos,
+    %% Y = Layout#layout.y - D#d.view_ypos,
+    {X, Y} = get_rview_pos(D, Layout#layout.x, Layout#layout.y),
     Rect = {X,Y,Width,Layout#layout.height},
     epx:draw_rectangle(S#s.pixels, Rect).
 
-draw_scrollbar(State, left, HBar) ->
-    draw_vertical_scrollbar(State, ?LEFT_BAR, HBar);
+draw_scrollbar(State={S,_D}, left, HBar) ->
+    LeftBar = left_bar(S),
+    draw_vertical_scrollbar(State, LeftBar, HBar);
 draw_scrollbar(State={S,_D}, right, HBar) ->
+    Size = scroll_bar_size(S),
+    RightBar = right_bar(S),
     draw_vertical_scrollbar(State,
-			    S#s.width-?SCROLL_BAR_SIZE-?RIGHT_BAR,HBar);
-draw_scrollbar(State, top, VBar) ->
-    draw_horizontal_scrollbar(State, ?TOP_BAR, VBar);
+			    S#s.width-Size-RightBar,HBar);
+draw_scrollbar(State={S,_D}, top, VBar) ->
+    TopBar = top_bar(S),
+    draw_horizontal_scrollbar(State, TopBar, VBar);
 draw_scrollbar(State={S,_D}, bottom, VBar) ->
+    Size = scroll_bar_size(S),
+    BottomBar = bottom_bar(S),
     draw_horizontal_scrollbar(State,
-			      S#s.height-?SCROLL_BAR_SIZE-?BOTTOM_BAR,VBar).
+			      S#s.height-Size-BottomBar,VBar).
 
 vertical_scrollbar(_State={S,D}) ->
     WH = S#s.height,
-    VH = D#d.view_bottom - D#d.view_top,
-    if VH > WH ->  ?SCROLL_VERTICAL;
+    %% VH = D#d.view_bottom - D#d.view_top,
+    VH = get_view_height(D),
+    if VH > WH ->  scroll_vertical(S);
        true  -> none
     end.
 	    
 draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
-    WH = if HBar =:= none -> S#s.height - (?TOP_BAR+?BOTTOM_BAR);
-	    true -> S#s.height - (?SCROLL_BAR_SIZE+?TOP_BAR+?BOTTOM_BAR)
+    Size = scroll_bar_size(S),
+    HndlSize = scroll_hndl_size(S),
+    {_,_,TopBar,BottomBar} = bar(S),
+    WH = if HBar =:= none -> S#s.height - (TopBar+BottomBar);
+	    true -> S#s.height - (Size+TopBar+BottomBar)
 	 end,
-    VH = D#d.view_bottom - D#d.view_top,
+    %%VH = D#d.view_bottom - D#d.view_top,
+    VH = get_view_height(D),
     if VH > WH ->
 	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
+	    epx_gc:set_fill_color(scroll_bar_color(D)),
 	    Y0 = case HBar of
-		     none   -> ?TOP_BAR;
-		     bottom -> ?TOP_BAR;
-		     top    -> ?TOP_BAR+?SCROLL_BAR_SIZE
+		     none   -> TopBar;
+		     bottom -> TopBar;
+		     top    -> TopBar+Size
 		 end,
-	    Rect = {X0,Y0,?SCROLL_BAR_SIZE,WH},
-	    DrawRect = {X0,?TOP_BAR,?SCROLL_BAR_SIZE,
-			S#s.height-(?TOP_BAR+?BOTTOM_BAR)},
+	    Rect = {X0,Y0,Size,WH},
+	    DrawRect = {X0,TopBar,Size,
+			S#s.height-(TopBar+BottomBar)},
 	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
+	    epx_gc:set_fill_color(scroll_hndl_color(D)),
 	    %% fixme: save scale factor? keep min HandleLength!
 	    Part = WH / VH,
 	    HandleLength = trunc(Part*WH),
-	    Top = D#d.view_ypos,
+	    Top = get_view_ypos(D),
 	    HandlePos = trunc(Part*Top),
-	    Pad = (?SCROLL_BAR_SIZE - ?SCROLL_HNDL_SIZE) div 2,
-	    HRect = {X0+Pad,Y0+HandlePos,?SCROLL_HNDL_SIZE,HandleLength},
+	    Pad = (Size - HndlSize) div 2,
+	    HRect = {X0+Pad,Y0+HandlePos,HndlSize,HandleLength},
 	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
-	    {S,D#d { vscroll=Rect, vhndl=HRect }};
+	    {S, set_vscroll(D, Rect, HRect) };
        true ->
-	    {S,D#d { vscroll=undefined, vhndl=undefined }}
+	    {S, set_vscroll(D, undefined, undefined) }
     end.
 
 horizontal_scrollbar(_State={S,D}) ->
     WW = S#s.width,
-    VW = D#d.view_right - D#d.view_left,
+    %% VW = D#d.view_right - D#d.view_left,
+    VW = get_view_width(D),
     case VW > WW of
-	true -> ?SCROLL_HORIZONTAL;
+	true -> scroll_horizontal(S);
 	false -> none
     end.
 	    
 %% fixme remove vertical scrollbar if present!
 draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
-    WW = if VBar =:= none -> S#s.width - (?LEFT_BAR+?RIGHT_BAR);
-	    true -> S#s.width - (?SCROLL_BAR_SIZE+?LEFT_BAR+?RIGHT_BAR)
+    Size = scroll_bar_size(S),
+    HndlSize = scroll_hndl_size(S),
+    {LeftBar,RightBar,_,_} = bar(S),
+    WW = if VBar =:= none -> S#s.width - (LeftBar+RightBar);
+	    true -> S#s.width - (Size+LeftBar+RightBar)
 	 end,
-    VW = D#d.view_right - D#d.view_left,
+    %%VW = D#d.view_right - D#d.view_left,
+    VW = get_view_width(D),
     if VW > WW ->
 	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(?SCROLL_BAR_COLOR),
+	    epx_gc:set_fill_color(scroll_bar_color(D)),
 	    X0 = case VBar of
-		     none -> ?LEFT_BAR;
-		     left -> ?LEFT_BAR;
-		     right -> ?LEFT_BAR+?SCROLL_BAR_SIZE
+		     none -> LeftBar;
+		     left -> LeftBar;
+		     right -> LeftBar+Size
 		 end,
-	    Rect = {X0,Y0,WW,?SCROLL_BAR_SIZE},
-	    DrawRect = {?LEFT_BAR,Y0,S#s.width-(?LEFT_BAR+?RIGHT_BAR),
-			?SCROLL_BAR_SIZE},
+	    Rect = {X0,Y0,WW,Size},
+	    DrawRect = {LeftBar,Y0,S#s.width-(LeftBar+RightBar),
+			Size},
 	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    epx_gc:set_fill_color(?SCROLL_HNDL_COLOR),
+	    epx_gc:set_fill_color(scroll_hndl_color(D)),
 	    Part = WW / VW,
-	    Left = D#d.view_xpos,
+	    %% D#d.view_xpos,
+	    Left = get_view_xpos(D), 
 	    HandleLength = trunc(Part*WW),
 	    HandlePos = trunc(Part*Left),
-	    Pad = (?SCROLL_BAR_SIZE - ?SCROLL_HNDL_SIZE) div 2,
-	    HRect = {HandlePos,Y0+Pad,HandleLength,?SCROLL_HNDL_SIZE},
+	    Pad = (Size - HndlSize) div 2,
+	    HRect = {HandlePos,Y0+Pad,HandleLength,HndlSize},
 	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
-	    {S,D#d { hscroll=Rect, hhndl=HRect }};
+	    {S, set_hscroll(D, Rect, HRect)};
        true ->
-	    {S,D#d { hscroll=undefined, hhndl=undefined }}
+	    {S, set_hscroll(D, undefined, undefined) }
     end.
+
+
+%% profile acces
+background_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.background_color).
+
+top_bar_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.top_bar_color).
+
+left_bar_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.left_bar_color).
+
+right_bar_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.right_bar_color).
+
+bottom_bar_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.bottom_bar_color).
+
+scroll_bar_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.scroll_bar_color).
+
+scroll_hndl_color(#d { content = WD }) ->
+    P = WD#window_content.profile,
+    epx_profile:color(P#window_profile.scheme,
+		      P#window_profile.scroll_hndl_color).
+
+get_view_xpos(#d { content = WD }) -> WD#window_content.view_xpos.
+get_view_ypos(#d { content = WD }) -> WD#window_content.view_ypos.
+
+get_view_pos(#d { content = WD }, X, Y) -> 
+    {WD#window_content.view_xpos+X,WD#window_content.view_ypos+Y}.
+
+get_rview_pos(#d { content = WD }, X, Y) -> 
+    { X-WD#window_content.view_xpos, Y-WD#window_content.view_ypos}.
+
+set_view_xpos(D = #d{ content = WD}, X) ->
+    D#d { content = WD#window_content { view_xpos = X }}.
+set_view_ypos(D = #d{ content = WD}, Y) ->
+    D#d { content = WD#window_content { view_ypos = Y }}.
+set_view_pos(D = #d{ content = WD}, X, Y) ->
+    D#d { content = WD#window_content { view_xpos = X, view_ypos = Y }}.
+
+get_view_left(#d { content = WD }) -> WD#window_content.view_left.
+get_view_right(#d { content = WD }) -> WD#window_content.view_right.
+get_view_top(#d { content = WD }) -> WD#window_content.view_top.
+get_view_bottom(#d { content = WD }) -> WD#window_content.view_bottom.
+get_view_width(#d { content = WD }) ->
+    WD#window_content.view_right - WD#window_content.view_left.
+get_view_height(#d { content = WD }) ->
+    WD#window_content.view_bottom - WD#window_content.view_top.
+
+set_view_rect(D=#d { content = WD }, L, R, T, B) ->    
+    D#d { content = WD#window_content { view_left = L,
+					view_right = R,
+					view_top   = T,
+					view_bottom = B }}.
+
+get_hscroll(#d { content = WD }) -> WD#window_content.hscroll.
+get_hhndl(#d { content = WD }) -> WD#window_content.hhndl.
+get_vscroll(#d { content = WD }) -> WD#window_content.vscroll.
+get_vhndl(#d { content = WD }) -> WD#window_content.vhndl.
+
+set_hscroll(D=#d { content = WD }, Rect, Hndl) ->
+    D#d { content = WD#window_content { hscroll = Rect,
+					hhndl = Hndl }}.
+set_vscroll(D=#d { content = WD }, Rect, Hndl) ->
+    D#d { content = WD#window_content { vscroll = Rect,
+					vhndl = Hndl }}.
+
+get_motion(#d { content = WD }) -> WD#window_content.motion.
+
+set_motion(D=#d { content = WD }, Motion) ->    
+    D#d { content = WD#window_content { motion = Motion }}.
     
+
+bar(#s { winfo = WI }) ->
+    #window_info { left_bar = L, right_bar = R,
+		   top_bar = T, bottom_bar = B } = WI,
+    {L, R, T, B}.
+
+top_bar(#s { winfo = WI }) -> WI#window_info.top_bar.
+left_bar(#s { winfo = WI }) -> WI#window_info.left_bar.
+right_bar(#s { winfo = WI }) -> WI#window_info.right_bar.
+bottom_bar(#s { winfo = WI }) -> WI#window_info.bottom_bar.
+
+top_offset(#s { winfo = WI }) -> 
+    WI#window_info.top_offset + WI#window_info.top_bar.
+left_offset(#s { winfo = WI }) -> 
+    WI#window_info.left_offset + WI#window_info.left_bar.
+right_offset(#s { winfo = WI }) -> 
+    WI#window_info.right_offset + WI#window_info.right_bar.
+bottom_offset(#s { winfo = WI }) -> 
+    WI#window_info.bottom_offset + WI#window_info.bottom_bar.
+
+scroll_hndl_size(#s { winfo = WI }) -> WI#window_info.scroll_hndl_size.
+scroll_bar_size(#s { winfo = WI }) -> WI#window_info.scroll_bar_size.
+
+scroll_horizontal(#s { winfo = WI }) -> WI#window_info.scroll_horizontal.
+scroll_vertical(#s { winfo = WI }) -> WI#window_info.scroll_vertical.
+
+scroll_xstep(#s { winfo = WI }) -> WI#window_info.scroll_xstep.
+scroll_ystep(#s { winfo = WI }) -> WI#window_info.scroll_ystep.
+
+glyph_width(#s { winfo = WI }) -> WI#window_info.glyph_width.
+glyph_height(#s { winfo = WI }) -> WI#window_info.glyph_height.
+glyph_ascent(#s { winfo = WI }) -> WI#window_info.glyph_ascent.
+glyph_descent(#s { winfo = WI }) -> WI#window_info.glyph_descent.
 
 %% draw hightlight background return text color and flag to signal remove
 highlight(FID, Pos, Color, Rect, _State={S,_}) ->
@@ -1700,8 +1882,9 @@ repaint_layout(Layout, State={_S,D}, MinW) ->
     #layout { x=X0, y=Y0, width=W0, height=H0 } = Layout,
     W1 = max(W0,MinW),
     H1 = H0,
-    X1 = X0 - D#d.view_xpos,
-    Y1 = Y0 - D#d.view_ypos,
+    %% X1 = X0 - D#d.view_xpos,
+    %% Y1 = Y0 - D#d.view_ypos,
+    {X1,Y1} = get_rview_pos(D, X0, Y0),
     update_window(State, {X1,Y1,W1,H1}).
     
 update_window(State={S,_D},_R={X,Y,W,H}) ->
@@ -1758,9 +1941,10 @@ position_deleted(Layout, _State) ->
     Layout#layout { x=0,y=0,width=0,height=0 }.
 
 position_normal(Layout, State={S,_D}) ->
+    TopOffset = top_offset(S),
     I = Layout#layout.pos-1,
-    Y = S#s.top_offset + I*(S#s.row_height+S#s.row_pad),
-    X = S#s.left_offset,
+    Y = TopOffset + I*(S#s.row_height+S#s.row_pad),
+    X = left_offset(S),
     {X1,_Y1,Format} = 
 	position_format(X, Y, 1, Layout#layout.format, [], State),
     Width = (X1-X-2)+1,
@@ -1768,15 +1952,17 @@ position_normal(Layout, State={S,_D}) ->
     Layout#layout { x=X,y=Y,width=Width,height=Height,format=Format }.    
 
 position_collapsed(Layout, _State={S,_D}) ->
+    BottomOffset = bottom_offset(S),
     J = Layout#layout.pos-1,
     Fmt = element(?ID_FMT_POSITION, Layout#layout.format), %% FIXME!
     Row = 1,  %% calculate row from bottom left to right
     Height = S#s.row_height,
     Num    = num_glyphs(Fmt),
-    Wide   = 8*S#s.glyph_width + 4,
-    Width  = Num*S#s.glyph_width + 4,
-    X = S#s.left_offset + J*Wide,
-    Y = S#s.height - Row*Height - S#s.bottom_offset,
+    GW = glyph_width(S),
+    Wide   = 8*GW + 4,
+    Width  = Num*GW + 4,
+    X = left_offset(S) + J*Wide,
+    Y = S#s.height - Row*Height - BottomOffset,
     Fmt1 = Fmt#fmt { x=X, y=Y, width=Width, height=Height },
     Format = setelement(?ID_FMT_POSITION, Layout#layout.format, Fmt1),
     Layout#layout { x=X,y=Y,width=Wide+2,height=Height,format=Format}.
@@ -1784,7 +1970,8 @@ position_collapsed(Layout, _State={S,_D}) ->
 position_format(X,Y,I,Format,Acc,State={S,_D}) when I =< tuple_size(Format) ->
     Fmt = element(I, Format),
     Num = num_glyphs(Fmt),
-    Width0 = Num*S#s.glyph_width,
+    GW = glyph_width(S),
+    Width0 = Num*GW,
     Wind = if Fmt#fmt.field =:= data -> 6; %% what was this?
 	      true -> 0
 	   end,
@@ -1895,15 +2082,14 @@ lookup_layout(FID, _State={S,_D}) ->
 
 insert_layout(Layout, _State={S,D}) ->
     ets:insert(S#s.frame_layout, Layout),
-    L = min(Layout#layout.x, D#d.view_left),
-    R = max(Layout#layout.x + Layout#layout.width, D#d.view_right),
-    T = min(Layout#layout.y, D#d.view_top),
-    B = max(Layout#layout.y + Layout#layout.height, D#d.view_bottom),
-    {S, D#d { view_left=L, view_right=R, view_top=T, view_bottom=B }}.
+    L = min(Layout#layout.x, get_view_left(D)),
+    R = max(Layout#layout.x + Layout#layout.width, get_view_right(D)),
+    T = min(Layout#layout.y, get_view_top(D)),
+    B = max(Layout#layout.y + Layout#layout.height, get_view_bottom(D)),
+    {S, set_view_rect(D, L, R, T, B)}.
 
 update_layout(OldLayout, NewLayout, State={S,D}) ->
     SaveClip = clip_window_content(State),
-
     clear_layout_background(OldLayout, State),
     Layout = position_layout(NewLayout, State),
     State1 = insert_layout(Layout, State),
@@ -1911,10 +2097,11 @@ update_layout(OldLayout, NewLayout, State={S,D}) ->
 
     set_clip_rect(State2, SaveClip),
 
-    MinW = if D#d.vscroll =:= undefined ->
+    MinW = case get_vscroll(D) of
+	       undefined ->
 		   S#s.width;
-	      true ->
-		   S#s.width - ?SCROLL_BAR_SIZE
+	       _ ->
+		   S#s.width -  scroll_bar_size(S)
 	   end,
     if OldLayout#layout.x =/= Layout#layout.x;
        OldLayout#layout.y =/= Layout#layout.y;
@@ -2062,6 +2249,63 @@ flush_motion(Win) ->
     after 0 ->
 	    ok
     end.
+
+%% load #profile from environment
+load_profile(E) ->
+    D = #profile{},
+    %% Special case
+    S = ?ld(scheme, E, D),
+    #profile {
+       scheme = S,
+       screen_color    = ?ldc(S,screen_color, E, D),
+       selection_alpha = ?ld(selection_alpha, E, D),
+       selection_color = ?ldc(S,selection_color, E, D),
+       selection_border_width = ?ld(selection_border_width, E, D),
+       selection_border_color = ?ldc(S,selection_border_color, E, D),
+       menu_font_name = ?ld(menu_font_name, E, D),
+       menu_font_size = ?ld(menu_font_size, E, D),
+       menu_font_color = ?ldc(S,menu_font_color,E,D),
+       menu_background_color = ?ldc(S,menu_background_color,E,D),
+       menu_border_color = ?ldc(S,menu_border_color,E,D),
+       
+       window_font_name = ?ld(window_font_name, E, D),
+       window_font_size = ?ld(window_font_size, E, D),
+       window_font_color = ?ldc(S, window_font_color, E, D),
+       scroll_bar_color  = ?ldc(S, scroll_bar_color, E, D),
+       scroll_hndl_color = ?ldc(S, scroll_hndl_color, E, D),
+       scroll_horizontal = ?ld(scroll_horizontal, E, D),
+       scroll_vertical   = ?ld(scroll_vertical, E, D),
+       top_bar_color     = ?ldc(S, top_bar_color, E, D),
+       left_bar_color    = ?ldc(S, left_bar_color, E, D),
+       right_bar_color   = ?ldc(S, right_bar_color, E, D),
+       bottom_bar_color  = ?ldc(S, bottom_bar_color, E, D)
+      }.
+
+create_menu_profile(Profile) ->
+    #menu_profile {
+       scheme           = Profile#profile.scheme,
+       font_name        = Profile#profile.menu_font_name,
+       font_size        = Profile#profile.menu_font_size,
+       font_color       = Profile#profile.menu_font_color,
+       background_color = Profile#profile.menu_background_color,
+       border_color     = Profile#profile.menu_border_color
+      }.
+
+create_window_profile(Profile) ->
+    #window_profile {
+       scheme           = Profile#profile.scheme,
+       font_name        = Profile#profile.window_font_name,
+       font_size        = Profile#profile.window_font_size,
+       font_color       = Profile#profile.window_font_color,
+       background_color = Profile#profile.screen_color,
+       scroll_bar_color = Profile#profile.scroll_bar_color,
+       scroll_hndl_color = Profile#profile.scroll_hndl_color,
+       top_bar_color     = Profile#profile.top_bar_color,
+       left_bar_color    = Profile#profile.left_bar_color,
+       right_bar_color   = Profile#profile.right_bar_color,
+       bottom_bar_color  = Profile#profile.bottom_bar_color
+      }.
+
 
 resize_pixmap(undefined, W, H) ->
     Pixmap = next_pixmap(W,H),
