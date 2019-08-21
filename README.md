@@ -51,6 +51,7 @@ Key commands used on selected elements:
     Ctrl+S         Save information to $HOME/candy.txt
 
 Other key commands
+
     Q              Quit application
     Up             Arrow up, scroll up
     Down           Arrow down, scroll down
