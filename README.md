@@ -56,6 +56,8 @@ Other key commands
     Down           Arrow down, scroll down
     PageUp         Page up, scroll one page up
     PageDown       Page down, scroll one page down
+	Alt-Up         circulate bitrate up  (125K,250K,500K)
+	Alt-Down       circulate bitrate down (500K,250K,125K)
 
 # candy.txt format
 
