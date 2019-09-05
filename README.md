@@ -83,3 +83,10 @@ comments could be a space or a ';'.
     <frame-id1> <byte-index> <byte-mask> <match-on> <match-off> ...
     <frame-id2> <byte-index> <byte-mask> <match-on> <match-off> ...
     ...
+
+# make AppImage
+
+    erl -config candy.config -s candy -s servator make_appimage candy
+	[close candy window]
+	appimagetool
+	

@@ -1,0 +1,13 @@
+#!/usr/bin/env xdg-open
+
+[Desktop Entry]
+Version=1.0
+Type=Application
+Categories=Utility;
+Terminal=false
+Exec=AppRun
+Comment[sv_SE]=CAN bus analyser
+Name=Candy
+Comment=CAN bus analyser
+Icon=candy
+

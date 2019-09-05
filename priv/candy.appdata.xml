@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+	<id>candy</id>
+	<metadata_license>MIT</metadata_license>
+	<project_license>MIT</project_license>
+	<name>Candy</name>
+	<summary>CAN analyser</summary>
+	<description>
+		<p>Candy is used to reverse engineer can protocols. The bits that are changed flash when changed making it easy to detect which bits are use for what.
+</p>
+	</description>
+	<launchable type="desktop-id">candy.desktop</launchable>
+	<url type="homepage">http://rogvall.se/apps/candy</url>
+	<screenshots>
+		<screenshot type="default">
+			<image>http://rogvall.se/apps/candy/candy.png</image>
+		</screenshot>
+	</screenshots>
+	<provides>
+		<id>candy.desktop</id>
+	</provides>
+</component>
