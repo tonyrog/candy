@@ -7,7 +7,7 @@
 
 -module(candy_play).
 
--export([file/1, file/2]).
+-export([file/1, file/2, file/3]).
 
 -include_lib("can/include/can.hrl").
 
@@ -16,13 +16,18 @@
 file(File) ->
     file(File,0).
 
-file(File,Repeat) when is_integer(Repeat), Repeat >= -1 ->
+file(File,Repeat) ->
+    file(File,Repeat,1).
+
+file(File,Repeat,TimeScale) when is_integer(Repeat), Repeat >= -1,
+				 is_number(TimeScale), 
+				 TimeScale > 0 ->
     (catch error_logger:tty(false)),
     application:start(lager),
     can_udp:start(0, [{ttl,0}]),
     case file:open(File,[read,binary,raw]) of
 	{ok,Fd} ->
-	    try replay(Fd, Repeat, ?CAN_NO_TIMESTAMP) of
+	    try replay(Fd,Repeat,?CAN_NO_TIMESTAMP, TimeScale) of
 		Result -> Result
 	    after
 		file:close(Fd)
@@ -31,15 +36,15 @@ file(File,Repeat) when is_integer(Repeat), Repeat >= -1 ->
 	    Error
     end.
 
-replay(Fd, Repeat, LastStamp) ->
+replay(Fd, Repeat, LastStamp, TimeScale) ->
     case file:read_line(Fd) of
 	eof ->
 	    if Repeat =:= -1 ->
 		    file:position(Fd, 0),
-		    replay(Fd, -1, ?CAN_NO_TIMESTAMP);
+		    replay(Fd, -1, ?CAN_NO_TIMESTAMP, TimeScale);
 	       Repeat > 0 ->
 		    file:position(Fd, 0),
-		    replay(Fd, Repeat-1, ?CAN_NO_TIMESTAMP);
+		    replay(Fd, Repeat-1, ?CAN_NO_TIMESTAMP, TimeScale);
 	       Repeat =:= 0 ->
 		    ok
 	    end;
@@ -48,21 +53,22 @@ replay(Fd, Repeat, LastStamp) ->
 	{ok,Line} ->
 	    case decode(Line) of
 		ignore ->
-		    replay(Fd, Repeat, LastStamp);
-		{ok,TimeHw,Frame=#can_frame { ts=Stamp }} ->
-		    can:send(Frame),
-		    Wait = timediff(TimeHw,Stamp, LastStamp),
+		    replay(Fd, Repeat, LastStamp, TimeScale);
+		{ok,TimeHw,Frame=#can_frame { ts=Stamp0 }} ->
+		    can:sync_send(Frame),
+		    Stamp = trunc(Stamp0*TimeScale),
+		    Wait = timediff(TimeHw,Stamp,LastStamp),
 		    timer:sleep(Wait),
-		    replay(Fd, Repeat, Stamp);
+		    replay(Fd, Repeat, Stamp, TimeScale);
 		{error,Reason} ->
 		    io:format("error: ~p, line ~p\n", [Reason,Line]),
 		    timer:sleep(2000),
-		    replay(Fd, Repeat, -1)
+		    replay(Fd, Repeat, -1, TimeScale)
 	    end;
 	{ok,Line} ->
 	    io:format("bad line format ~p\n", [Line]),
 	    timer:sleep(2000),
-	    replay(Fd, Repeat, -1)
+	    replay(Fd, Repeat, -1, TimeScale)
     end.
 
 %% return wait time in millis seconds

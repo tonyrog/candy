@@ -243,7 +243,7 @@ init(Options) ->
     S0 = #s{},
 
     Profile = load_profile(Env),
-    MProfile = create_menu_profile(Profile),
+    _MProfile = create_menu_profile(Profile),
     WProfile = create_window_profile(Profile),
 
     {ok,Font} = epx_font:match([{name,WProfile#window_profile.font_name},
@@ -425,71 +425,75 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
-handle_info(_Frame=#can_frame{id=FID}, {S,D}) 
-  when FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
-    %% io:format("got error frame ~w\n", [Frame]),
-    Fs = lists:foldl(
-	   fun({Bit,Flag}, Acc) ->
-		   if FID band Bit =:= Bit -> [Flag|Acc];
-		      true -> Acc
-		   end
-	   end, [], [{?CAN_ERR_TX_TIMEOUT, txtimeout},
-		     {?CAN_ERR_LOSTARB,     lastarb},
-		     {?CAN_ERR_CRTL,        crtl},
-		     {?CAN_ERR_PROT,        prot},
-		     {?CAN_ERR_TRX,         trx},
-		     {?CAN_ERR_ACK,         ack},
-		     {?CAN_ERR_BUSOFF,      busoff},
-		     {?CAN_ERR_BUSERROR,    buserror},
-		     {?CAN_ERR_RESTARTED,   restarted}]),
-    %% io:format(" status = ~w\n", [Fs]),
-    State1 = redraw({S#s { if_error = Fs },D}),
+handle_info(Frame=#can_frame{}, State) ->
+    State1 = handle_can_frames([Frame], State),
     {noreply, State1};
 
-handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
-    case ets:lookup(S#s.frame, FID) of
-	[Frame] -> %% no change
-	    ets:update_counter(S#s.frame_counter, FID, 1),
-	    {noreply, State};
-	[Frame0] ->
-	    ets:insert(S#s.frame, Frame),
-	    ets:update_counter(S#s.frame_counter, FID, 1),
-	    case diff_frames(FID,Frame,Frame0,State) of
-		[] ->
-		    {noreply, tick_restart(State)};
-		Diff ->
-		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
-		    State1 = redraw(FID, State),
-		    {noreply, tick_restart(State1)}
-	    end;
-	[] ->
-	    ets:insert(S#s.frame, Frame),
-	    IDFmt = 
-		if FID band ?CAN_EFF_FLAG =/= 0 ->
-			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
-		   true ->
-			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
-		end,
-	    Format = default_format(IDFmt),
-	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
-		Pos <- lists:seq(1,tuple_size(Format))  ],
+%% handle_info(_Frame=#can_frame{id=FID}, {S,D}) 
+%%   when FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
+%%     %% io:format("got error frame ~w\n", [Frame]),
+%%     Fs = lists:foldl(
+%% 	   fun({Bit,Flag}, Acc) ->
+%% 		   if FID band Bit =:= Bit -> [Flag|Acc];
+%% 		      true -> Acc
+%% 		   end
+%% 	   end, [], [{?CAN_ERR_TX_TIMEOUT, txtimeout},
+%% 		     {?CAN_ERR_LOSTARB,     lostarb},
+%% 		     {?CAN_ERR_CRTL,        crtl},
+%% 		     {?CAN_ERR_PROT,        prot},
+%% 		     {?CAN_ERR_TRX,         trx},
+%% 		     {?CAN_ERR_ACK,         ack},
+%% 		     {?CAN_ERR_BUSOFF,      busoff},
+%% 		     {?CAN_ERR_BUSERROR,    buserror},
+%% 		     {?CAN_ERR_RESTARTED,   restarted}]),
+%%     %% io:format(" status = ~w\n", [Fs]),
+%%     State1 = redraw({S#s { if_error = Fs },D}),
+%%     {noreply, State1};
 
-	    LPos = S#s.next_pos,
-	    Layout1 = #layout { id=FID, pos=LPos, format=Format },
-	    Layout2 = position_layout(Layout1, State),
+%% handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
+%%     case ets:lookup(S#s.frame, FID) of
+%% 	[Frame] -> %% no change
+%% 	    ets:update_counter(S#s.frame_counter, FID, 1),
+%% 	    {noreply, State};
+%% 	[Frame0] ->
+%% 	    ets:insert(S#s.frame, Frame),
+%% 	    ets:update_counter(S#s.frame_counter, FID, 1),
+%% 	    case diff_frames(FID,Frame,Frame0,State) of
+%% 		[] ->
+%% 		    {noreply, tick_restart(State)};
+%% 		Diff ->
+%% 		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
+%% 		    State1 = redraw(FID, State),
+%% 		    {noreply, tick_restart(State1)}
+%% 	    end;
+%% 	[] ->
+%% 	    ets:insert(S#s.frame, Frame),
+%% 	    IDFmt = 
+%% 		if FID band ?CAN_EFF_FLAG =/= 0 ->
+%% 			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
+%% 		   true ->
+%% 			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
+%% 		end,
+%% 	    Format = default_format(IDFmt),
+%% 	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
+%% 		Pos <- lists:seq(1,tuple_size(Format))  ],
 
-	    State1 = {S#s{ next_pos = LPos+1}, D},
-	    State2 = insert_layout(Layout2, State1),
+%% 	    LPos = S#s.next_pos,
+%% 	    Layout1 = #layout { id=FID, pos=LPos, format=Format },
+%% 	    Layout2 = position_layout(Layout1, State),
 
-	    ets:insert(S#s.frame_counter, {FID, 1}),
-	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
-	    %% SaveClip = clip_window_content(State1),
-	    %% State2 = redraw_layout_(Layout2, State1),
-	    %% set_clip_rect(State2, SaveClip),
-	    %% State3 = repaint_layout(Layout2, State2, 0),
-	    State3 = redraw(State2),
-	    {noreply, tick_restart(State3)}
-    end;
+%% 	    State1 = {S#s{ next_pos = LPos+1}, D},
+%% 	    State2 = insert_layout(Layout2, State1),
+
+%% 	    ets:insert(S#s.frame_counter, {FID, 1}),
+%% 	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
+%% 	    %% SaveClip = clip_window_content(State1),
+%% 	    %% State2 = redraw_layout_(Layout2, State1),
+%% 	    %% set_clip_rect(State2, SaveClip),
+%% 	    %% State3 = repaint_layout(Layout2, State2, 0),
+%% 	    State3 = redraw(State2),
+%% 	    {noreply, tick_restart(State3)}
+%%     end;
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
     Save = clip_window_content(State),
     R = redraw_anim(State),
@@ -565,6 +569,105 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+%% batch collect all frames in one go then redraw if needed
+handle_can_frames(CanFrames, S) ->
+    receive
+	Frame = #can_frame {} ->
+	    handle_can_frames([Frame|CanFrames], S)
+    after 0 -> %% or a short time?
+	    process_can_frames(lists:reverse(CanFrames),S,
+			       false, 0, sets:new())
+    end.
+
+process_can_frames([#can_frame{id=FID}|Fs], {S,D},
+		   _Redraw, RedrawCount, RedrawSet) when
+      FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
+    Err = lists:foldl(
+	    fun({Bit,Flag}, Acc) ->
+		    if FID band Bit =:= Bit -> [Flag|Acc];
+		       true -> Acc
+		    end
+	    end, [], [{?CAN_ERR_TX_TIMEOUT, txtimeout},
+		      {?CAN_ERR_LOSTARB,     lostarb},
+		      {?CAN_ERR_CRTL,        crtl},
+		      {?CAN_ERR_PROT,        prot},
+		      {?CAN_ERR_TRX,         trx},
+		      {?CAN_ERR_ACK,         ack},
+		      {?CAN_ERR_BUSOFF,      busoff},
+		      {?CAN_ERR_BUSERROR,    buserror},
+		      {?CAN_ERR_RESTARTED,   restarted}]),
+    %% io:format(" status = ~w\n", [Fs]),
+    process_can_frames(Fs, {S#s { if_error = Err }, D},
+		       true, RedrawCount, RedrawSet);
+process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
+		   Redraw, RedrawCount, RedrawSet) ->
+    case ets:lookup(S#s.frame, FID) of
+	[Frame] -> %% no change
+	    ets:update_counter(S#s.frame_counter, FID, 1),
+	    process_can_frames(Fs, State, Redraw, RedrawCount, RedrawSet);
+	[Frame0] ->
+	    ets:insert(S#s.frame, Frame),
+	    ets:update_counter(S#s.frame_counter, FID, 1),
+	    case diff_frames(FID,Frame,Frame0,State) of
+		[] ->
+		    process_can_frames(Fs, tick_restart(State),
+				       Redraw, RedrawCount, RedrawSet);
+		Diff ->
+		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
+		    process_can_frames(Fs, tick_restart(State),
+				       Redraw,
+				       RedrawCount+1,
+				       sets:add_element(FID,RedrawSet))
+	    end;
+	[] ->
+	    ets:insert(S#s.frame, Frame),
+	    IDFmt =
+		if FID band ?CAN_EFF_FLAG =/= 0 ->
+			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
+		   true ->
+			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
+		end,
+	    Format = default_format(IDFmt),
+	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
+		Pos <- lists:seq(1,tuple_size(Format))  ],
+	    
+	    LPos = S#s.next_pos,
+	    Layout1 = #layout { id=FID, pos=LPos, format=Format },
+	    Layout2 = position_layout(Layout1, State),
+	    
+	    State1 = {S#s{ next_pos = LPos+1}, D},
+	    State2 = insert_layout(Layout2, State1),
+	    
+	    ets:insert(S#s.frame_counter, {FID, 1}),
+	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
+	    %% SaveClip = clip_window_content(State1),
+	    %% State2 = redraw_layout_(Layout2, State1),
+	    %% set_clip_rect(State2, SaveClip),
+	    %% State3 = repaint_layout(Layout2, State2, 0),
+	    process_can_frames(Fs, tick_restart(State2),
+			       true, RedrawCount+1, RedrawSet)
+    end;
+process_can_frames([], State, Redraw, _RedrawCount, RedrawSet) ->
+    if Redraw ->
+	    redraw(State);
+       true ->
+	    case sets:size(RedrawSet) of
+		0 ->
+		    State;
+		_Count ->
+		    %% display_saved(_Count, _RedrawCount),
+		    sets:fold(
+		      fun(FID, Statei) ->
+			      redraw(FID, Statei)
+		      end, State, RedrawSet)
+	    end
+    end.
+
+display_saved(Count, RedrawCount) when Count < RedrawCount ->
+    io:format("saved ~w redraws\n", [RedrawCount-Count]);
+display_saved(_Count, _RedrawCount) ->
+    ok.
+    
 
 epx_event(close, State={_S,_D}) ->
     %% io:format("Got window close\n", []),
@@ -1168,7 +1271,7 @@ default_format(IDFmt) ->
     {
      #fmt { field=hide, type=undefined },
      IDFmt,
-     #fmt { field=frequency,base=10,type={float,4,1},bits=[]},
+     #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
      #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
      #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
      #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
