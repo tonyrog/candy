@@ -3,11 +3,12 @@
 #
 APP = candy
 APPL = Candy
-VSN = $(shell git describe)
+VSN = $(shell git describe --abbrev=0)
 MACHINE = $(shell uname -m)
+CONFIG = -config $(APP).config
 
 appimage:
-	erl -epx -noshell -s candy -config candy.config -s servator make_appimage $(APP) -s erlang halt
+	erl -epx -noshell -s $(APP) $(CONFIG) -s servator make_appimage $(APP) -s erlang halt
 	strip $(APP).AppDir/bin/beam.smp
 	strip $(APP).AppDir/bin/epmd
 	strip $(APP).AppDir/bin/erlc
@@ -20,7 +21,7 @@ appimage:
 	mv $(APPL)-$(MACHINE).AppImage $(APPL)-$(VSN)-$(MACHINE).AppImage
 
 osxapp:
-	erl -epx -noshell -s $(APP) -s servator make_osxapp $(APP) -s erlang halt
+	erl -epx -noshell -s $(APP) $(CONFIG) -s servator make_osxapp $(APP) -s erlang halt
 	mkdir -p tmpdist
 	mv $(APPL).app tmpdist/
 	cd tmpdist/
