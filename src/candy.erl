@@ -958,16 +958,16 @@ command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
 		    || G <- Bs],
 		   "\n" | Acc]
 	  end, [], FIDs),
-    %% when we are executing in a appimage mount HOME is changed
-    %% to point into that area, so to write candy.txt we generate
-    %% a new path /home/$USER
-    Home = case os:getenv("USER") of
+    %% User =  os:getenv("USER"),
+    Home = case os:getenv("HOME") of
 	       false -> "/tmp";
-	       User -> filename:join("home", User)
+	       ""    -> "/tmp";
+	       H -> H
 	   end,
     file:write_file(filename:join(Home, "candy.txt"), 
 		    [Bytes,
-		     " This line and the following lines are comments\n"]),
+		     " This line and the following lines are comments\n"
+		    ]),
     State;
 command($q, _Selected, _Mod, State) ->
     erlang:halt(0),
