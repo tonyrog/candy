@@ -901,7 +901,7 @@ cell_hit(Pos, Layout, State={S,D}) ->
 %%   Shift+G        Ungroup selected bits
 %%   1-8            Split in groups of 1 to 8 bits
 %%   T              Swap groups (not implemented yet)
-%%   Ctrl+S         Save information to $HOME/candy.txt
+%%   Ctrl+S         Save information to /home/$USER/candy.txt
 %%
 %% Global commands
 %%   Q              Quit application
@@ -958,11 +958,14 @@ command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
 		    || G <- Bs],
 		   "\n" | Acc]
 	  end, [], FIDs),
-    Dir = case os:getenv("HOME") of
-    	       false -> "/tmp";
-	       Home -> Home
-	  end,
-    file:write_file(filename:join(Dir, "candy.txt"), 
+    %% when we are executing in a appimage mount HOME is changed
+    %% to point into that area, so to write candy.txt we generate
+    %% a new path /home/$USER
+    Home = case os:getenv("USER") of
+	       false -> "/tmp";
+	       User -> filename:join("home", User)
+	   end,
+    file:write_file(filename:join(Home, "candy.txt"), 
 		    [Bytes,
 		     " This line and the following lines are comments\n"]),
     State;

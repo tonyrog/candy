@@ -88,5 +88,6 @@ comments could be a space or a ';'.
 
     erl -config candy.config -s candy -s servator make_appimage candy
 	[close candy window]
+	strip candy.AppDir/bin/*
 	appimagetool -n candy.AppDir
 	
