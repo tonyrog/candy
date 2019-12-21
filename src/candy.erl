@@ -878,9 +878,16 @@ cell_hit(Pos, Layout, State={S,D}) ->
 	    Layout1 = Layout#layout { style = normal },
 	    update_layout(Layout, Layout1, State);
 
-	{I, _Fmt} when (D#d.keymod)#keymod.shift ->  %% add to selection
+	{I, _Fmt} when (D#d.keymod)#keymod.shift ->  
+	    %% add to or remove from selection
 	    FID = Layout#layout.id,
-	    Selected = lists:usort([{FID,I}|D#d.selected]),
+	    Selected = 
+		case lists:member({FID,I}, D#d.selected) of
+		    true -> 
+			lists:delete({FID,I},D#d.selected);
+		    false ->
+			[{FID,I} | D#d.selected]
+		end,
 	    D1 = D#d { selected = Selected },
 	    State1 =  {S,D1},
 	    redraw(FID, State1);
@@ -899,6 +906,8 @@ cell_hit(Pos, Layout, State={S,D}) ->
 %%   --
 %%   G              Group selected bits
 %%   Shift+G        Ungroup selected bits
+%%   H              Sort Low -> High frames by frame id
+%%   Ctrl+H         Sort High -> Low frames by frame id
 %%   1-8            Split in groups of 1 to 8 bits
 %%   T              Swap groups (not implemented yet)
 %%   Ctrl+S         Save information to /home/$USER/candy.txt
@@ -921,7 +930,6 @@ command($b, Selected, _Mod, State) ->
 command($G, Selected, Mod, State) when Mod#keymod.shift ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
-
 command($g, Selected, _Mod, _State = {S,D}) ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     %% select min pos foreach FID and keep as selected
@@ -933,6 +941,31 @@ command($g, Selected, _Mod, _State = {S,D}) ->
 		  end, [], Fs),
     State1 = {S, D#d { selected = Selected1 }},
     foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
+command($h, _Selected, Mod, State) ->
+    %% sort all fields by frame id
+    FIDs0 = fold_layout(fun(Li, Acc, _Si) ->
+				case Li#layout.style of
+				    deleted -> Acc;
+				    hidden -> Acc;
+				    collapsed -> Acc;
+				    _ -> [Li#layout.id|Acc]
+				end
+			end, [], State),
+    FIDs1 = if Mod#keymod.ctrl ->
+		    lists:reverse(lists:sort(FIDs0));
+	       true ->
+		    lists:sort(FIDs0)
+	    end,
+    FIDsPos = maps:from_list(lists:zip(FIDs1, lists:seq(1,length(FIDs0)))),
+    State1 =
+	each_layout(
+	  fun(L1, Si) ->
+		  Pos = maps:get(L1#layout.id, FIDsPos),
+		  L2 = L1#layout { pos = Pos },
+		  L3 = position_normal(L2, Si),
+		  insert_layout(L3, Si)
+	  end, State),
+    redraw(State1);
 
 command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
     FIDs = lists:usort([FID || {FID,_} <- Selected]),
@@ -1090,7 +1123,7 @@ scroll_right(_State={S,D}) ->
     RightOffset = right_offset(S),
     W = case get_vscroll(D) of
 	    undefined -> S#s.width;
-	    true ->  S#s.width - scroll_bar_size(S)
+	    _ ->  S#s.width - scroll_bar_size(S)
 	end,
     R = max(0, (get_view_right(D) - RightOffset) - W),
     X = min(get_view_xpos(D) + scroll_xstep(S), R),
