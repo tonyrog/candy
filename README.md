@@ -47,6 +47,8 @@ Key commands used on selected elements:
     ---
     G              Group selected bits
     Shift+G        Ungroup selected bits
+    H              Sort Low -> High frames by frame id
+    Ctrl+H         Sort High -> Low frames by frame id	
     1-8            Split in groups of 1 to 8 bits
     Ctrl+S         Save information to $HOME/candy.txt
 
