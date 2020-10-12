@@ -19,6 +19,7 @@ Unary 300 '!'.
 
 file -> statement newline : ['$1'].
 file -> statement newline file : ['$1'|'$3'].
+file -> newline file : '$2'.
 
 statement -> hex int int int int : {can,'$1','$2','$3','$4'}.
 statement -> declaration : '$1'.
