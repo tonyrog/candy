@@ -7,6 +7,16 @@ VSN = $(shell git describe --abbrev=0)
 MACHINE = $(shell uname -m)
 CONFIG = -config $(APP).config
 
+all:
+	@if [ -d "src" -a -f "src/Makefile" ]; then (cd src && $(MAKE) all); fi
+	@if [ -d "c_src" -a -f "c_src/Makefile" ]; then (cd c_src && $(MAKE) all); fi
+	@if [ -d "test" -a -f "test/Makefile" ]; then (cd test && $(MAKE) all); fi
+
+clean:
+	@if [ -d "src" -a -f "src/Makefile" ]; then (cd src && $(MAKE) clean); fi
+	@if [ -d "c_src" -a -f "c_src/Makefile" ]; then (cd c_src && $(MAKE) clean); fi
+	@if [ -d "test" -a -f "test/Makefile" ]; then (cd test && $(MAKE) clean); fi
+
 appimage:
 	erl -epx -noshell -s $(APP) $(CONFIG) -s servator make_appimage $(APP) -s erlang halt
 	strip $(APP).AppDir/bin/beam.smp

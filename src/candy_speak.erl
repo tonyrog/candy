@@ -7,19 +7,29 @@
 
 -module(candy_speak).
 
+-export([file/1, file/2]).
+-export([string/1, string/2]).
 -export([tokens/1]).
--export([parse/1, parse/2]).
 
+file(Filename) ->
+    file(Filename, #{}).
+file(Filename, Opts) ->
+    case file:read_file(Filename) of
+	{ok,Binary} ->
+	    string(Filename, Binary, Opts);
+	Error ->
+	    Error
+    end.
 
-parse(String) ->
-    parse("*internal*", String).
+string(String) ->
+    string("*internal*", String).
 
-parse(File, String) ->
-    parse(File, String, #{}).
+string(File, String) ->
+    string(File, String, #{}).
 
-parse(File, Binary, Opts) when is_binary(Binary) ->
-    parse(File, binary_to_list(Binary), Opts);    
-parse(File, String, _Opts) ->
+string(File, Binary, Opts) when is_binary(Binary) ->
+    string(File, binary_to_list(Binary), Opts);    
+string(File, String, _Opts) when is_list(String) ->
     case tokens(String) of
 	{ok,Ts} ->
 	    case candy_speak_gram:parse(Ts) of
@@ -38,7 +48,6 @@ parse(File, String, _Opts) ->
 	    io:format("~s: Error: ~p\n", [File,Error]),
 	    Error
     end.
-
 
 tokens(String) ->
     case candy_speak_lex:string(remove_comments(String)) of

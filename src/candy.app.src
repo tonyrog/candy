@@ -1,6 +1,7 @@
 {application, candy,
  [{description, "CAN frame viewer"},
   {vsn, git},
+  {modules, ["@@MODULES@@"]},
   {registered, []},
   {env, []},
   {applications,[kernel,stdlib,can,epx]}

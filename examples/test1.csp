@@ -1,0 +1,10 @@
+#digital OUT1 1:1
+#digital OUT2 1:2
+#digital OUT3 1:3
+
+0x218 2 0x40 0x40 0x00
+
+OUT1 < 0x218[1,0]
+OUT2 < 0x218[8]
+!OUT2 < 0x218[9]
+OUT3 = 0x218[8]

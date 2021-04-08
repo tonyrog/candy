@@ -58,10 +58,22 @@
 	epx_profile:color_number(Scheme, ?ld(Key,Env,Default))).
 
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
--define(HIGHLIGHT_COLOR,         {255,0,0}).       %% red hight light
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
 -define(TEXT_HIGHLIGHT_COLOR,    {0,255,255,255}). %% white hight light
+-define(HIGHLIGHT_COLOR1,   {215,48,39}).
+-define(HIGHLIGHT_COLOR2,  {240,101,14}).
+-define(HIGHLIGHT_COLOR3,  {176,122,78}).
+-define(HIGHLIGHT_COLOR4,  {234,234,20}).
+-define(HIGHLIGHT_COLOR5,  {94,191,63}).
+-define(HIGHLIGHT_COLOR6,  {42,212,57}).
+-define(HIGHLIGHT_COLOR7,  {37,217,164}).
+-define(HIGHLIGHT_COLOR8,  {50,167,204}).
+-define(HIGHLIGHT_COLOR9,  {47,153,207}).
+-define(HIGHLIGHT_COLOR10, {70,119,184}).
+-define(HIGHLIGHT_COLOR11, {130,82,172}).
+-define(HIGHLIGHT_COLOR12, {221,33,140}).
+-define(HIGHLIGHT_COLOR13, {205,49,86}).
 
 %% color profile with default values
 -record(profile,
@@ -106,6 +118,7 @@
 	 field = none :: none | id | len | data | frequency | hide,
 	 base = 16 :: 0 | 2 | 8 | 16 | 10,
 	 signed = false :: boolean(),
+	 ci = 1 :: 1..13,               %% color index in cell_color(I)
 	 bits = [] :: [{Pos::non_neg_integer(),Length::non_neg_integer()}]
 	}).
 
@@ -115,7 +128,7 @@
 	 background  = ?LAYOUT_BACKGROUND_COLOR,
 	 foreground  = ?TEXT_COLOR,               %% text color
 	 border      = ?FRAME_BORDER_COLOR,       %% frame border color
-	 background1  = ?HIGHLIGHT_COLOR,
+	 background1  = ?HIGHLIGHT_COLOR1,
 	 foreground1  = ?TEXT_HIGHLIGHT_COLOR
 	}).
 
@@ -365,10 +378,11 @@ load_pid(FID, Name, FormList, _State={S,D}) ->
 	  [
 	   #fmt { field=label,base=0,type={string,NameBits},bits=[]},
 	   #fmt { field=id,base=16,type=unsigned,bits=[{21,11}]},
-	   #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
-	   #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
-	   #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
-	   #fmt { field=len,base=16,type=unsigned,bits=[{0,4}]} |
+	   #fmt { field=id,base=0,type={enum,{"-","F"}},bits=[{0,1}]},
+	   #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{1,1}]},
+	   #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{2,1}]},
+	   #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{3,1}]},
+	   #fmt { field=len,base=16,type=unsigned,bits=[{2,4}]} |
 	   FormList ]),
     L0 = #layout {
 	    id = FID,
@@ -431,71 +445,6 @@ handle_info(Frame=#can_frame{}, State) ->
     State1 = handle_can_frames([Frame], State),
     {noreply, State1};
 
-%% handle_info(_Frame=#can_frame{id=FID}, {S,D}) 
-%%   when FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
-%%     %% io:format("got error frame ~w\n", [Frame]),
-%%     Fs = lists:foldl(
-%% 	   fun({Bit,Flag}, Acc) ->
-%% 		   if FID band Bit =:= Bit -> [Flag|Acc];
-%% 		      true -> Acc
-%% 		   end
-%% 	   end, [], [{?CAN_ERR_TX_TIMEOUT, txtimeout},
-%% 		     {?CAN_ERR_LOSTARB,     lostarb},
-%% 		     {?CAN_ERR_CRTL,        crtl},
-%% 		     {?CAN_ERR_PROT,        prot},
-%% 		     {?CAN_ERR_TRX,         trx},
-%% 		     {?CAN_ERR_ACK,         ack},
-%% 		     {?CAN_ERR_BUSOFF,      busoff},
-%% 		     {?CAN_ERR_BUSERROR,    buserror},
-%% 		     {?CAN_ERR_RESTARTED,   restarted}]),
-%%     %% io:format(" status = ~w\n", [Fs]),
-%%     State1 = redraw({S#s { if_error = Fs },D}),
-%%     {noreply, State1};
-
-%% handle_info(Frame=#can_frame{id=FID}, State={S,D}) ->
-%%     case ets:lookup(S#s.frame, FID) of
-%% 	[Frame] -> %% no change
-%% 	    ets:update_counter(S#s.frame_counter, FID, 1),
-%% 	    {noreply, State};
-%% 	[Frame0] ->
-%% 	    ets:insert(S#s.frame, Frame),
-%% 	    ets:update_counter(S#s.frame_counter, FID, 1),
-%% 	    case diff_frames(FID,Frame,Frame0,State) of
-%% 		[] ->
-%% 		    {noreply, tick_restart(State)};
-%% 		Diff ->
-%% 		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
-%% 		    State1 = redraw(FID, State),
-%% 		    {noreply, tick_restart(State1)}
-%% 	    end;
-%% 	[] ->
-%% 	    ets:insert(S#s.frame, Frame),
-%% 	    IDFmt = 
-%% 		if FID band ?CAN_EFF_FLAG =/= 0 ->
-%% 			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
-%% 		   true ->
-%% 			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
-%% 		end,
-%% 	    Format = default_format(IDFmt),
-%% 	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
-%% 		Pos <- lists:seq(1,tuple_size(Format))  ],
-
-%% 	    LPos = S#s.next_pos,
-%% 	    Layout1 = #layout { id=FID, pos=LPos, format=Format },
-%% 	    Layout2 = position_layout(Layout1, State),
-
-%% 	    State1 = {S#s{ next_pos = LPos+1}, D},
-%% 	    State2 = insert_layout(Layout2, State1),
-
-%% 	    ets:insert(S#s.frame_counter, {FID, 1}),
-%% 	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
-%% 	    %% SaveClip = clip_window_content(State1),
-%% 	    %% State2 = redraw_layout_(Layout2, State1),
-%% 	    %% set_clip_rect(State2, SaveClip),
-%% 	    %% State3 = repaint_layout(Layout2, State2, 0),
-%% 	    State3 = redraw(State2),
-%% 	    {noreply, tick_restart(State3)}
-%%     end;
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
     Save = clip_window_content(State),
     R = redraw_anim(State),
@@ -527,7 +476,7 @@ handle_info({if_state_event, {ID,_IfEnt}, IfState}, State={S,D}) ->
 			 {ok,{IfID,IfPid}} ->
 			     redraw({S#s { if_state = up, if_id=IfID, 
 					   if_pid=IfPid }, D});
-			 error ->
+			 {error,_} ->
 			     {S#s { if_state = up, if_id=ID, 
 				    if_pid=undefined }, D}
 		     end;
@@ -625,11 +574,16 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
 	    ets:insert(S#s.frame, Frame),
 	    IDFmt =
 		if FID band ?CAN_EFF_FLAG =/= 0 ->
-			#fmt {field=id,base=16,type=unsigned,bits=[{3,29}]};
+			#fmt {field=id,base=16,type=unsigned,bits=[{4,29}]};
 		   true ->
-			#fmt {field=id,base=16,type=unsigned,bits=[{21,11}]}
+			#fmt {field=id,base=16,type=unsigned,bits=[{22,11}]}
 		end,
-	    Format = default_format(IDFmt),
+	    Format =
+		if FID band ?CAN_FD_FLAG =/= 0 ->
+			default_fd_format(IDFmt);
+		   true ->
+			default_format(IDFmt)
+		end,
 	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
 		Pos <- lists:seq(1,tuple_size(Format))  ],
 	    
@@ -642,10 +596,6 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
 	    
 	    ets:insert(S#s.frame_counter, {FID, 1}),
 	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
-	    %% SaveClip = clip_window_content(State1),
-	    %% State2 = redraw_layout_(Layout2, State1),
-	    %% set_clip_rect(State2, SaveClip),
-	    %% State3 = repaint_layout(Layout2, State2, 0),
 	    process_can_frames(Fs, tick_restart(State2),
 			       true, RedrawCount+1, RedrawSet)
     end;
@@ -868,9 +818,6 @@ cell_hit(Xy, Layout, State={S,D}) ->
 	    State2 = insert_layout(Layout1, State1),
 	    {Vx,Vy,Vw,Vh} = view_rect(State2),
 	    {S2,D2} = State2,
-%%	    D3 = D2#d { view_left = Vx, view_top = Vy,
-%%			view_right = Vx+Vw-1,
-%%			view_bottom = Vy+Vh-1 },
 	    D3 = set_view_rect(D2, Vx, Vx+Vw-1, Vy, Vy+Vh-1),
 	    State3 = {S2,D3},
 	    redraw(State3);
@@ -905,6 +852,7 @@ cell_hit(Xy, Layout, State={S,D}) ->
 %%   D              Decimal format
 %%   B              Binary format
 %%   O              Octal format
+%%   C              Color format
 %%   --
 %%   G              Group selected bits
 %%   Shift+G        Ungroup selected bits
@@ -929,6 +877,8 @@ command($o, Selected, _Mod, State) ->
     set_base(Selected, 8, State);
 command($b, Selected, _Mod, State) ->
     set_base(Selected, 2, State);
+command($c, Selected, _Mod, State) ->
+    set_base(Selected, c, State);
 command($G, Selected, Mod, State) when Mod#keymod.shift ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
@@ -1321,10 +1271,11 @@ default_format(IDFmt) ->
      #fmt { field=hide, type=undefined },
      IDFmt,
      #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
-     #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{0,1}]},
-     #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{1,1}]},
-     #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{2,1}]},
-     #fmt { field=len,base=16,type=unsigned,bits=[{0,4}]},
+     #fmt { field=id,base=0,type={enum,{"-","F"}},bits=[{0,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{1,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{2,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{3,1}]},
+     #fmt { field=len,base=16,type=unsigned,bits=[{2,4}]},
      #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
      #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
      #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
@@ -1335,12 +1286,44 @@ default_format(IDFmt) ->
      #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
     }.
 
-bits_int8(Pos)  -> [{Pos,8}].
-bits_int16(Pos) -> [{Pos,16}].
-bits_int32(Pos) -> [{Pos,32}].
+default_fd_format(IDFmt) ->
+    {
+     #fmt { field=hide, type=undefined },
+     IDFmt,
+     #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
+     #fmt { field=id,base=0,type={enum,{"-","F"}},bits=[{0,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{1,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{2,1}]},
+     #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{3,1}]},
+     #fmt { field=len,base=16,type=unsigned,bits=[{0,7}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]},
+     %% FD data
+     #fmt { field=data, base=c, type=unsigned, bits=[{64,32}], ci=2},
+     #fmt { field=data, base=c, type=unsigned, bits=[{96,32}], ci=3},
+     #fmt { field=data, base=c, type=unsigned, bits=[{128,32}], ci=4},
+     #fmt { field=data, base=c, type=unsigned, bits=[{160,32}], ci=5},
+     #fmt { field=data, base=c, type=unsigned, bits=[{192,32}], ci=6},
+     #fmt { field=data, base=c, type=unsigned, bits=[{224,32}], ci=7},
 
-bits_int16_LE(Pos) -> [{Pos+8,8},{Pos,8}].
-bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
+     #fmt { field=data, base=c, type=unsigned, bits=[{256,64}], ci=8},
+     #fmt { field=data, base=c, type=unsigned, bits=[{320,64}], ci=9},
+     #fmt { field=data, base=c, type=unsigned, bits=[{384,64}], ci=10},
+     #fmt { field=data, base=c, type=unsigned, bits=[{448,64}], ci=11}
+    }.
+
+%% bits_int8(Pos)  -> [{Pos,8}].
+%% bits_int16(Pos) -> [{Pos,16}].
+%% bits_int32(Pos) -> [{Pos,32}].
+
+%% bits_int16_LE(Pos) -> [{Pos+8,8},{Pos,8}].
+%% bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
 
 diff_frames(FID, New, Old, State) ->
     #layout{format=Format} = Layout = lookup_layout(FID, State),
@@ -1623,8 +1606,8 @@ redraw_cells(_Lx,_Ly,_FID,_Pos,_Color,_FmtTuple,_Frame,State) ->
     State.
 
 redraw_pos(FID,Pos,Frame,State) ->
-    #layout{ x=Lx, y=Ly, color=Color, format=FmtTuple} = Layout = 
-	lookup_layout(FID, State),
+    Layout = lookup_layout(FID, State),
+    #layout{ x=Lx, y=Ly, color=Color, format=FmtTuple} = Layout,
     case Layout#layout.style of
 	collapsed ->
 	    redraw_pos(Lx,Ly,FID,?ID_FMT_POSITION,Color,FmtTuple,Frame,State);
@@ -1642,8 +1625,9 @@ redraw_pos(Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) ->
 	    redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State)
     end.
 
-redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State={S,D}) ->
-    #fmt {dx=Dx,dy=Dy,width=W,height=H} = Fmt,
+redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
+    #fmt {dx=Dx,dy=Dy,width=W,height=H,ci=Ci} = Fmt,
+    Color = cell_color(Ci),
     X0 = Lx+Dx, Y0 = Ly+Dy,
     {X,Y} = get_rview_pos(D, X0, Y0),
     Anim = get_anim(FID,Pos,State),
@@ -1685,6 +1669,8 @@ redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 					  X+1,Y+1,6,7,argb,dec_icon(),blend),
 		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
 		0  ->
+		    false;
+		c ->
 		    false
 	    end;
        true ->
@@ -1731,6 +1717,31 @@ redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State={S,D}) ->
 	    epx:draw_string(S#s.pixels, X+Offs, Ya, String)
     end,
     Remove.
+
+-define(COLOR(H),
+	       #color {
+		  background  = ?LAYOUT_BACKGROUND_COLOR,
+		  foreground  = ?TEXT_COLOR,               %% text color
+		  border      = ?FRAME_BORDER_COLOR,       %% frame border color
+		  background1  = H,
+		  foreground1  = ?TEXT_HIGHLIGHT_COLOR
+		 }).
+
+cell_color(I) ->
+    element(I, 
+	    { ?COLOR(?HIGHLIGHT_COLOR1),
+	      ?COLOR(?HIGHLIGHT_COLOR2),
+	      ?COLOR(?HIGHLIGHT_COLOR3),
+	      ?COLOR(?HIGHLIGHT_COLOR4),
+	      ?COLOR(?HIGHLIGHT_COLOR5),
+	      ?COLOR(?HIGHLIGHT_COLOR6),
+	      ?COLOR(?HIGHLIGHT_COLOR7),
+	      ?COLOR(?HIGHLIGHT_COLOR8),
+	      ?COLOR(?HIGHLIGHT_COLOR9),
+	      ?COLOR(?HIGHLIGHT_COLOR10),
+	      ?COLOR(?HIGHLIGHT_COLOR11),
+	      ?COLOR(?HIGHLIGHT_COLOR12),
+	      ?COLOR(?HIGHLIGHT_COLOR13)  }).
 
 %% "delete" the layout by drawing layout background color
 draw_layout_background(Layout, State) ->
@@ -2033,8 +2044,8 @@ get_bits(#fmt { field=hide }, _Frame) ->
 get_bits(Fmt, Frame) ->
     Data = case Fmt#fmt.field of
 	       data -> extend_bits(Frame#can_frame.data, 64);
-	       id   -> <<(Frame#can_frame.id):32>>;
-	       len  -> <<(Frame#can_frame.len):4>>
+	       id   -> <<(Frame#can_frame.id):33>>;  %% 33 bits!!! FD support
+	       len  -> <<(Frame#can_frame.len):7>>
 	   end,
     collect_bits(Fmt#fmt.bits, Data).
 
@@ -2198,6 +2209,9 @@ fmt_bits({string,_String},_Base,BitsData) ->
     binary_to_list(BitsData).
 
 
+fmt_num(c, Size, _Number) ->
+    N = max(1, (Size+15) div 16),
+    lists:duplicate(N, $\s);
 fmt_num(Base, Size, Number) ->
     tl(integer_to_list(hi_digit(Base, Size) + Number, Base)).
 
@@ -2212,12 +2226,17 @@ hi_digit(16, Size) ->
     pow(16, N);
 hi_digit(10, Size) ->
     N = number_of_digits(10, Size),
-    pow(10, N).
+    pow(10, N);
+hi_digit(c, Size) ->
+    N = max(1, (Size+15) div 16),
+    pow(8, N).
 
 number_of_digits(2,  Size) -> Size;
 number_of_digits(8,  Size) -> ((Size+2) div 3);
 number_of_digits(16, Size) -> ((Size+3) div 4);
-number_of_digits(10, Size) -> trunc(math:log10((1 bsl Size)-1)) + 1.
+number_of_digits(10, Size) -> trunc(math:log10((1 bsl Size)-1)) + 1;
+number_of_digits(c,  Size) -> max(1, (Size+15) div 16).
+    
 
 pow(A, B) when is_integer(A),is_integer(B), B >= 0 ->
     if A =:= 0 -> 0;
@@ -2246,12 +2265,20 @@ pow_(A, B, Prod)  ->
 %% [{24,8},{16,8},{8,8},{0,8}]
 %% 
 collect_bits([{P,L}|Ps], Data) when is_bitstring(Data) ->
-    <<_:P, Bits:L/bitstring, _/bitstring>> = Data,
-    collect_bits_(Ps, Data, Bits).
+    case Data of
+	<<_:P, Bits:L/bitstring, _/bitstring>> ->
+	    collect_bits_(Ps, Data, Bits);
+	_ ->
+	    collect_bits_(Ps, Data, <<0:L>>)
+    end.
 
 collect_bits_([{P,L}|Ps], Data, Acc) ->
-    <<_:P, Bits:L/bitstring, _/bitstring>> = Data,
-    collect_bits_(Ps, Data, <<Acc/bitstring, Bits/bitstring>>);
+    case Data of
+	<<_:P, Bits:L/bitstring, _/bitstring>> ->
+	    collect_bits_(Ps, Data, <<Acc/bitstring, Bits/bitstring>>);
+	_ ->
+	    collect_bits_(Ps, Data, <<Acc/bitstring, 0:L>>)
+    end;
 collect_bits_([], _Data, Acc) ->
     Acc.
 
@@ -2523,7 +2550,7 @@ get_can_usb_if() ->
 
 %% fixme export can_if from can_router!?
 get_can_usb_if_([{can_if,IfPid,IfID,_Name,_Mon,
-		  _Param={can_usb,_IfName,_Num,_DevName},
+		  _Param=#{mod:=can_usb},
 		  _Atime,_State} | _IFs]) ->
     {ok,{IfID,IfPid}};
 get_can_usb_if_([_|IFs]) ->
