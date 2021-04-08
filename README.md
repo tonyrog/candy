@@ -44,6 +44,7 @@ Key commands used on selected elements:
     D              Decimal format
     B              Binary format
     O              Octal format
+	C              Color format	
     ---
     G              Group selected bits
     Shift+G        Ungroup selected bits
