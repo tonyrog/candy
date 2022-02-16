@@ -22,26 +22,40 @@
 %%% Created : 22 Nov 2014 by Tony Rogvall <tony@rogvall.se>
 %%%-------------------------------------------------------------------
 -module(candy).
-
--behaviour(gen_server).
+-behaviour(epxw).
 
 %% API
 -export([start/0, start/1]).
 -export([status/0]).
 -export([start_link/0, start_link/1]).
 
+-export([init/1,
+	 configure/2,
+	 key_press/2,
+	 key_release/2,
+	 button_press/2,
+	 button_release/2,
+	 enter/2,
+	 leave/2,
+	 focus_in/2,
+	 focus_out/2,
+	 close/1,
+	 draw/3,
+	 command/3,
+	 select/2,
+	 motion/2,
+	 menu/2
+	]).
+
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+-export([handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
--import(lists, [foldl/3]).
 
 -include_lib("can/include/can.hrl").
 -include_lib("epx/include/epx_menu.hrl").
 -include_lib("epx/include/epx_window_content.hrl").
 
-%% -type unsigned() :: non_neg_integer().
-
--compile(export_all).
+%% -compile(export_all).
 
 -ifdef(OTP_RELEASE). %% this implies 21 or higher
 -define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
@@ -56,6 +70,19 @@
 
 -define(ldc(Scheme, Key, Env, Default),
 	epx_profile:color_number(Scheme, ?ld(Key,Env,Default))).
+
+%% profile with default values
+-record(profile,
+	{
+	 scheme                        = logo, %% xterm,
+	 %% menu_info
+	 menu_font_name                = "Arial",
+	 menu_font_size                = 14,
+	 menu_font_color               = grey5,   %% light
+	 menu_background_color         = grey10,  %% dark
+	 menu_border_color             = green
+	}).
+
 
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
@@ -75,36 +102,11 @@
 -define(HIGHLIGHT_COLOR12, {221,33,140}).
 -define(HIGHLIGHT_COLOR13, {205,49,86}).
 
-%% color profile with default values
--record(profile,
-	{
-	 scheme                        = logo, %% xterm,
-	 screen_color                  = grey2,
-	 selection_alpha               = 100,
-	 selection_color               = grey,
-	 selection_border_width        = 1,
-	 selection_border_color        = grey10,
+-define(FONT_NAME, "Courier New").
+-define(FONT_SIZE, 14).
 
-	 %% menu_info
-	 menu_font_name                = "Arial",
-	 menu_font_size                = 14,
-	 menu_font_color               = grey5,   %% light
-	 menu_background_color         = grey10,  %% dark
-	 menu_border_color             = green,
-
-	 %% window_profile
-	 window_font_name              = "Courier New",
-	 window_font_size              = 14,
-	 window_font_color             = grey10,
-	 scroll_bar_color              = grey5,
-	 scroll_hndl_color             = grey6,
-	 scroll_horizontal             = right,
-	 scroll_vertical               = bottom,
-	 top_bar_color                 = red,
-	 left_bar_color                = green,
-	 right_bar_color               = blue,
-	 bottom_bar_color              = red6
-	}).
+-define(verbose(F,A), ok).
+%% -define(verbose(F,A), io:format((F),(A))).
 
 -record(fmt,
 	{
@@ -149,30 +151,47 @@
 
 -define(ID_FMT_POSITION, 2).
 
+-define(DEFAULT_BITRATES, [1000000, 500000, 250000, 125000]).
+-define(DEFAULT_DATARATES, [5000000,4000000,3000000,2000000,
+			    1000000,500000,250000,125000]).
+
+-define(WIDTH, 640).
+-define(HEIGHT, 480).
+
+-record(if_can,
+	{
+	 if_mod :: atom(),
+	 if_pid :: pid(),
+	 if_id  :: integer()
+	}).
+
 %% kind of constant elements
 -record(s,
 	{
-	 width  :: integer(),
-	 height :: integer(),
-	 winfo :: #window_info{},
-	 bit_rate = error,
-	 bit_rates = [125000, 250000, 500000],
+	 fd = undefined,                  %% fd mode
+	 listen_only = undefined,         %% listen only mode
+	 bitrate = undefined,
+	 bitrates = list_to_tuple(?DEFAULT_BITRATES),
+	 datarate = undefined,
+	 datarates =  list_to_tuple(?DEFAULT_DATARATES),
+	 
 	 if_state  = down,            %% up | down
 	 if_error  = [],              %% interface error code list
-	 if_id     = 0,               %% interface number of can_usb 
-	 if_pid    = 0,               %% interface process of can_usb 
+	 if_can :: #if_can{},
 	 nrows = 30 :: integer(),     %% number or rows shown
-	 window :: epx:epx_window(),  %% attached window
 	 font   :: epx:epx_font(),
-	 %% foreground_pixels :: epx:epx_pixmap(),
-	 pixels :: epx:epx_pixmap(),
+	 %%
+	 glyph_width,
+	 glyph_height,
+	 glyph_ascent,
+	 %%
 	 frame,          %% ets: #can_frame{}
 	 frame_layout,   %% ets: #layout{}
 	 frame_counter,  %% ets: ID -> Counter
 	 frame_freq,     %% ets: {ID,Time,OldCounter}
 	 frame_anim,     %% ets: {ID,FmtPos} -> Counter
-
 	 %% background_color :: epx:epx_color(),
+	 menu_profile,
 	 row_width     = 0,
 	 row_height    = 0,
 	 row_pad = 3,
@@ -184,18 +203,11 @@
 -record(d,
 	{
 	 tick :: undefined | reference(),
-	 selected = [],
-	 %% #keymod?
-	 keymod = #keymod{} :: #keymod{}, %% key modifiers
-	 %% window_content
+	 selection,                 %% current selection rect
+	 selected = [],             %% selected frames [{FID,Pos}]
 	 content :: #window_content{}
 	}).
 
-%%
-%% gen server state is divided in a "static" part
-%% and one dynamic part
-%%  {#s{}, #d{}}
-%%
 
 status() ->
     io:format("candy is running\n").
@@ -209,7 +221,10 @@ start(Options) ->
     (catch error_logger:tty(false)),
     low_latency(),
     application:ensure_all_started(?MODULE),
-    gen_server:start(?MODULE, Options, []).
+    start_it(Options, start).
+
+
+%%    gen_server:start(?MODULE, Options, []).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -224,7 +239,28 @@ start_link(Options) ->
     (catch error_logger:tty(false)),
     low_latency(),
     application:ensure_all_started(?MODULE),
-    gen_server:start_link(?MODULE, Options, []).
+    start_it(Options, start_link).
+
+start_it(Options, Start) ->
+    epxw:Start(?MODULE,
+	       Options,
+	       [{title, "Candy"},
+		{scroll_horizontal, bottom},  %% none|top|bottom
+		{scroll_vertical,   right},   %% none|left|right
+		{scroll_bar_color,  cyan},
+		{scroll_hndl_color, blue},
+		{scroll_bar_size,   14},
+		{scroll_hndl_size,  10},
+		{left_bar, 0},
+		{right_bar, 0},
+		{top_bar, 20},
+		{width,  ?WIDTH},
+		{height, ?HEIGHT},
+		{view_width,?WIDTH},
+		{view_height,?HEIGHT-(20+18)}]).
+    
+
+%%    gen_server:start_link(?MODULE, Options, []).
 
     %% make sure CANUSB is on full speed (+ other FTDI serial devices)
 low_latency() ->
@@ -256,89 +292,365 @@ init(Options) ->
     can_router:error_reception(on),
     can_router:if_state_supervision(on),
     S0 = #s{},
-
-    Profile = load_profile(Env),
-    _MProfile = create_menu_profile(Profile),
-    WProfile = create_window_profile(Profile),
-
-    {ok,Font} = epx_font:match([{name,WProfile#window_profile.font_name},
-				{size,WProfile#window_profile.font_size}]),
+    {ok,Font} = epx_font:match([{name,?FONT_NAME},{size,?FONT_SIZE}]),
     epx_gc:set_font(Font),
     {W,H}  = epx_font:dimension(Font,"0"),
 
-    WInfo = #window_info {
-	       glyph_width  = W,
-	       glyph_height = H,
-	       glyph_ascent = epx:font_info(Font, ascent),
-	       glyph_descent = epx:font_info(Font, descent),
-	       bottom_bar = 18 %% candy use a bottom status bar
-	       %% use default for rest options
-	      },
-    
+    Profile = #profile{},
+    MProfile = create_menu_profile(Profile),
+
+
+    Window = epxw:window(),
+    epx:window_enable_events(Window, no_auto_repeat),
+
     RowHeight = H + 2,
     NRows = S0#s.nrows + 2,  %% 2 collapsed frame rows
-    Height = WInfo#window_info.top_offset+NRows*(RowHeight+S0#s.row_pad)
-	- S0#s.row_pad + WInfo#window_info.bottom_offset,
+    _Height = NRows*(RowHeight+S0#s.row_pad) - S0#s.row_pad,
     %% FORMAT= ID X|R|E L 01 23 45 67 01 23 45 67
     %% maximum width = 
     %%   ID: 3FF (11-bit) | 1FFFFFFF (29-bit)
     %% Data: 64 bit : 8*8 (16 char) | 64*1 (64 char) | X|R
     %% Given 8 byte groups in base 2
-    Width = WInfo#window_info.left_offset + 
-	1*(8*W+4+2) + 3*(1*W+4+2) + 1*(1*W+4+2) + 8*(6+8*W+4+2) - 2 +
-	WInfo#window_info.right_offset,
-    Window = epx:window_create(40, 40, Width, Height,
-			       [button_press,button_release,
-				key_press, key_release, configure]),
-    Bg = epx:pixmap_create(Width, Height, argb),
-    BgColor = epx_profile:color(WProfile#window_profile.scheme,
-				WProfile#window_profile.background_color),
-    epx:pixmap_fill(Bg, BgColor),
+    Width = 1*(8*W+4+2) + 3*(1*W+4+2) + 1*(1*W+4+2) + 8*(6+8*W+4+2) - 2,
+    BitRates0 = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
 
-    epx:window_attach(Window),
-    epx:pixmap_attach(Bg),
-    epx:window_adjust(Window, [{name, "Candy"}]),
-
-    {IfID,IfPid,IfBitRate} =
-	case get_can_usb_if() of
+    {IF,
+     [{listen_only,LISTEN},{fd,FD},
+      {bitrate,BitRate}, {bitrates, BitRates},
+      {datarate,DataRate}, {datarates,DataRates}]} =
+	case get_can_if() of
+	    {ok,IFCan=#if_can{if_mod=Mod,if_pid=Pid}} when is_pid(Pid) ->
+		{IFCan, Mod:getopts(Pid, [listen_only, fd, 
+					  bitrate, bitrates, 
+					  datarate, datarates])};
 	    {error,_} ->
-		{0,undefined,error};
-	    {ok,{IfID0,IfPid0}} ->
-		{IfID0,IfPid0,
-		 case get_can_usb_bitrate(IfPid0) of
-		     {ok,BitRate0} -> BitRate0;
-		     {error,_} -> error
-		 end}
+		{#if_can{if_mod=undefined,if_id=0,if_pid=undefined},
+		 [{listen_only, false},
+		  {fd, false},
+		  {bitrate, hd(BitRates0)},
+		  {bitrates, BitRates0},
+		  {datarate, undefined},
+		  {datarates, ?DEFAULT_DATARATES}]}
 	end,
+
     S1 = S0#s {
-	   bit_rate = IfBitRate,
-	   if_id = IfID,
-	   if_pid = IfPid,
-	   width = Width,
-	   height = Height,
-	   window = Window,
+	   listen_only = LISTEN,
+	   fd = FD,
+	   bitrate = BitRate,
+	   bitrates = sort_rates(BitRates),
+	   datarate = DataRate,
+	   datarates = sort_rates(DataRates),
+	   if_can = IF,
 	   font   = Font,
-	   winfo = WInfo,
-	   %% glyph_width  = W,
-	   %% glyph_height = H,
-	   %% glyph_ascent = epx:font_info(Font, ascent),
-	   %% background_color = ?BACKGROUND_COLOR,
-	   pixels = Bg,
+	   glyph_width  = W,
+	   glyph_height = H,
+	   glyph_ascent = epx:font_info(Font, ascent),
 	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
 	   frame_layout  = ets:new(frame_layout, [{keypos,#layout.id}]),
 	   frame_counter = ets:new(frame_counter, []),
 	   frame_anim    = ets:new(frame_anim, []),
 	   frame_freq    = ets:new(frame_freq, []),
-	   row_width = Width,
-	   row_height = RowHeight,
+	   menu_profile  = MProfile,
+	   row_width     = Width,
+	   row_height    = RowHeight,
 	   hide = hide_pixels()
 	  },
-    WContent = #window_content { profile = WProfile },
-    D0 = #d { content = WContent },
-    State = {S1, D0},
+    State = {S1, #d{} },
     Model = proplists:get_value(model, Env, any),
     State1 = load_frame_layout(Model, State),
-    {ok, update_window(State1)}.
+    set_status(State1),
+    {ok, State1}.
+
+create_menu_profile(Profile) ->
+    #menu_profile {
+       scheme           = Profile#profile.scheme,
+       font_name        = Profile#profile.menu_font_name,
+       font_size        = Profile#profile.menu_font_size,
+       font_color       = Profile#profile.menu_font_color,
+       background_color = Profile#profile.menu_background_color,
+       border_color     = Profile#profile.menu_border_color
+      }.
+
+configure(_Rect,State) ->
+    ?verbose("CONFIGURE: ~w\n", [_Rect]),
+    State.
+
+key_press(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
+    ?verbose("KEY_PRESS: ~w, mod=~p\n", [_Event, _Mod]),
+    State.
+
+key_release(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
+    ?verbose("KEY_RELEASE: ~w\n", [_Event]),
+    State.
+
+button_press(_Event={button_press, Buttons,XY={_X,_Y}}, State) ->
+    ?verbose("BUTTON_PRESS: ~w\n", [_Event]),
+    case Buttons of
+	[left] ->
+	    case layout_from_coord(XY, State) of
+		false ->
+		    deselect(State, []);
+		Layout ->
+		    cell_hit(XY,Layout,State)
+	    end;
+	_ ->
+	    State
+    end.
+
+button_release(_Event={_,_Buttons,{_X,_Y}},State) ->
+    ?verbose("BUTTON_RELEASE: ~w\n", [_Event]),
+    State.
+
+enter(_Event, State) ->
+    ?verbose("ENTER: ~w\n", [_Event]),
+    State.
+
+leave(_Event, State) ->
+    ?verbose("LEAVE: ~w\n", [_Event]),
+    State.
+
+focus_in(_Event, State) ->
+    ?verbose("FOCUS_IN: ~w\n", [_Event]),
+    State.
+
+focus_out(_Event, State) ->
+    ?verbose("FOCUS_OUT: ~w\n", [_Event]),
+    State.
+
+close(State={_S,_D}) ->
+    %% ?verbose("Got window close\n", []),
+    erlang:halt(0),   %% temporary hack?
+    State.
+
+draw(Pixels, Area, State) ->
+    ?verbose("DRAW: Area = ~p\n", [Area]),
+    redraw_all(Pixels, Area, State),
+    State.
+
+
+menu({menu,Pos}, State={S,_D}) ->
+    ?verbose("MENU: Pos = ~p\n", [Pos]),
+    MProfile = S#s.menu_profile,
+    Menu =
+	case S#s.if_can of
+	    #if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid) ->
+		[{listen_only,LISTEN},{fd,FD},
+		 {bitrate,BitRate}, {bitrates, BitRates},
+		 {datarate,_DataRate}, {datarates,_DataRates}] =
+		    Mod:getopts(Pid, [listen_only, fd, 
+				      bitrate, bitrates, 
+				      datarate, datarates]),
+		LISTEN_ON = if LISTEN -> "ON";
+			       not LISTEN -> "OFF";
+			       true -> "N/A"
+			    end,
+		FD_ON = if FD -> "ON";
+			   not FD -> "OFF";
+			   true -> "N/A"
+			end,
+		BitRates1 = sort_rates(BitRates),
+		[{"Listen="++LISTEN_ON, "Ctrl+L"},
+		 {"Fd="++FD_ON, "Ctrl+F"}] ++
+		    [{rate_to_list(R,BitRate), "Alt+"++integer_to_list(I)} ||
+			{R,I} <- lists:zip(BitRates1, 
+					   lists:seq(1, length(BitRates1)))];
+	    _ ->
+		[{"Listen=N/A", "Ctrl+L"},
+		 {"Fd=N/A",     "Ctrl+F"},
+		 {" 1000k",      "Alt+1"},
+		 {" 500k",       "Alt+2"},
+		 {" 250k",       "Alt+3"},
+		 {" 125k",       "Alt+4"}
+		]
+	end,
+    CanMenu = epx_menu:create(MProfile#menu_profile{background_color=green},
+			      Menu),
+    {reply, CanMenu, State}.
+
+		
+rate_to_list(Rate,CurrentRate) ->
+    RateK = Rate div 1000,
+    RateM = Rate rem 1000,
+    Mark = if Rate =:= CurrentRate -> ">";
+	      true -> " "
+	   end,
+    if RateM =:= 0 ->
+	    Mark++integer_to_list(RateK)++"k";
+       true ->
+	    Mark++integer_to_list(RateK) ++ "." ++
+		hd(integer_to_list(RateM)) ++ "k"
+    end.
+	    
+
+select({_Phase,Rect}, {S,D}) ->
+    ?verbose("SELECT: ~w\n", [Rect]),
+    ?verbose("State = S=~p, D=~p\n", [S, D]),
+    {S, D#d { selection = Rect }}.
+
+motion(_Event={motion,_Button,_Pos}, State) ->
+    ?verbose("MOTION: ~w\n", [_Event]),
+    State.
+
+%%
+%% Commands on Selected elements:
+%%   X              Hexa decimal format
+%%   D              Decimal format
+%%   B              Binary format
+%%   O              Octal format
+%%   C              Color format
+%%   --
+%%   G              Group selected bits
+%%   Shift+G        Ungroup selected bits
+%%   H              Sort Low -> High frames by frame id
+%%   Ctrl+H         Sort High -> Low frames by frame id
+%%   1-8            Split in groups of 1 to 8 bits
+%%   Alt+1-9        Set bitrate 
+%%   Alt+up         Bitrate up
+%%   Alt+down       Bitrate down
+%%   T              Swap groups (not implemented yet)
+%%   Ctrl+L         Listen mode toggle
+%%   Ctrl+F         FD allow toggle
+%%   Ctrl+1-9        Set datarate (FD)
+%%   Ctrl+S         Save information to /home/$USER/candy.txt
+%%
+%% Global commands
+%%   Q              Quit application
+%%   up             Arrow up, scroll up
+%%   down           Arrow down, scroll down
+%%   pageup         Page up, scroll one page up
+%%   pagedown       Page down, scroll one page down
+%%
+command(Key, Mod, State={_,D}) ->
+    ?verbose("COMMAND: key=~p, mod=~p\n", [Key, Mod]),
+    case command(Key, D#d.selected, Mod, State) of
+	Reply = {reply, _SymMod, _State1} ->
+	    Reply;
+	State1 ->
+	    {noreply, State1}
+    end.
+	     
+
+command($x, Selected, _Mod, State) ->
+    set_base(Selected, 16, State);
+command($d, Selected, _Mod, State) ->
+    set_base(Selected, 10, State);
+command($o, Selected, _Mod, State) ->
+    set_base(Selected, 8, State);
+command($b, Selected, _Mod, State) ->
+    set_base(Selected, 2, State);
+command($c, Selected, _Mod, State) ->
+    set_base(Selected, c, State);
+command($G, Selected, Mod, State) when Mod#keymod.shift ->
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    lists:foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
+command($g, Selected, _Mod, _State = {S,D}) ->
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    %% select min pos foreach FID and keep as selected
+    Selected1 = lists:foldl(
+		  fun(FID, Acc) ->
+			  MinPos = lists:min([Pos || {F,Pos} <- Selected, 
+						     F =:= FID]),
+			  [{FID,MinPos}|Acc]
+		  end, [], Fs),
+    State1 = {S, D#d { selected = Selected1 }},
+    lists:foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
+command($h, _Selected, Mod, State) ->
+    %% sort all fields by frame id
+    FIDs0Pos0 = fold_layout(
+		  fun(Li, Acc, _Si) ->
+			  case Li#layout.style of
+			      deleted -> Acc;
+			      hidden -> Acc;
+			      collapsed -> Acc;
+			      _ ->
+				  if Mod#keymod.alt ->
+					  %% sort according to original pos
+					  [{Li#layout.pos0,Li#layout.id}|Acc];
+				     true ->
+					  %% sort according to id
+					  [{0,Li#layout.id}|Acc]
+				  end
+			  end
+		  end, [], State),
+    FIDs1Pos0 = 
+	if Mod#keymod.ctrl ->
+		[Lj || {_SortKey,Lj} <- lists:reverse(lists:sort(FIDs0Pos0))];
+	   true ->
+		[Lj || {_SortKey,Lj} <- lists:sort(FIDs0Pos0)]
+	end,
+    FIDsPos = maps:from_list(lists:zip(FIDs1Pos0, 
+				       lists:seq(1,length(FIDs1Pos0)))),
+    State1 =
+	each_layout(
+	  fun(Li, Si) ->
+		  case maps:get(Li#layout.id, FIDsPos, hidden) of
+		      hidden ->
+			  Si;
+		      Pos ->
+			  L2 = Li#layout { pos = Pos, src = Li#layout.pos },
+			  L3 = position_normal(L2, Si),
+			  insert_layout(L3, Si)
+		  end
+	  end, State),
+    epxw:invalidate(),
+    State1;
+command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
+    FIDs = lists:usort([FID || {FID,_} <- Selected]),
+    Bytes = 
+	lists:foldr(
+	  fun(FID,Acc) ->
+		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+		  L = lookup_layout(FID, State),
+		  Format = L#layout.format,
+		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
+		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
+		  %% ?verbose("SAVE FID=0x~s Bits=~w\n", [integer_to_list(FID,16), Bs]),
+		  ["0x",integer_to_list(FID,16),
+		   [[ %% byte index in decimal
+		     [" ", integer_to_list(B div 8),  
+		      %% byte mask
+		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
+		      %% byte match value HIGH
+		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
+		      %% byte match value LOW
+		      " 0x00" ] || {B,_Len} <- G]
+		    || G <- Bs],
+		   "\n" | Acc]
+	  end, [], FIDs),
+    %% User =  os:getenv("USER"),
+    Home = case os:getenv("HOME") of
+	       false -> "/tmp";
+	       ""    -> "/tmp";
+	       H -> H
+	   end,
+    file:write_file(filename:join(Home, "candy.txt"), 
+		    [Bytes,
+		     " This line and the following lines are comments\n"
+		    ]),
+    State;
+command($q, _Selected, _Mod, State) ->
+    erlang:halt(0),
+    State;
+
+command(I, _Selected, Mod, State) when Mod#keymod.alt, I >= $1, I =< $9 ->
+    bitrate_select(I-$0, State);
+command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
+    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    lists:foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, 
+		State, Fs);
+command(up, _Selected, Mod, State) when Mod#keymod.alt ->
+    bitrate_prev(State);
+command(down, _Selected, Mod, State) when Mod#keymod.alt ->
+    bitrate_next(State);
+command($l, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    toggle_listen_only(State);
+command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    toggle_fd(State);
+
+command(Symbol, _Selected, Mod, State) ->
+    io:format("unhandled command ~p\n", [Symbol]),
+    {reply,{Symbol,Mod},State}.
 
 %% Load data display for various models (test)
 load_frame_layout(prius, State) ->
@@ -414,8 +726,8 @@ load_pid(FID, Name, FormList, _State={S,D}) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+    ?verbose("Call ~p not handled\n", [_Request]),
+    {reply, {error,badcall}, State}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -428,6 +740,7 @@ handle_call(_Request, _From, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_cast(_Msg, State) ->
+    ?verbose("Cast ~p not handled\n", [_Msg]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -446,47 +759,60 @@ handle_info(Frame=#can_frame{}, State) ->
     {noreply, State1};
 
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
-    Save = clip_window_content(State),
-    R = redraw_anim(State),
-    set_clip_rect(State, Save),
-    case R of
+    case epxw:draw(fun(Pixels,Area) ->
+			   redraw_anim(Pixels,Area,State)
+		   end) of
 	false ->
 	    {noreply, {S, D#d { tick = undefined }}};
 	true ->
-	    State1 = update_window(State),
-	    {noreply, tick_start(State1)}
+	    {noreply, tick_start(State)}
     end;
 
-handle_info({epx_event, Win, Event}, State={S,_}) when S#s.window =:= Win ->
-    try epx_event(Event, State) of
-	Return -> Return
-    catch
-    ?EXCEPTION(error,Reason,Stack) ->
-	    io:format("crash: ~p\n", [Reason]),
-	    io:format("~p\n", [?GET_STACK(Stack)]),
-	    {noreply, State}
-    end;
-
-handle_info({if_state_event, {ID,_IfEnt}, IfState}, State={S,D}) ->
-    %% io:format("Got if_state if=~w, ifstate=~w\n", [ID,IfState]),
-    State1 = if IfState =:= down, ID =:= S#s.if_id ->
-		     redraw({S#s { if_state = down }, D});
-		IfState =:= up, S#s.if_state =:= down ->
-		     case get_can_usb_if() of  %% pickup new interface id
-			 {ok,{IfID,IfPid}} ->
-			     redraw({S#s { if_state = up, if_id=IfID, 
-					   if_pid=IfPid }, D});
-			 {error,_} ->
-			     {S#s { if_state = up, if_id=ID, 
-				    if_pid=undefined }, D}
-		     end;
-		true ->
-		     State
-	     end,
+%%
+%% Interface has changed, pick up new message
+%%
+handle_info({if_state_event, {ID,_IfEnt}, IfState}, {S,D}) ->
+    ?verbose("Got if_state if=~w, ifstate=~w\n", [ID,IfState]),
+    S1 = 
+	if IfState =:= down, ID =:= (S#s.if_can)#if_can.if_id ->
+		S#s { if_state = down };
+	   IfState =:= up, S#s.if_state =:= down ->
+		{IfState1,
+		 IF,
+		 [{listen_only,LISTEN},{fd,FD},
+		  {bitrate,BitRate}, {bitrates, BitRates},
+		  {datarate,DataRate}, {datarates,DataRates}]} =
+		    case get_can_if() of
+			{ok,IFCan=#if_can{if_mod=Mod,if_pid=Pid}} when 
+			      is_pid(Pid) ->
+			    {up,IFCan, Mod:getopts(Pid, [listen_only, fd, 
+							 bitrate, bitrates, 
+							 datarate, datarates])};
+			{error,_} ->
+			    {down,
+			     #if_can{if_mod=undefined,if_id=0,if_pid=undefined},
+			     [{listen_only, undefined},
+			      {fd, undefined},
+			      {bitrate, hd(?DEFAULT_DATARATES)},
+			      {bitrates, ?DEFAULT_DATARATES},
+			      {datarate, undefined},
+			      {datarates, ?DEFAULT_DATARATES}]}
+		    end,
+		
+		S#s { if_state=IfState1, if_can=IF,
+		      listen_only=LISTEN,fd=FD,
+		      bitrate=BitRate, bitrates=sort_rates(BitRates),
+		      datarate=DataRate, datarates=sort_rates(DataRates) };
+	   true ->
+		S
+	end,
+    State1 = {S1,D},
+    set_status(State1),
+    epxw:invalidate(),
     {noreply, State1};
 
 handle_info(_Info, State) ->
-    io:format("Got info ~p\n", [_Info]),
+    ?verbose("Got info ~p\n", [_Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -500,9 +826,7 @@ handle_info(_Info, State) ->
 %% @spec terminate(Reason, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, {S,_D}) ->
-    epx:pixmap_detach(S#s.pixels),
-    epx:window_detach(S#s.window),
+terminate(_Reason, {_S,_D}) ->
     ok.
 
 %%--------------------------------------------------------------------
@@ -519,6 +843,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+sort_rates(Rates) ->
+    lists:sort(Rates).
 
 %% batch collect all frames in one go then redraw if needed
 handle_can_frames(CanFrames, S) ->
@@ -547,7 +874,7 @@ process_can_frames([#can_frame{id=FID}|Fs], {S,D},
 		      {?CAN_ERR_BUSOFF,      busoff},
 		      {?CAN_ERR_BUSERROR,    buserror},
 		      {?CAN_ERR_RESTARTED,   restarted}]),
-    %% io:format(" status = ~w\n", [Fs]),
+    %% ?verbose(" status = ~w\n", [Fs]),
     process_can_frames(Fs, {S#s { if_error = Err }, D},
 		       true, RedrawCount, RedrawSet);
 process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
@@ -601,7 +928,8 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
     end;
 process_can_frames([], State, Redraw, _RedrawCount, RedrawSet) ->
     if Redraw ->
-	    redraw(State);
+	    epxw:invalidate(),
+	    State;
        true ->
 	    case sets:size(RedrawSet) of
 		0 ->
@@ -620,194 +948,6 @@ display_saved(Count, RedrawCount) when Count < RedrawCount ->
 display_saved(_Count, _RedrawCount) ->
     ok.
     
-
-epx_event(close, State={_S,_D}) ->
-    %% io:format("Got window close\n", []),
-    erlang:halt(0),   %% temporary hack
-    {stop, normal, State};
-epx_event({button_press,[left],{X0,Y0,_}}, State={_S,D}) ->
-    case scroll_hit({X0,Y0}, State) of
-	false ->
-	    %% Pos = {X0+D#d.view_xpos, Y0+ D#d.view_ypos},
-	    Xy = get_view_pos(D, X0, Y0),
-	    case layout_from_coord(Xy, State) of
-		false ->
-		    {noreply, deselect(State, [])};
-		Layout ->
-		    {noreply, cell_hit(Xy,Layout,State)}
-	    end;
-	State1 ->
-	    {noreply, State1}
-    end;
-
-epx_event({button_release,[left],{_X,_Y,_}}, State={S,D}) ->
-    flush_motion(S#s.window),
-    case get_motion(D) of
-	undefined ->
-	    {noreply, State};
-	{vhndl,_Delta} ->
-	    epx:window_disable_events(S#s.window, [motion]),
-	    {noreply, {S,set_motion(D, undefined)}};
-	{hhndl,_Delta} ->
-	    epx:window_disable_events(S#s.window, [motion]),
-	    {noreply, {S,set_motion(D, undefined)}}
-    end;
-
-epx_event({motion,_Button,{X1,Y1,_}},State={S,D}) ->
-    flush_motion(S#s.window),
-    case get_motion(D) of
-	{vhndl,{_DX,Dy}} ->
-	    BottomOffset = bottom_offset(S),
-	    {_,_,_,H} = get_vscroll(D),
-	    %%VH = (D#d.view_bottom - D#d.view_top),
-	    VH = get_view_height(D),
-	    Y2  = trunc((Y1-Dy)*(VH/H)),
-	    B = max(0,(get_view_bottom(D) + BottomOffset)-H),
-	    Y  = if Y2 < 0 -> 0;
-		    Y2 > B -> B;
-		    true -> Y2
-		 end,
-	    %% State1 = {S, D#d { view_ypos = Y }},
-	    State1 = {S, set_view_ypos(D, Y)},
-	    {noreply,redraw(State1)};
-	{hhndl,{Dx,_Dy}} ->
-	    RightOffset = right_offset(S),
-	    {_,_,W,_} = get_hscroll(D),
-	    %% VW = (D#d.view_right - D#d.view_left),
-	    VW = get_view_width(D),
-	    X2  = trunc((X1-Dx)*(VW/W)),
-	    R = max(0, (get_view_right(D)-RightOffset)-W),
-	    X = if X2 < 0 -> 0;
-		   X2 > R -> R;
-		   true -> X2
-		end,
-	    %% State1 = {S, D#d { view_xpos = X }},
-	    State1 = {S, set_view_xpos(D, X)},
-	    {noreply,redraw(State1)}; 
-	_ ->
-	    {noreply,State}
-    end;
-
-epx_event({button_press,[wheel_down],{_X,_Y,_}},State) ->
-    {noreply, State};
-epx_event({button_release,[wheel_down],{_X,_Y,_}},State={S,_D}) ->
-    flush_wheel(S#s.window),
-    {noreply, scroll_down(State)};
-
-epx_event({button_press,[wheel_up],{_X,_Y,_}},State) ->
-    {noreply, State};
-epx_event({button_release,[wheel_up],{_X,_Y,_}},State={S,_D}) ->
-    flush_wheel(S#s.window),
-    {noreply, scroll_up(State)};
-
-epx_event({button_press,[wheel_left],{_X,_Y,_}}, State) ->
-    {noreply, State};
-epx_event({button_release,[wheel_left],{_X,_Y,_}},State={S,_D}) ->
-    flush_wheel(S#s.window),
-    {noreply, scroll_left(State)};
-
-epx_event({button_press,[wheel_right],{_X,_Y,_}}, State) ->
-    {noreply, State};    
-epx_event({button_release,[wheel_right],{_X,_Y,_}},State={S,_D}) ->
-    flush_wheel(S#s.window),
-    {noreply, scroll_right(State)};
-
-epx_event({key_press, Sym, Mod, _Code}, _State={S,D}) ->
-    M = set_mod(D#d.keymod, Mod),
-    D1 = D#d { keymod = M },
-    State2 = command(Sym, D#d.selected, M, {S,D1}),
-    {noreply, State2};    
-
-epx_event({key_release, _Sym, Mod, _code},_State={S,D}) ->
-    %% %% io:format("Key release ~p mod=~p\n", [_Sym,Mod]),
-    M = clr_mod(D#d.keymod, Mod),
-    D1 = D#d { keymod = M },
-    {noreply, {S,D1}};
-
-epx_event({configure, Rect},_State={S,D}) ->
-    {_X,_Y,W,H} = flush_configure(S#s.window, Rect),
-    Pixels = resize_pixmap(S#s.pixels, W, H),
-    State1 = {S#s { width=W, height=H,  pixels=Pixels }, D},
-    {noreply, redraw(State1)};
-epx_event(Event, State) ->
-    io:format("Got epx event ~p\n", [Event]),
-    {noreply, State}.
-
-%% update mod keys
-set_mod(M, [shift|Mod]) ->  set_mod(M#keymod {shift = true}, Mod);
-set_mod(M, [ctrl|Mod]) ->   set_mod(M#keymod {ctrl = true}, Mod);
-set_mod(M, [alt|Mod]) ->    set_mod(M#keymod {alt = true}, Mod);
-set_mod(M, [_|Mod]) ->      set_mod(M, Mod);
-set_mod(M, []) -> M.
-
-clr_mod(M, [shift|Mod]) ->  clr_mod(M#keymod {shift = false}, Mod);
-clr_mod(M, [ctrl|Mod]) ->   clr_mod(M#keymod {ctrl = false}, Mod);
-clr_mod(M, [alt|Mod]) ->    clr_mod(M#keymod {alt = false}, Mod);
-clr_mod(M, [_|Mod]) ->      clr_mod(M, Mod);
-clr_mod(M, []) -> M.
-
-
-scroll_hit(Pos, _State={S,D}) ->
-    case epx_rect:contains(get_hscroll(D), Pos) of
-	true ->
-	    epx:window_enable_events(S#s.window, [motion]),
-	    case epx_rect:contains(get_hhndl(D), Pos) of
-		true ->
-		    {Xv,Yv,_,_} = get_hhndl(D),
-		    {Xp,Yp} = Pos,
-		    Delta = {Xp-Xv, Yp-Yv},
-		    {S,set_motion(D,{hhndl,Delta})};
-		false ->
-		    RightOffset = right_offset(S),
-		    {_,_,W,_} = get_hscroll(D),
-		    {_,_,Vw,_} = get_hhndl(D),
-		    {Xp,_Yp} = Pos,
-		    %% VW = (D#d.view_right - D#d.view_left),
-		    VW = get_view_width(D),
-		    X2  = trunc((Xp-(Vw div 2))*(VW/W)),
-		    R = max(0, (get_view_right(D)-RightOffset)-W),
-		    X  = clamp(X2, 0, R),
-		    %% D1 = D#d { view_xpos = X },
-		    D1 = set_view_xpos(D, X),
-		    State1 = {S, set_motion(D1,{hhndl,{(Vw div 2),0}}) },
-		    redraw(State1)
-	    end;
-	false ->
-	    case epx_rect:contains(get_vscroll(D), Pos) of
-		true ->
-		    epx:window_enable_events(S#s.window, [motion]),
-		    case epx_rect:contains(get_vhndl(D), Pos) of
-			true ->
-			    {Xv,Yv,_,_} = get_vhndl(D),
-			    {Xp,Yp} = Pos,
-			    Delta = {Xp-Xv, Yp-Yv},
-			    %% activate motion
-			    {S,set_motion(D,{vhndl,Delta})};
-			false ->
-			    BottomOffset = bottom_offset(S),
-			    {_,_,_,H} = get_vscroll(D),
-			    {_,_,_,Vh} = get_vhndl(D),
-			    {_Xp,Yp} = Pos,
-			    %% VH = (D#d.view_bottom - D#d.view_top),
-			    VH = get_view_height(D),
-			    Y2  = trunc((Yp-(Vh div 2))*(VH/H)),
-			    B = max(0,(get_view_bottom(D)+BottomOffset)-H),
-			    Y  = clamp(Y2, 0, B),
-			    D1 = set_view_ypos(D, Y),
-			    State1 = {S,set_motion(D1,{vhndl,{0,(Vh div 2)}})},
-			    redraw(State1)
-		    end;
-		false ->
-		    false
-	    end
-    end.
-
-clamp(Value, Min, Max) ->
-    if Value < Min -> Min;
-       Value > Max -> Max;
-       true -> Value
-    end.
-
 cell_hit(Xy, Layout, State={S,D}) ->
     case fmt_from_coord(Xy, Layout) of
 	false ->
@@ -817,298 +957,142 @@ cell_hit(Xy, Layout, State={S,D}) ->
 	    %% Note that Layout1 is the "delete" marked Layout
 	    State2 = insert_layout(Layout1, State1),
 	    {Vx,Vy,Vw,Vh} = view_rect(State2),
-	    {S2,D2} = State2,
-	    D3 = set_view_rect(D2, Vx, Vx+Vw-1, Vy, Vy+Vh-1),
-	    State3 = {S2,D3},
-	    redraw(State3);
+	    epxw:set_view_size(max(0,Vx+Vw-1), max(0,Vy+Vh-1)),
+	    State2;
 	    
 	{_I, Fmt} when Fmt#fmt.field =:= id,
 		       Layout#layout.style =:= collapsed ->
 	    Layout1 = Layout#layout { style = normal },
 	    update_layout(Layout, Layout1, State);
 
-	{I, _Fmt} when (D#d.keymod)#keymod.shift ->  
-	    %% add to or remove from selection
-	    FID = Layout#layout.id,
-	    Selected = 
-		case lists:member({FID,I}, D#d.selected) of
-		    true -> 
-			lists:delete({FID,I},D#d.selected);
-		    false ->
-			[{FID,I} | D#d.selected]
-		end,
-	    D1 = D#d { selected = Selected },
-	    State1 =  {S,D1},
-	    redraw_fid(FID, State1);
-
 	{I, _Fmt} ->
-	    FID = Layout#layout.id,
-	    deselect(State, [{FID,I}])
+	    Mod = epxw:keymod(),
+	    if Mod#keymod.shift ->  
+		    %% add to or remove from selection
+		    FID = Layout#layout.id,
+		    Selected = 
+			case lists:member({FID,I}, D#d.selected) of
+			    true -> 
+				lists:delete({FID,I},D#d.selected);
+			    false ->
+				[{FID,I} | D#d.selected]
+			end,
+		    D1 = D#d { selected = Selected },
+		    State1 =  {S,D1},
+		    redraw_fid(FID, State1);
+	       true ->
+		    FID = Layout#layout.id,
+		    deselect(State, [{FID,I}])
+	    end
     end.
 
-%%
-%% Commands on Selected elements:
-%%   X              Hexa decimal format
-%%   D              Decimal format
-%%   B              Binary format
-%%   O              Octal format
-%%   C              Color format
-%%   --
-%%   G              Group selected bits
-%%   Shift+G        Ungroup selected bits
-%%   H              Sort Low -> High frames by frame id
-%%   Ctrl+H         Sort High -> Low frames by frame id
-%%   1-8            Split in groups of 1 to 8 bits
-%%   T              Swap groups (not implemented yet)
-%%   Ctrl+S         Save information to /home/$USER/candy.txt
-%%
-%% Global commands
-%%   Q              Quit application
-%%   up             Arrow up, scroll up
-%%   down           Arrow down, scroll down
-%%   pageup         Page up, scroll one page up
-%%   pagedown       Page down, scroll one page down
-%%
-command($x, Selected, _Mod, State) ->
-    set_base(Selected, 16, State);
-command($d, Selected, _Mod, State) ->
-    set_base(Selected, 10, State);
-command($o, Selected, _Mod, State) ->
-    set_base(Selected, 8, State);
-command($b, Selected, _Mod, State) ->
-    set_base(Selected, 2, State);
-command($c, Selected, _Mod, State) ->
-    set_base(Selected, c, State);
-command($G, Selected, Mod, State) when Mod#keymod.shift ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
-    foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
-command($g, Selected, _Mod, _State = {S,D}) ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
-    %% select min pos foreach FID and keep as selected
-    Selected1 = lists:foldl(
-		  fun(FID, Acc) ->
-			  MinPos = lists:min([Pos || {F,Pos} <- Selected, 
-						     F =:= FID]),
-			  [{FID,MinPos}|Acc]
-		  end, [], Fs),
-    State1 = {S, D#d { selected = Selected1 }},
-    foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
-command($h, _Selected, Mod, State) ->
-    %% sort all fields by frame id
-    FIDs0Pos0 = fold_layout(
-		  fun(Li, Acc, _Si) ->
-			  case Li#layout.style of
-			      deleted -> Acc;
-			      hidden -> Acc;
-			      collapsed -> Acc;
-			      _ ->
-				  if Mod#keymod.alt ->
-					  %% sort according to original pos
-					  [{Li#layout.pos0,Li#layout.id}|Acc];
-				     true ->
-					  %% sort according to id
-					  [{0,Li#layout.id}|Acc]
-				  end
-			  end
-		  end, [], State),
-    FIDs1Pos0 = 
-	if Mod#keymod.ctrl ->
-		[Lj || {_SortKey,Lj} <- lists:reverse(lists:sort(FIDs0Pos0))];
-	   true ->
-		[Lj || {_SortKey,Lj} <- lists:sort(FIDs0Pos0)]
-	end,
-    FIDsPos = maps:from_list(lists:zip(FIDs1Pos0, 
-				       lists:seq(1,length(FIDs1Pos0)))),
-    State1 =
-	each_layout(
-	  fun(Li, Si) ->
-		  Pos = maps:get(Li#layout.id, FIDsPos),
-		  L2 = Li#layout { pos = Pos, src = Li#layout.pos },
-		  L3 = position_normal(L2, Si),
-		  insert_layout(L3, Si)
-	  end, State),
-    redraw(State1);
-
-command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
-    FIDs = lists:usort([FID || {FID,_} <- Selected]),
-    Bytes = 
-	lists:foldr(
-	  fun(FID,Acc) ->
-		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
-		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-		  L = lookup_layout(FID, State),
-		  Format = L#layout.format,
-		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
-		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
-		  %% io:format("SAVE FID=0x~s Bits=~w\n", [integer_to_list(FID,16), Bs]),
-		  ["0x",integer_to_list(FID,16),
-		   [[ %% byte index in decimal
-		     [" ", integer_to_list(B div 8),  
-		      %% byte mask
-		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
-		      %% byte match value HIGH
-		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
-		      %% byte match value LOW
-		      " 0x00" ] || {B,_Len} <- G]
-		    || G <- Bs],
-		   "\n" | Acc]
-	  end, [], FIDs),
-    %% User =  os:getenv("USER"),
-    Home = case os:getenv("HOME") of
-	       false -> "/tmp";
-	       ""    -> "/tmp";
-	       H -> H
-	   end,
-    file:write_file(filename:join(Home, "candy.txt"), 
-		    [Bytes,
-		     " This line and the following lines are comments\n"
-		    ]),
-    State;
-command($q, _Selected, _Mod, State) ->
-    erlang:halt(0),
-    State;
-command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
-    foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, State, Fs);
-
-command(up, _Selected, Mod, State) when Mod#keymod.alt ->
-    bit_rate_up(State);
-command(down, _Selected, Mod, State) when Mod#keymod.alt ->
-    bit_rate_down(State);
-
-command(up, _Selected, _Mod, State) ->
-    scroll_up(State);
-command(down, _Selected, _Mod, State) ->
-    scroll_down(State);
-
-command(pageup, _Selected, _Mod, State) ->
-    page_up(State);
-command(pagedown, _Selected, _Mod, State) ->
-    page_down(State);
-
-command(left, _Selected, _Mod, State) ->
-    scroll_left(State);
-command(right, _Selected, _Mod, State) ->
-    scroll_right(State);
-
-command(_Symbol, _Selected, _Mod, State) ->
-    io:format("unhandled command ~p\n", [_Symbol]),
+bitrate_next(State0={S,D}) ->
+    I = bitrate_index(State0)-1,
+    BitRates = S#s.bitrates,
+    N = length(BitRates),
+    J = ((I+1) rem N) + 1,
+    Rate = lists:nth(J, BitRates),
+    setopts(S#s.if_can, [{bitrate, Rate}]),
+    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
+    State = {S#s { bitrate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
     State.
 
-bit_rate_up(_State={S,D}) ->
-    Rates = S#s.bit_rates,
-    BitRate = case S#s.bit_rate of
-		  error -> hd(Rates);
-		  B -> 
-		      case lists:dropwhile(fun(X) -> X =/= B end, Rates) of
-			  [B] -> hd(Rates);
-			  [] -> hd(Rates);
-			  [B,N|_] -> N
-		      end
-	      end,
-    State = case set_can_usb_bitrate(S#s.if_pid, BitRate) of
-		ok ->
-		    {S#s { bit_rate = BitRate }, D};
-		{error,_} ->
-		    {S#s { bit_rate = error }, D}
-	    end,
-    redraw(State).
+bitrate_prev(State0={S,D}) ->
+    I = bitrate_index(State0)-1,
+    BitRates = S#s.bitrates,
+    N = length(BitRates),
+    J = ((I+(N-1)) rem N) + 1,
+    Rate = lists:nth(J, BitRates),
+    setopts(S#s.if_can, [{bitrate, Rate}]),
+    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
+    State = {S#s { bitrate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
+    State.
 
+bitrate_select(I, _State0={S,D}) ->
+    BitRates = S#s.bitrates,
+    N = length(BitRates),
+    J = ((I-1) rem N) + 1,
+    Rate = lists:nth(J, BitRates),
+    ?verbose("I=~w, J=~w, Rate=~w\n", [I,J,Rate]),
+    setopts(S#s.if_can, [{bitrate, Rate}]),
+    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
+    State = {S#s { bitrate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
+    State.
 
-bit_rate_down(_State={S,D}) ->
-    Rates = lists:reverse(S#s.bit_rates),
-    BitRate = case S#s.bit_rate of
-		  error -> hd(Rates);
-		  B -> 
-		      case lists:dropwhile(fun(X) -> X =/= B end, Rates) of
-			  [B] -> hd(Rates);
-			  [] -> hd(Rates);
-			  [B,P|_] -> P
-		      end
-	      end,
-    State = case set_can_usb_bitrate(S#s.if_pid, BitRate) of
-		ok ->
-		    {S#s { bit_rate = BitRate }, D};
-		{error,_} ->
-		    {S#s { bit_rate = error }, D}
-	    end,
-    redraw(State).
-    
+bitrate_index({S,_D}) ->
+    if S#s.bitrate =:= undefined, S#s.bitrates =:= [] -> 0;
+       S#s.bitrate =:= undefined, is_list(S#s.bitrates) -> 1;
+       true -> index(S#s.bitrate, S#s.bitrates)
+    end.
+
+index(E, L) -> index_(E, L, 1).
+index_(E, [E|_], I) -> I;
+index_(E, [_|L], I) -> index_(E, L, I+1);
+index_(_E, [], _) ->  0.
+
+%% toggle Listen-Only
+toggle_listen_only({S,D}) ->
+    Listen1 =
+	if S#s.listen_only =:= undefined -> undefined;
+	   S#s.listen_only =:= true -> false;
+	   S#s.listen_only =:= false -> true
+	end,
+    ListenOnly =
+	case S#s.if_can of
+	    #if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid), 
+						Listen1 =/= undefined ->
+		Mod:setopts(Pid, [{listen_only, Listen1}]),
+		[{listen_only,Listen2}] = Mod:getopts(Pid, [listen_only]),
+		Listen2;
+	    _ ->
+		S#s.listen_only
+	end,
+    S1 = S#s{ listen_only = ListenOnly },
+    State1 = {S1, D},
+    set_status(State1),
+    epxw:invalidate(),
+    State1.    
+
+%% toggle allow FD
+toggle_fd({S,D}) ->
+    FD1 =
+	if S#s.fd =:= undefined -> undefined;
+	   S#s.fd =:= true -> false;
+	   S#s.fd =:= false -> true
+	end,
+    FD =
+	case S#s.if_can of
+	    #if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid), 
+						FD1 =/= undefined ->
+		Mod:setopts(Pid, [{fd, FD1}]),
+		[{fd,FD2}] = Mod:getopts(Pid, [fd]),
+		FD2;
+	    _ ->
+		S#s.fd
+	end,
+    S1 = S#s{ fd = FD },
+    State1 = {S1, D},
+    set_status(State1),
+    epxw:invalidate(),
+    State1.    
+	    
 
 %% deselect all and selecte the NewSelected
 deselect({S,D}, NewSelected) ->
     Fs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
     State = {S, D#d { selected = NewSelected }},
-    foldl(fun(FID,Si) -> redraw_fid(FID, Si) end, State, Fs).
+    lists:foldl(fun(FID,Si) -> redraw_fid(FID, Si) end, State, Fs).
 
-scroll_up(State={S,_}) ->
-    State1 = step_up(State, scroll_ystep(S)),
-    redraw(State1).
 
-scroll_down(State={S,_}) ->
-    State1 = step_down(State, scroll_ystep(S)),
-    redraw(State1).
-
-%% move a page up
-page_up(State={_S,D}) ->
-    case get_vscroll(D) of
-	undefined ->
-	    State;
-	{_,_,_,H} ->
-	    {_,_,_,VH} = get_vhndl(D), %% this is the page size in window coords
-	    R = VH/H,  %% page ratio
-	    %%Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
-	    Step = trunc(R*get_view_height(D)),
-	    State1 = step_up(State, Step),
-	    redraw(State1)
-    end.
-
-page_down(State={_S,D}) ->
-    case get_vscroll(D) of
-	undefined ->
-	    State;
-	{_,_,_,H} ->
-	    {_,_,_,VH} = get_vhndl(D), %% this is the page size in window coords
-	    R = VH/H,  %% page ratio
-	    %% Step = trunc(R*(D#d.view_bottom - D#d.view_top)),
-	    Step = trunc(R*get_view_height(D)),
-	    State1 = step_down(State, Step),
-	    redraw(State1)
-    end.
-
-scroll_left(_State={S,D}) ->
-    X = max(0, get_view_xpos(D) - scroll_xstep(S)),
-    State1 = {S, set_view_xpos(D, X)},
-    redraw(State1).
-
-scroll_right(_State={S,D}) ->
-    RightOffset = right_offset(S),
-    W = case get_vscroll(D) of
-	    undefined -> S#s.width;
-	    _ ->  S#s.width - scroll_bar_size(S)
-	end,
-    R = max(0, (get_view_right(D) - RightOffset) - W),
-    X = min(get_view_xpos(D) + scroll_xstep(S), R),
-    State1 = {S, set_view_xpos(D, X)},
-    redraw(State1).
-
-step_up(_State={S,D}, Step) ->
-    Y = max(0, get_view_ypos(D) - Step),
-    {S, set_view_ypos(D, Y) }.
-
-step_down(_State={S,D}, Step) ->
-    BottomOffset = bottom_offset(S),
-    H = case get_hscroll(D) of
-	    undefined -> S#s.height;
-	    _ -> S#s.height - scroll_bar_size(S)
-	end,
-    B = max(0, (get_view_bottom(D)+BottomOffset) - H),
-    Y = min(get_view_ypos(D) + Step, B),
-    {S, set_view_ypos(D, Y)}.
-    
 %% Set base to 'Base' in selected cells
 set_base(Selected, Base, State) ->
-    foldl(
+    lists:foldl(
       fun({FID,I}, Si) ->
 	      L= #layout{format=Format} = lookup_layout(FID,Si),
 	      Fmt = element(I, Format),
@@ -1180,7 +1164,7 @@ merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when
 	    Bits = 
 		case {Fmt1#fmt.bits,Fmt2#fmt.bits} of
 		    {[{P1,L1}],[{P2,L2}]} when P1+L1 =:= P2 ->
-			%% io:format("merged ~p and ~p to ~p\n",
+			%% ?verbose("merged ~p and ~p to ~p\n",
 			%% [{P1,L1},{P2,L2},{P1,L1+L2}]),
 			[{P1,L1+L2}];
 		    {Bits1,Bits2} ->
@@ -1208,7 +1192,7 @@ split_halfs(I,[Fmt|FmtList],Acc,Sel) when  Fmt#fmt.field =:= data ->
 		    Acc1 = make_bit_chunks(Fmt, Pos, Chunk, Len, Acc),
 		    split_halfs(I+1,FmtList,Acc1, Sel);
 		_ -> %% FIXME a bit more work
-		    io:format("fixme: split bits ~w\n", [Fmt#fmt.bits]),
+		    ?debug("fixme: split bits ~w\n", [Fmt#fmt.bits]),
 		    split_halfs(I+1,FmtList,[Fmt|Acc],Sel)
 	    end;
 	false ->
@@ -1233,7 +1217,7 @@ split_size(I,Size,[Fmt|FmtList],Acc,Sel) when Fmt#fmt.field =:= data ->
 		    Acc1 = make_bit_chunks(Fmt, Pos, Chunk, Len, Acc),
 		    split_size(I+1,Size,FmtList,Acc1, Sel);
 		_ -> %% FIXME a bit more work
-		    io:format("fixme: split bits ~w\n", [Fmt#fmt.bits]),
+		    ?debug("fixme: split bits ~w\n", [Fmt#fmt.bits]),
 		    split_size(I+1,Size,FmtList,[Fmt|Acc],Sel)
 	    end;
 	false ->
@@ -1351,16 +1335,16 @@ diff_frames_(Pos,Format,FID,New,Old,Acc,State) when Pos =< tuple_size(Format) ->
 diff_frames_(_Pos,_Format,_FID,_New,_Old,Acc,_State) ->
     Acc.
 
-redraw_anim(State={S,_}) ->
+redraw_anim(Pixels,Area,State={S,_}) ->
     case ets:first(S#s.frame_anim) of
-	'$end_of_table' -> 
+	'$end_of_table' ->
 	    false;
 	First ->
-	    {Remove,Update} = redraw_anim_(First, [], [], State),
+	    {Remove,Update} = redraw_anim_(Pixels,Area,First, [], [], State),
 	    ets:delete(S#s.frame_anim, Remove),
 	    lists:foreach(
 	      fun(Key) ->
-		      %% fixme: use update couter
+		      %% FIXME: use update counter
 		      case ets:lookup(S#s.frame_anim, Key) of
 			  [] -> ok;
 			  [{_,Val}] ->
@@ -1371,189 +1355,78 @@ redraw_anim(State={S,_}) ->
 	    Update =/= []
     end.
 
-redraw_anim_(Key={_FID,0}, Remove, Update, State={S,_}) ->
+redraw_anim_(Pixels,Area,Key={_FID,0}, Remove, Update, State={S,_}) ->
     %% redraw the entire layout using position interpolation
     Next = ets:next(S#s.frame_anim, Key),
-    redraw_anim_(Next, Remove, Update, State);
-redraw_anim_(Key={FID,Pos}, Remove, Update, State={S,_}) ->
+    redraw_anim_(Pixels,Area,Next, Remove, Update, State);
+redraw_anim_(Pixels,Area,Key={FID,Pos}, Remove, Update, State={S,_}) ->
     [Frame] = ets:lookup(S#s.frame, FID),
     Next = ets:next(S#s.frame_anim, Key),
-    case redraw_pos(FID,Pos,Frame,State) of
+    case redraw_pos(Pixels,Area,FID,Pos,Frame,State) of
 	true -> %% remove
-	    redraw_anim_(Next, [Key|Remove], Update, State);
+	    redraw_anim_(Pixels,Area,Next, [Key|Remove], Update, State);
 	false ->
-	    redraw_anim_(Next, Remove, [Key|Update], State)
+	    redraw_anim_(Pixels,Area,Next, Remove, [Key|Update], State)
     end;
-redraw_anim_('$end_of_table', Remove, Update, _State) ->
+redraw_anim_(_Pixels,_Area,'$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
-%% no need to clip since we always draw scollbar if needed
-redraw(State={S,D}) ->
-    HBar = horizontal_scrollbar(State),
-    VBar = vertical_scrollbar(State),
-    epx:pixmap_fill(S#s.pixels, background_color(D)),
-
-    State1 = redraw_all(State),
-    State2 = draw_scrollbar(State1,scroll_vertical(S),HBar),
-    State3 = draw_scrollbar(State2,scroll_horizontal(S),VBar),
-    State4 = draw_top_bar(State3),
-    State5 = draw_left_bar(State4),
-    State6 = draw_right_bar(State5),
-    State7 = draw_bottom_bar(State6),
-    update_window(State7).
-
-%% top & bottom bar has priority over left and right...
-draw_top_bar(State={S,D}) ->
-    case bar(S) of
-	{_Left,_Right,0,_Bottom} ->
-	    State;
-	{_Left,_Right,Top,_Bottom} ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(top_bar_color(D)), 
-	    DrawRect = {0,0,S#s.width,Top},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    State
-    end.
-
-draw_bottom_bar(State={S,D}) ->
-    case bar(S) of
-	{_Left,_Right,_Top,0} ->
-	    State;
-	{_Left,_Right,_Top,Bottom} ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(bottom_bar_color(D)), 
-	    X0 = 0,
-	    Y0 = S#s.height-Bottom,
-	    DrawRect = {X0,Y0,S#s.width,Bottom},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    epx_gc:set_foreground_color({0,0,0}),
-	    epx_gc:set_fill_style(none),
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-
-	    %% +-----------+---------------+----------------+
-	    %% | Link: up  | BitRate: 250k | Status: busoff |
-	    %% +-----------+---------------+----------------+
-	    LinkString = case S#s.if_state of
-			     up -> "Link: up";
-			     down -> "Link: down"
-			 end,
-	    draw_text(X0+10, Y0, 100, Bottom-2, LinkString, State),
-
-	    BitRateString =
-		case S#s.bit_rate of
-		    error ->   "BitRate: error";
-		    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)
+%% +-----------+---------------+----------------+
+%% | Link: up  | BitRate: 250k | Status: busoff |
+%% +-----------+---------------+----------------+
+set_status(_State={S,_D}) ->
+    LinkState = case S#s.if_state of
+		    up -> "Link: up";
+		    down -> "Link: down"
 		end,
-	    draw_text(X0+110, Y0, 130, Bottom-2, BitRateString, State),
-
-	    ErrorString = 
-		case S#s.if_error of 
-		    [] -> "State: ok";
-		    Es -> "State: "++ format_error(Es)
-		end,
-	    draw_text(X0+240, Y0, 80, Bottom-2, ErrorString, State),
-	    State
-    end.
-
-draw_left_bar(State={S,D}) ->
-    case bar(S) of
-	{0,_,_,_} -> State;
-	{Left,_Right,Top,Bottom} ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(left_bar_color(D)),
-	    DrawRect = {0,Top,Left, S#s.height-(Top+Bottom)},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    State
-    end.
-
-draw_right_bar(State={S,D}) ->
-    case bar(S) of
-	{_Left,0,_Top,_Bottom} -> State;
-	{_Left,Right,Top,Bottom} ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(right_bar_color(D)),
-	    DrawRect = {S#s.width-Right,Top,Right,
-			S#s.height-(Top+Bottom)},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    State
-    end.
-
-draw_text(X0, Y0, _W, _H, Text, {S,_}) ->
-    X = X0,
-    GA = glyph_ascent(S),
-    Y = Y0+1+GA,
-    epx_gc:set_foreground_color(?TEXT_COLOR),
-    epx:draw_string(S#s.pixels, X, Y, Text).
+    LinkBitRate =
+	case S#s.bitrate of
+	    error ->   "BitRate: error";
+	    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)++"k"
+	end,
+    LinkFlags =
+	"Flags: " ++ 
+	lists:join(",", 
+		   lists:append(case S#s.listen_only of 
+				    true -> ["LISTEN"];
+				    _ -> []
+				end,
+				case S#s.fd of 
+				    true -> ["FD"];
+				    _ -> []
+				end)),
+    LinkError =
+	case S#s.if_error of 
+	    [] -> "State: ok";
+	    Es -> "State: "++ format_error(Es)
+	end,
+    Status = io_lib:format("~-12s ~-16s ~-16s ~-20s", 
+			   [LinkState,LinkFlags,LinkBitRate,LinkError]),
+    epxw:set_status_text(Status).
 
 format_error(ErrorList) ->
     string:join([atom_to_list(E) || E <- ErrorList], ",").
 
-
-%% define clip rect for content drawing depending on scrollbar information
-clip_rect(_State={S,_D}, none, none) ->
-    inside_rect(S,0,0,S#s.width,S#s.height);
-clip_rect(_State={S,_D}, none, right) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,0,0,S#s.width-Size,S#s.height);
-clip_rect(_State={S,_D}, none, left) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,Size,0,S#s.width-Size,S#s.height);
-clip_rect(_State={S,_D}, bottom, none) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,0,0,S#s.width,S#s.height-Size);
-clip_rect(_State={S,_D}, bottom, right) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,0,0,S#s.width-Size,S#s.height-Size);
-clip_rect(_State={S,_D}, bottom, left) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,Size,0,S#s.width-Size,
-		S#s.height-Size);
-clip_rect(_State={S,_D}, top, none) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,0,Size,S#s.width,S#s.height-Size);
-clip_rect(_State={S,_D}, top, right) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,0,Size,S#s.width-Size,S#s.height-Size);
-clip_rect(_State={S,_D}, top, left) ->
-    Size = scroll_bar_size(S),
-    inside_rect(S,Size,Size,
-		S#s.width-Size,S#s.height-Size).
-
-%% exclude side var from clip rect
-inside_rect(S,X,Y,W,H) ->
-    {Left,Right,Top,Bottom} = bar(S),
-    {X+Left, Y+Top, W - (Left+Right), H - (Top+Bottom)}.
-
-%% set clip to window content (exclude scrollbar area, and side bars)
-%% return Old clip rectangle
-clip_window_content(State={S,_D}) ->
-    SaveClip = epx:pixmap_info(S#s.pixels, clip),
-    HBar = horizontal_scrollbar(State),
-    VBar = vertical_scrollbar(State),
-    ClipRect = clip_rect(State, HBar, VBar),
-    epx:pixmap_set_clip(S#s.pixels, ClipRect),
-    SaveClip.
-
-%% use for restore saved clip rect
-set_clip_rect(_State={S,_D}, ClipRect) ->
-    epx:pixmap_set_clip(S#s.pixels, ClipRect).
-
 %% redraw all Layouts 
-redraw_all(State) ->
+redraw_all(Pixels, _Area, State) ->
     each_layout(fun(Layout, State1) ->
-			redraw_layout_(Layout, State1)
+			%% FIXME: check intersection with _Area
+			redraw_layout_(Pixels, Layout, State1)
 		end, State).
 
-redraw_(FID, State) ->
+redraw_(Pixels, _Area, FID, State) ->
     Layout = lookup_layout(FID, State),
-    redraw_layout_(Layout, State).
+    %% Fixme check intersection with Area
+    redraw_layout_(Pixels, Layout, State).
 
 redraw_fid(FID, State={_S,_D}) ->
-    SaveClip = clip_window_content(State),
-    Layout = lookup_layout(FID, State),
-    State1 = redraw_layout_(Layout, State),
-    set_clip_rect(State1, SaveClip),
-    repaint_layout(Layout, State1, 0).
+    epxw:draw(
+      fun(Pixels, _Area) ->
+	      Layout = lookup_layout(FID, State),
+	      %% Fixme check intersection with Area
+	      redraw_layout_(Pixels, Layout, State)
+      end).
+
 
 each_layout(Fun, State={S,_D}) ->
     Tab = S#s.frame_layout,
@@ -1566,7 +1439,6 @@ each_layout_(Fun, Tab, FID, State) ->
     State1 = Fun(Layout, State),
     each_layout_(Fun, Tab, ets:next(Tab, FID), State1).
 
-
 fold_layout(Fun, Acc, State={S,_D}) ->
     Tab = S#s.frame_layout,
     fold_layout_(Fun, Acc, Tab, ets:first(Tab), State).
@@ -1578,60 +1450,62 @@ fold_layout_(Fun, Acc, Tab, FID, State) ->
     Acc1 = Fun(Layout, Acc, State),
     fold_layout_(Fun, Acc1, Tab, ets:next(Tab, FID), State).
     
-redraw_layout_(Layout, State={S,_D}) ->
+redraw_layout_(Pixels, Layout, State={S,_D}) ->
     #layout{ id=FID, color=Color,format=FmtTuple} = Layout,
     %% Count = ets:lookup_element(S#s.frame_counter, FID, 2),
-    draw_layout_background(Layout, State),
+    draw_layout_background(Pixels, Layout),
     [Frame] = ets:lookup(S#s.frame, FID),
     case Layout#layout.style of
 	deleted ->
 	    State;
 	collapsed ->
-	    _Remove = redraw_cell(Layout#layout.x,Layout#layout.y,
+	    _Remove = redraw_cell(Pixels,
+				  Layout#layout.x,Layout#layout.y,
 				  FID,?ID_FMT_POSITION,Color,
 				  element(?ID_FMT_POSITION,FmtTuple),
 				  Frame,State),
 	    State;
 	_ ->
-	    redraw_cells(Layout#layout.x,Layout#layout.y,
+	    redraw_cells(Pixels,
+			 Layout#layout.x,Layout#layout.y,
 			 FID,1,Color,FmtTuple,Frame,State)
     end.
 
-redraw_cells(Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) when 
+redraw_cells(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) when 
       Pos =< tuple_size(FmtTuple) ->
     Fmt = element(Pos, FmtTuple),
-    _Remove = redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State),
-    redraw_cells(Lx,Ly,FID,Pos+1,Color,FmtTuple,Frame,State);
-redraw_cells(_Lx,_Ly,_FID,_Pos,_Color,_FmtTuple,_Frame,State) ->
+    _Remove = redraw_cell(Pixels, Lx,Ly,FID,Pos,Color,Fmt,Frame,State),
+    redraw_cells(Pixels,Lx,Ly,FID,Pos+1,Color,FmtTuple,Frame,State);
+redraw_cells(_Pixels,_Lx,_Ly,_FID,_Pos,_Color,_FmtTuple,_Frame,State) ->
     State.
 
-redraw_pos(FID,Pos,Frame,State) ->
+redraw_pos(Pixels,Area,FID,Pos,Frame,State) ->
     Layout = lookup_layout(FID, State),
+    %% FIXME: filter using Area!
     #layout{ x=Lx, y=Ly, color=Color, format=FmtTuple} = Layout,
     case Layout#layout.style of
 	collapsed ->
-	    redraw_pos(Lx,Ly,FID,?ID_FMT_POSITION,Color,FmtTuple,Frame,State);
+	    redraw_pos(Pixels,Lx,Ly,FID,?ID_FMT_POSITION,Color,FmtTuple,Frame,State);
 	deleted ->
 	    true;
 	_ ->
-	    redraw_pos(Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State)
+	    redraw_pos(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State)
     end.
 
-redraw_pos(Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) ->
+redraw_pos(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) ->
     if Pos > tuple_size(FmtTuple) ->
 	    true;
        true ->
 	    Fmt = element(Pos,FmtTuple),
-	    redraw_cell(Lx,Ly,FID,Pos,Color,Fmt,Frame,State)
+	    redraw_cell(Pixels,Lx,Ly,FID,Pos,Color,Fmt,Frame,State)
     end.
 
-redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
+redraw_cell(Pixels,Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
     #fmt {dx=Dx,dy=Dy,width=W,height=H,ci=Ci} = Fmt,
     Color = cell_color(Ci),
-    X0 = Lx+Dx, Y0 = Ly+Dy,
-    {X,Y} = get_rview_pos(D, X0, Y0),
+    X = Lx+Dx, Y = Ly+Dy,
     Anim = get_anim(FID,Pos,State),
-    {Remove,TextColor} = highlight(Anim,Color,{X,Y,W,H},State),
+    {Remove,TextColor} = highlight(Pixels,Anim,Color,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
     %% draw shape
     if Fmt#fmt.field =/= hide ->
@@ -1643,7 +1517,8 @@ redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 		true -> epx_gc:set_border_width(2);
 		_ -> epx_gc:set_border_width(0)
 	    end,
-	    epx:draw_rectangle(S#s.pixels, {X,Y,W,H}),
+	    epx:draw_rectangle(Pixels, {X,Y,W,H}),
+	    epxw:invalidate({X,Y,W,H}),
 	    epx_gc:set_border_width(0);
        true ->
 	    ok
@@ -1653,21 +1528,21 @@ redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
     if Fmt#fmt.field =:= data ->
 	    case Fmt#fmt.base of
 		2  ->
-		    epx:pixmap_put_pixels(S#s.pixels,
+		    epx:pixmap_put_pixels(Pixels,
 					  X+1,Y+1,6,7,argb,bin_icon(),blend),
-		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
+		    epx:draw_rectangle(Pixels,{X,Y,8,9});
 		8  ->
-		    epx:pixmap_put_pixels(S#s.pixels,
+		    epx:pixmap_put_pixels(Pixels,
 					  X+1,Y+1,6,7,argb,oct_icon(),blend),
-		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
+		    epx:draw_rectangle(Pixels,{X,Y,8,9});
 		16 ->
-		    epx:pixmap_put_pixels(S#s.pixels,
+		    epx:pixmap_put_pixels(Pixels,
 					  X+1,Y+1,6,7,argb,hex_icon(),blend),
-		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
+		    epx:draw_rectangle(Pixels,{X,Y,8,9});
 		10 ->
-		    epx:pixmap_put_pixels(S#s.pixels,
+		    epx:pixmap_put_pixels(Pixels,
 					  X+1,Y+1,6,7,argb,dec_icon(),blend),
-		    epx:draw_rectangle(S#s.pixels,{X,Y,8,9});
+		    epx:draw_rectangle(Pixels,{X,Y,8,9});
 		0  ->
 		    false;
 		c ->
@@ -1676,6 +1551,7 @@ redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
        true ->
 	    false
     end,
+    epx_gc:set_font(S#s.font),
     epx_gc:set_foreground_color(TextColor),
     case Fmt#fmt.field of
 	frequency -> %% frequency in K frames/s
@@ -1702,10 +1578,10 @@ redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	    GA = glyph_ascent(S),
 	    Ya = Y+1+GA,
 	    Offs = 2,
-	    epx:draw_string(S#s.pixels,X+Offs,Ya,String);
+	    epx:draw_string(Pixels,X+Offs,Ya,String);
 	hide ->
 	    epx:pixmap_copy_area(S#s.hide, 
-				 S#s.pixels,
+				 Pixels,
 				 0, 0, X+2, Y+2, 16, 16, [blend]);
 	_ ->
 	    String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
@@ -1714,7 +1590,7 @@ redraw_cell(Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	    Offs = if Fmt#fmt.base > 0, Fmt#fmt.field =:= data -> 6+2;
 		      true -> 2
 		   end,
-	    epx:draw_string(S#s.pixels, X+Offs, Ya, String)
+	    epx:draw_string(Pixels, X+Offs, Ya, String)
     end,
     Remove.
 
@@ -1744,246 +1620,27 @@ cell_color(I) ->
 	      ?COLOR(?HIGHLIGHT_COLOR13)  }).
 
 %% "delete" the layout by drawing layout background color
-draw_layout_background(Layout, State) ->
+draw_layout_background(Pixels, Layout) ->
     Color = Layout#layout.color,
-    draw_layout_rectangle(Layout, Color#color.background, State,
+    draw_layout_rectangle(Pixels, Layout, Color#color.background,
 			  Layout#layout.width).
 
 %% prepare layout by painting the layout background color
-clear_layout_background(Layout, State={S,D}) ->
-    Color = background_color(D),
-    draw_layout_rectangle(Layout, Color, State, S#s.width).
+clear_layout_background(Pixels, Layout, State={S,_D}) ->
+    Color = ?LAYOUT_BACKGROUND_COLOR,
+    draw_layout_rectangle(Pixels, Layout, Color, epxw:width()).
 
-draw_layout_rectangle(Layout, Color, _State={S,D}, Width) ->
+draw_layout_rectangle(Pixels, Layout, Color, Width) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color),
-    {X, Y} = get_rview_pos(D, Layout#layout.x, Layout#layout.y),
+    {X,Y} = {Layout#layout.x, Layout#layout.y},
     Rect = {X,Y,Width,Layout#layout.height},
-    epx:draw_rectangle(S#s.pixels, Rect).
-
-draw_scrollbar(State={S,_D}, left, HBar) ->
-    LeftBar = left_bar(S),
-    draw_vertical_scrollbar(State, LeftBar, HBar);
-draw_scrollbar(State={S,_D}, right, HBar) ->
-    Size = scroll_bar_size(S),
-    RightBar = right_bar(S),
-    draw_vertical_scrollbar(State,
-			    S#s.width-Size-RightBar,HBar);
-draw_scrollbar(State={S,_D}, top, VBar) ->
-    TopBar = top_bar(S),
-    draw_horizontal_scrollbar(State, TopBar, VBar);
-draw_scrollbar(State={S,_D}, bottom, VBar) ->
-    Size = scroll_bar_size(S),
-    BottomBar = bottom_bar(S),
-    draw_horizontal_scrollbar(State,
-			      S#s.height-Size-BottomBar,VBar).
-
-vertical_scrollbar(_State={S,D}) ->
-    WH = S#s.height,
-    %% VH = D#d.view_bottom - D#d.view_top,
-    VH = get_view_height(D),
-    if VH > WH ->  scroll_vertical(S);
-       true  -> none
-    end.
-	    
-draw_vertical_scrollbar(_State={S,D}, X0, HBar) ->
-    Size = scroll_bar_size(S),
-    HndlSize = scroll_hndl_size(S),
-    {_,_,TopBar,BottomBar} = bar(S),
-    WH = if HBar =:= none -> S#s.height - (TopBar+BottomBar);
-	    true -> S#s.height - (Size+TopBar+BottomBar)
-	 end,
-    %%VH = D#d.view_bottom - D#d.view_top,
-    VH = get_view_height(D),
-    if VH > WH ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(scroll_bar_color(D)),
-	    Y0 = case HBar of
-		     none   -> TopBar;
-		     bottom -> TopBar;
-		     top    -> TopBar+Size
-		 end,
-	    Rect = {X0,Y0,Size,WH},
-	    DrawRect = {X0,TopBar,Size,
-			S#s.height-(TopBar+BottomBar)},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    epx_gc:set_fill_color(scroll_hndl_color(D)),
-	    %% fixme: save scale factor? keep min HandleLength!
-	    Part = WH / VH,
-	    HandleLength = trunc(Part*WH),
-	    Top = get_view_ypos(D),
-	    HandlePos = trunc(Part*Top),
-	    Pad = (Size - HndlSize) div 2,
-	    HRect = {X0+Pad,Y0+HandlePos,HndlSize,HandleLength},
-	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
-	    {S, set_vscroll(D, Rect, HRect) };
-       true ->
-	    {S, set_vscroll(D, undefined, undefined) }
-    end.
-
-horizontal_scrollbar(_State={S,D}) ->
-    WW = S#s.width,
-    %% VW = D#d.view_right - D#d.view_left,
-    VW = get_view_width(D),
-    case VW > WW of
-	true -> scroll_horizontal(S);
-	false -> none
-    end.
-	    
-%% fixme remove vertical scrollbar if present!
-draw_horizontal_scrollbar({S,D}, Y0, VBar) ->
-    Size = scroll_bar_size(S),
-    HndlSize = scroll_hndl_size(S),
-    {LeftBar,RightBar,_,_} = bar(S),
-    WW = if VBar =:= none -> S#s.width - (LeftBar+RightBar);
-	    true -> S#s.width - (Size+LeftBar+RightBar)
-	 end,
-    %%VW = D#d.view_right - D#d.view_left,
-    VW = get_view_width(D),
-    if VW > WW ->
-	    epx_gc:set_fill_style(solid),
-	    epx_gc:set_fill_color(scroll_bar_color(D)),
-	    X0 = case VBar of
-		     none -> LeftBar;
-		     left -> LeftBar;
-		     right -> LeftBar+Size
-		 end,
-	    Rect = {X0,Y0,WW,Size},
-	    DrawRect = {LeftBar,Y0,S#s.width-(LeftBar+RightBar),
-			Size},
-	    epx:draw_rectangle(S#s.pixels, DrawRect),
-	    epx_gc:set_fill_color(scroll_hndl_color(D)),
-	    Part = WW / VW,
-	    %% D#d.view_xpos,
-	    Left = get_view_xpos(D), 
-	    HandleLength = trunc(Part*WW),
-	    HandlePos = trunc(Part*Left),
-	    Pad = (Size - HndlSize) div 2,
-	    HRect = {HandlePos,Y0+Pad,HandleLength,HndlSize},
-	    epx:draw_roundrect(S#s.pixels,HRect,5,5),
-	    {S, set_hscroll(D, Rect, HRect)};
-       true ->
-	    {S, set_hscroll(D, undefined, undefined) }
-    end.
+    epx:draw_rectangle(Pixels, Rect).
 
 
-%% profile acces
-background_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.background_color).
-
-top_bar_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.top_bar_color).
-
-left_bar_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.left_bar_color).
-
-right_bar_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.right_bar_color).
-
-bottom_bar_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.bottom_bar_color).
-
-scroll_bar_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.scroll_bar_color).
-
-scroll_hndl_color(#d { content = WD }) ->
-    P = WD#window_content.profile,
-    epx_profile:color(P#window_profile.scheme,
-		      P#window_profile.scroll_hndl_color).
-
-get_view_xpos(#d { content = WD }) -> WD#window_content.view_xpos.
-get_view_ypos(#d { content = WD }) -> WD#window_content.view_ypos.
-
-get_view_pos(#d { content = WD }, X, Y) -> 
-    {WD#window_content.view_xpos+X,WD#window_content.view_ypos+Y}.
-
-get_rview_pos(#d { content = WD }, X, Y) -> 
-    { X-WD#window_content.view_xpos, Y-WD#window_content.view_ypos}.
-
-set_view_xpos(D = #d{ content = WD}, X) ->
-    D#d { content = WD#window_content { view_xpos = X }}.
-set_view_ypos(D = #d{ content = WD}, Y) ->
-    D#d { content = WD#window_content { view_ypos = Y }}.
-set_view_pos(D = #d{ content = WD}, X, Y) ->
-    D#d { content = WD#window_content { view_xpos = X, view_ypos = Y }}.
-
-get_view_left(#d { content = WD }) -> WD#window_content.view_left.
-get_view_right(#d { content = WD }) -> WD#window_content.view_right.
-get_view_top(#d { content = WD }) -> WD#window_content.view_top.
-get_view_bottom(#d { content = WD }) -> WD#window_content.view_bottom.
-get_view_width(#d { content = WD }) ->
-    WD#window_content.view_right - WD#window_content.view_left.
-get_view_height(#d { content = WD }) ->
-    WD#window_content.view_bottom - WD#window_content.view_top.
-
-set_view_rect(D=#d { content = WD }, L, R, T, B) ->    
-    D#d { content = WD#window_content { view_left = L,
-					view_right = R,
-					view_top   = T,
-					view_bottom = B }}.
-
-get_hscroll(#d { content = WD }) -> WD#window_content.hscroll.
-get_hhndl(#d { content = WD }) -> WD#window_content.hhndl.
-get_vscroll(#d { content = WD }) -> WD#window_content.vscroll.
-get_vhndl(#d { content = WD }) -> WD#window_content.vhndl.
-
-set_hscroll(D=#d { content = WD }, Rect, Hndl) ->
-    D#d { content = WD#window_content { hscroll = Rect,
-					hhndl = Hndl }}.
-set_vscroll(D=#d { content = WD }, Rect, Hndl) ->
-    D#d { content = WD#window_content { vscroll = Rect,
-					vhndl = Hndl }}.
-
-get_motion(#d { content = WD }) -> WD#window_content.motion.
-
-set_motion(D=#d { content = WD }, Motion) ->    
-    D#d { content = WD#window_content { motion = Motion }}.
-    
-
-bar(#s { winfo = WI }) ->
-    #window_info { left_bar = L, right_bar = R,
-		   top_bar = T, bottom_bar = B } = WI,
-    {L, R, T, B}.
-
-top_bar(#s { winfo = WI }) -> WI#window_info.top_bar.
-left_bar(#s { winfo = WI }) -> WI#window_info.left_bar.
-right_bar(#s { winfo = WI }) -> WI#window_info.right_bar.
-bottom_bar(#s { winfo = WI }) -> WI#window_info.bottom_bar.
-
-top_offset(#s { winfo = WI }) -> 
-    WI#window_info.top_offset + WI#window_info.top_bar.
-left_offset(#s { winfo = WI }) -> 
-    WI#window_info.left_offset + WI#window_info.left_bar.
-right_offset(#s { winfo = WI }) -> 
-    WI#window_info.right_offset + WI#window_info.right_bar.
-bottom_offset(#s { winfo = WI }) -> 
-    WI#window_info.bottom_offset + WI#window_info.bottom_bar.
-
-scroll_hndl_size(#s { winfo = WI }) -> WI#window_info.scroll_hndl_size.
-scroll_bar_size(#s { winfo = WI }) -> WI#window_info.scroll_bar_size.
-
-scroll_horizontal(#s { winfo = WI }) -> WI#window_info.scroll_horizontal.
-scroll_vertical(#s { winfo = WI }) -> WI#window_info.scroll_vertical.
-
-scroll_xstep(#s { winfo = WI }) -> WI#window_info.scroll_xstep.
-scroll_ystep(#s { winfo = WI }) -> WI#window_info.scroll_ystep.
-
-glyph_width(#s { winfo = WI }) -> WI#window_info.glyph_width.
-glyph_height(#s { winfo = WI }) -> WI#window_info.glyph_height.
-glyph_ascent(#s { winfo = WI }) -> WI#window_info.glyph_ascent.
-glyph_descent(#s { winfo = WI }) -> WI#window_info.glyph_descent.
+glyph_width(S) -> S#s.glyph_width.
+%%glyph_height(S) -> S#s.glyph_height.
+glyph_ascent(S) -> S#s.glyph_ascent.
 
 get_anim(FID,Pos,{S,_}) ->
     case ets:lookup(S#s.frame_anim, {FID,Pos}) of
@@ -1992,20 +1649,20 @@ get_anim(FID,Pos,{S,_}) ->
     end.
 
 %% draw hightlight background return text color and flag to signal remove
-highlight(-1, Color, _Rect, _State) ->
+highlight(_Pixels,-1, Color, _Rect, _State) ->
     {true, Color#color.foreground};
-highlight(0, Color, Rect, _State={S,_}) ->
+highlight(Pixels,0, Color, Rect, _State) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color#color.background),
-    epx:draw_rectangle(S#s.pixels,Rect),
+    epx:draw_rectangle(Pixels,Rect),
     {true,  Color#color.foreground};
-highlight(Anim, Color, Rect, _State={S,_}) ->
+highlight(Pixels,Anim, Color, Rect, _State) ->
     B1 = Color#color.background1,
     B0 = Color#color.background,
     B  = blend(Anim, B1, B0),
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(B),
-    epx:draw_rectangle(S#s.pixels,Rect),
+    epx:draw_rectangle(Pixels,Rect),
     T1 = Color#color.foreground1,
     T0 = Color#color.foreground,
     T  = blend(Anim, T1, T0),
@@ -2056,24 +1713,13 @@ extend_bits(Data, MinSize) ->
     Pad = MinSize - Size,
     <<Data/bitstring, 0:Pad>>.
 
-repaint_layout(Layout, State) ->
-    repaint_layout(Layout, State, 0).
-repaint_layout(Layout, State={_S,D}, MinW) ->
-    #layout { x=X0, y=Y0, width=W0, height=H0 } = Layout,
-    W1 = max(W0,MinW),
-    H1 = H0,
-    %% X1 = X0 - D#d.view_xpos,
-    %% Y1 = Y0 - D#d.view_ypos,
-    {X1,Y1} = get_rview_pos(D, X0, Y0),
-    update_window(State, {X1,Y1,W1,H1}).
-    
-update_window(State={S,_D},_R={X,Y,W,H}) ->
-    epx:pixmap_draw(S#s.pixels, S#s.window, X, Y, X, Y, W, H),
-    epx:sync(S#s.window),
-    State.
+layout_rect(#layout { x=X0, y=Y0, width=W0, height=H0 }) ->
+    {X0,Y0,W0,H0}.
 
-update_window(State={S,_D}) ->
-    update_window(State, {0,0,S#s.width,S#s.height}).
+invalidate_layout(Layout, State) ->
+    #layout { x=X0, y=Y0, width=W0, height=H0 } = Layout,
+    epxw:invalidate({X0,Y0,W0,H0}),
+    State.
 
 %% Layout is to be "delete", 
 %% reposition layouts below the Layout, update next_pos
@@ -2121,17 +1767,10 @@ position_deleted(Layout, _State) ->
     Layout#layout { x=0,y=0,width=0,height=0 }.
 
 position_to_coord(Pos, {S,_D}) when is_integer(Pos), Pos > 0 ->
-    TopOffset = top_offset(S),
-    Y = TopOffset + (Pos-1)*(S#s.row_height+S#s.row_pad),
-    X = left_offset(S),
-    {X,Y}.
+    {0, (Pos-1)*(S#s.row_height+S#s.row_pad)}.
 
 position_normal(Layout, State={S,_D}) ->
     {X,Y} = position_to_coord(Layout#layout.pos, State),
-%%    TopOffset = top_offset(S),
-%%    I = Layout#layout.pos-1,
-%%    Y = TopOffset + I*(S#s.row_height+S#s.row_pad),
-%%    X = left_offset(S),
     {Dx,FmtTuple} = 
 	position_cells(0, 1, Layout#layout.format, [], State),
     Width = Dx-1,
@@ -2139,7 +1778,6 @@ position_normal(Layout, State={S,_D}) ->
     Layout#layout { x=X,y=Y,width=Width,height=Height,format=FmtTuple }.
 
 position_collapsed(Layout, _State={S,_D}) ->
-    BottomOffset = bottom_offset(S),
     J = Layout#layout.pos-1,
     Fmt = element(?ID_FMT_POSITION, Layout#layout.format), %% FIXME!
     Row = 1,  %% calculate row from bottom left to right
@@ -2148,8 +1786,8 @@ position_collapsed(Layout, _State={S,_D}) ->
     GW = glyph_width(S),
     Wide   = 8*GW + 4,
     Width  = Num*GW + 4,
-    X = left_offset(S) + J*Wide,
-    Y = S#s.height - Row*Height - BottomOffset,
+    X = J*Wide,
+    Y = epxw:height() - Row*Height,
     Fmt1 = Fmt#fmt { dx=0, dy=0, width=Width, height=Height },
     FmtTuple = setelement(?ID_FMT_POSITION, Layout#layout.format, Fmt1),
     Layout#layout { x=X,y=Y,width=Wide+2,height=Height,format=FmtTuple}.
@@ -2286,57 +1924,48 @@ lookup_layout(FID, _State={S,_D}) ->
     [L] = ets:lookup(S#s.frame_layout, FID),  %% lookup element
     L.
 
-update_layout(OldLayout, NewLayout, State={S,D}) ->
-    SaveClip = clip_window_content(State),
-    clear_layout_background(OldLayout, State),
+update_layout(OldLayout, NewLayout, State={_S,_D}) ->
+    Pixels = epxw:pixels(),
+    clear_layout_background(Pixels, OldLayout, State),
     Layout = position_layout(NewLayout, State),
     State1 = insert_layout(Layout, State),
-    State2 = redraw_layout_(Layout, State1),
-
-    set_clip_rect(State2, SaveClip),
-
-    MinW = case get_vscroll(D) of
-	       undefined ->
-		   S#s.width;
-	       _ ->
-		   S#s.width -  scroll_bar_size(S)
-	   end,
+    State2 = redraw_layout_(Pixels, Layout, State1),
     if OldLayout#layout.x =/= Layout#layout.x;
        OldLayout#layout.y =/= Layout#layout.y;
        OldLayout#layout.width =/= Layout#layout.width;
        OldLayout#layout.height =/= Layout#layout.height ->
 	    %% if layout changed repaint old area
-	    repaint_layout(OldLayout, State2, MinW);
+	    invalidate_layout(OldLayout, State2);
        true ->
 	    ok
     end,
-    repaint_layout(Layout, State2, MinW).
+    invalidate_layout(Layout, State2).
 
-insert_layout(Layout, _State={S,D}) ->
+
+insert_layout(Layout, State={S,D}) ->
     ets:insert(S#s.frame_layout, Layout),
-    L = min(Layout#layout.x, get_view_left(D)),
-    R = max(Layout#layout.x + Layout#layout.width, get_view_right(D)),
-    T = min(Layout#layout.y, get_view_top(D)),
-    B = max(Layout#layout.y + Layout#layout.height, get_view_bottom(D)),
-    {S, set_view_rect(D, L, R, T, B)}.
+    epxw:set_view_size(Layout#layout.x+Layout#layout.width,
+		       Layout#layout.y+Layout#layout.height),
+    State.
 
-layout_from_coord(Xy, _State={S,_D}) ->
+
+layout_from_coord(XY, _State={S,_D}) ->
     Tab = S#s.frame_layout,
     Key = ets:first(Tab),
-    layout_from_coord_(Xy, Tab, Key).
+    layout_from_coord_(XY, Tab, Key).
 
-layout_from_coord_(_Xy, _Tab, '$end_of_table') ->
+layout_from_coord_(_XY, _Tab, '$end_of_table') ->
     false;
-layout_from_coord_(Xy, Tab, FID) ->
+layout_from_coord_(XY, Tab, FID) ->
     case ets:lookup(Tab, FID) of
 	[] ->
-	    layout_from_coord_(Xy, Tab, ets:next(Tab, FID));
+	    layout_from_coord_(XY, Tab, ets:next(Tab, FID));
 	[Layout=#layout{x=X1,y=Y1,width=W,height=H}] ->
-	    {X,Y} = Xy,
+	    {X,Y} = XY,
 	    if X >= X1, Y >= Y1, X < X1+W, Y < Y1+H ->
 		    Layout;
 	       true ->
-		    layout_from_coord_(Xy, Tab, ets:next(Tab, FID))
+		    layout_from_coord_(XY, Tab, ets:next(Tab, FID))
 	    end
     end.
 
@@ -2421,139 +2050,41 @@ hide_pixels() ->
     epx:draw_line(Pix, {11,3}, {3,11}),
     Pix.
 
-flush_wheel(Window) ->
-    receive
-	{epx_event,Window,{_,[wheel_down],_}} ->
-	    flush_wheel(Window);
-	{epx_event,Window,{_,[wheel_left],_}} ->
-	    flush_wheel(Window);
-	{epx_event,Window,{_,[wheel_right],_}} ->
-	    flush_wheel(Window);
-	{epx_event,Window,{_,[wheel_up],_}} ->
-	    flush_wheel(Window)
-    after 0 ->
-	    ok
-    end.
-
-flush_configure(Win, Rect) ->
-    receive
-	{epx_event, Win, {configure, Rect1}} ->
-	    flush_configure(Win, Rect1)
-    after 0 ->
-	    Rect
-    end.
-
-flush_expose(Win, Rect) ->
-    receive
-	{epx_event, Win, {expose, Rect1}} ->
-	    flush_expose(Win, Rect1)
-    after 0 ->
-	    Rect
-    end.
-
-flush_motion(Win) ->
-    receive
-	{epx_event, Win, {motion, _Mod, _Pos}} ->
-	    flush_motion(Win)
-    after 0 ->
-	    ok
-    end.
-
-%% load #profile from environment
-load_profile(E) ->
-    D = #profile{},
-    %% Special case
-    S = ?ld(scheme, E, D),
-    #profile {
-       scheme = S,
-       screen_color    = ?ldc(S,screen_color, E, D),
-       selection_alpha = ?ld(selection_alpha, E, D),
-       selection_color = ?ldc(S,selection_color, E, D),
-       selection_border_width = ?ld(selection_border_width, E, D),
-       selection_border_color = ?ldc(S,selection_border_color, E, D),
-       menu_font_name = ?ld(menu_font_name, E, D),
-       menu_font_size = ?ld(menu_font_size, E, D),
-       menu_font_color = ?ldc(S,menu_font_color,E,D),
-       menu_background_color = ?ldc(S,menu_background_color,E,D),
-       menu_border_color = ?ldc(S,menu_border_color,E,D),
-       
-       window_font_name = ?ld(window_font_name, E, D),
-       window_font_size = ?ld(window_font_size, E, D),
-       window_font_color = ?ldc(S, window_font_color, E, D),
-       scroll_bar_color  = ?ldc(S, scroll_bar_color, E, D),
-       scroll_hndl_color = ?ldc(S, scroll_hndl_color, E, D),
-       scroll_horizontal = ?ld(scroll_horizontal, E, D),
-       scroll_vertical   = ?ld(scroll_vertical, E, D),
-       top_bar_color     = ?ldc(S, top_bar_color, E, D),
-       left_bar_color    = ?ldc(S, left_bar_color, E, D),
-       right_bar_color   = ?ldc(S, right_bar_color, E, D),
-       bottom_bar_color  = ?ldc(S, bottom_bar_color, E, D)
-      }.
-
-create_menu_profile(Profile) ->
-    #menu_profile {
-       scheme           = Profile#profile.scheme,
-       font_name        = Profile#profile.menu_font_name,
-       font_size        = Profile#profile.menu_font_size,
-       font_color       = Profile#profile.menu_font_color,
-       background_color = Profile#profile.menu_background_color,
-       border_color     = Profile#profile.menu_border_color
-      }.
-
-create_window_profile(Profile) ->
-    #window_profile {
-       scheme           = Profile#profile.scheme,
-       font_name        = Profile#profile.window_font_name,
-       font_size        = Profile#profile.window_font_size,
-       font_color       = Profile#profile.window_font_color,
-       background_color = Profile#profile.screen_color,
-       scroll_bar_color = Profile#profile.scroll_bar_color,
-       scroll_hndl_color = Profile#profile.scroll_hndl_color,
-       top_bar_color     = Profile#profile.top_bar_color,
-       left_bar_color    = Profile#profile.left_bar_color,
-       right_bar_color   = Profile#profile.right_bar_color,
-       bottom_bar_color  = Profile#profile.bottom_bar_color
-      }.
-
-
-resize_pixmap(undefined, W, H) ->
-    Pixmap = next_pixmap(W,H),
-    epx:pixmap_attach(Pixmap),
-    Pixmap;
-resize_pixmap(Pixmap, W, H) ->
-    case epx:pixmap_info(Pixmap,[width,height]) of
-	[{width,PW},{height,PH}] when PW < W; PH < H ->
-	    epx:pixmap_detach(Pixmap),
-	    Pixmap1 = next_pixmap(W,H),
-	    epx:pixmap_attach(Pixmap1),
-	    Pixmap1;
-	_ ->
-	    Pixmap
-    end.
-
-next_pixmap(W,H) ->
-    NPW = 1 bsl ceil(math:log2(W)),
-    NPH = 1 bsl ceil(math:log2(H)),
-    epx:pixmap_create(NPW, NPH, argb).
-
 %%
 %% GET and SET can bitrate on the can_usb backend
 %%
-get_can_usb_bitrate(Pid) when is_pid(Pid) ->
-    can_usb:get_bitrate(Pid).
+setopts(#if_can{if_mod=Mod,if_pid=Pid}, Opts) when is_pid(Pid), is_list(Opts) ->
+    Mod:setopts(Pid, Opts);
+setopts(_, _Opts) ->
+    error.
 
-set_can_usb_bitrate(Pid, BitRate) when is_pid(Pid) ->
-    can_usb:set_bitrate(Pid, BitRate).
-
-get_can_usb_if() ->
-    get_can_usb_if_(can_router:interfaces()).
+getopts(#if_can{if_mod=Mod,if_pid=Pid}, Opts) when is_pid(Pid), is_list(Opts) ->
+    Mod:getopts(Pid, Opts);
+getopts(_, Opts) ->
+    [{Opt,undefined} || Opt <- Opts].
+    
+get_can_if() ->
+    get_can_if_(can_router:interfaces()).
 
 %% fixme export can_if from can_router!?
-get_can_usb_if_([{can_if,IfPid,IfID,_Name,_Mon,
-		  _Param=#{mod:=can_usb},
-		  _Atime,_State} | _IFs]) ->
-    {ok,{IfID,IfPid}};
-get_can_usb_if_([_|IFs]) ->
-    get_can_usb_if_(IFs);
-get_can_usb_if_([]) ->
-    {error, no_backend_found}.
+get_can_if_(IFs) ->
+    get_can_if_(IFs, undefined).
+
+get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
+	      _Param=#{mod:=can_usb},
+	      _Atime,_State} | _IFs], _Default) ->
+    {ok,#if_can{if_mod=can_usb,if_id=IfID,if_pid=IfPid}};
+get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
+	      _Param=#{mod:=can_sock},
+	      _Atime,_State} | _IFs], _Default) ->
+    {ok,#if_can{if_mod=can_sock,if_id=IfID,if_pid=IfPid}};
+get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
+	      _Param=#{mod:=Mod},
+	      _Atime,_State}|IFs], undefined) ->
+    get_can_if_(IFs, #if_can{if_mod=Mod,if_id=IfID,if_pid=IfPid});
+get_can_if_([_|IFs], Default) ->
+    get_can_if_(IFs, Default);
+get_can_if_([], undefined) ->
+    {error, no_backend_found};
+get_can_if_([], Default) ->
+    {ok, Default}.

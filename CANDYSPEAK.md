@@ -14,7 +14,7 @@ Currently Candy saves an expression on the following form
 This should read
 
     Output is on if bit 0x40 is set in the byte 2 (counting from 0)
-	in frame 0x128
+	in frame 0x218
 	Output is off if bit 0x40 is cleared in the byte 2
 	
 It is also possible to specify multiple bits in the same byte
