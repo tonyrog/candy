@@ -83,7 +83,6 @@
 	 menu_border_color             = green
 	}).
 
-
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
@@ -174,8 +173,9 @@
 	 bitrates = list_to_tuple(?DEFAULT_BITRATES),
 	 datarate = undefined,
 	 datarates =  list_to_tuple(?DEFAULT_DATARATES),
-	 
+
 	 if_state  = down,            %% up | down
+	 if_param  = #{},             %% current interface params (when up)
 	 if_error  = [],              %% interface error code list
 	 if_can :: #if_can{},
 	 nrows = 30 :: integer(),     %% number or rows shown
@@ -298,7 +298,6 @@ init(Options) ->
 
     Profile = #profile{},
     MProfile = create_menu_profile(Profile),
-
 
     Window = epxw:window(),
     epx:window_enable_events(Window, no_auto_repeat),
@@ -428,8 +427,8 @@ draw(Pixels, Area, State) ->
     State.
 
 
-menu({menu,Pos}, State={S,_D}) ->
-    ?verbose("MENU: Pos = ~p\n", [Pos]),
+menu({menu,_Pos}, State={S,_D}) ->
+    ?verbose("MENU: Pos = ~p\n", [_Pos]),
     MProfile = S#s.menu_profile,
     Menu =
 	case S#s.if_can of
@@ -771,38 +770,44 @@ handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
 %%
 %% Interface has changed, pick up new message
 %%
-handle_info({if_state_event, {ID,_IfEnt}, IfState}, {S,D}) ->
-    ?verbose("Got if_state if=~w, ifstate=~w\n", [ID,IfState]),
+handle_info({if_state_event, {ID,_IfEnt}, IfParam}, {S,D}) when 
+      is_map(IfParam) ->
+    ?verbose("Got if_state if=~w, param=~p\n", [ID,IfParam]),
+    if ID =:= (S#s.if_can)#if_can.if_id, S#s.if_state =:= up ->
+	    S1 = S#s { if_param = maps:merge(S#s.if_param, IfParam) },
+	    {noreply, {S1,D}};
+       true -> %% ignore
+	    {noreply, {S,D}}
+    end;
+handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
+    ?verbose("if_state_event(~w): id=~w, ifparam=~p, ifstate=~w\n", 
+	     [S#s.if_state,ID,IfParam,IfState]),
     S1 = 
 	if IfState =:= down, ID =:= (S#s.if_can)#if_can.if_id ->
-		S#s { if_state = down };
+		can_router:if_state_supervision(refresh),
+		S#s { if_state = down,
+		      if_param = #{},
+		      if_can = #if_can{} };
 	   IfState =:= up, S#s.if_state =:= down ->
-		{IfState1,
-		 IF,
-		 [{listen_only,LISTEN},{fd,FD},
-		  {bitrate,BitRate}, {bitrates, BitRates},
-		  {datarate,DataRate}, {datarates,DataRates}]} =
-		    case get_can_if() of
-			{ok,IFCan=#if_can{if_mod=Mod,if_pid=Pid}} when 
-			      is_pid(Pid) ->
-			    {up,IFCan, Mod:getopts(Pid, [listen_only, fd, 
-							 bitrate, bitrates, 
-							 datarate, datarates])};
-			{error,_} ->
-			    {down,
-			     #if_can{if_mod=undefined,if_id=0,if_pid=undefined},
-			     [{listen_only, undefined},
-			      {fd, undefined},
-			      {bitrate, hd(?DEFAULT_DATARATES)},
-			      {bitrates, ?DEFAULT_DATARATES},
-			      {datarate, undefined},
-			      {datarates, ?DEFAULT_DATARATES}]}
-		    end,
-		
-		S#s { if_state=IfState1, if_can=IF,
-		      listen_only=LISTEN,fd=FD,
-		      bitrate=BitRate, bitrates=sort_rates(BitRates),
-		      datarate=DataRate, datarates=sort_rates(DataRates) };
+		%% new interface
+		LISTEN = maps:get(listen_only, IfParam),
+		FD = maps:get(fd, IfParam),
+		BitRate = maps:get(bitrate, IfParam),
+		BitRates = maps:get(bitrates, IfParam),
+		DataRate = maps:get(datarate, IfParam),
+		DataRates = maps:get(datarates, IfParam),
+		Mod = maps:get(mod, IfParam),
+		Pid = maps:get(pid, IfParam),
+		IFCan = #if_can{if_mod=Mod, if_id = ID, if_pid=Pid},
+		S#s { if_state = IfState, 
+		      if_can = IFCan,
+		      if_param = IfParam,
+		      listen_only =LISTEN,
+		      fd=FD,
+		      bitrate=BitRate, 
+		      bitrates=sort_rates(BitRates),
+		      datarate=DataRate,
+		      datarates=sort_rates(DataRates) };
 	   true ->
 		S
 	end,
@@ -1402,7 +1407,14 @@ set_status(_State={S,_D}) ->
 	end,
     Status = io_lib:format("~-12s ~-16s ~-16s ~-20s", 
 			   [LinkState,LinkFlags,LinkBitRate,LinkError]),
-    epxw:set_status_text(Status).
+    epxw:set_status_text(Status),
+
+    WindowTitle = case maps:get(device_name, S#s.if_param, "") of
+		      "" -> "Candy";
+		      DeviceName -> "Candy@"++DeviceName
+		  end,
+    Window = epxw:window(),
+    epx:window_adjust(Window, [{name, WindowTitle}]).
 
 format_error(ErrorList) ->
     string:join([atom_to_list(E) || E <- ErrorList], ",").
