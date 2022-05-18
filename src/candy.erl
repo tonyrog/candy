@@ -27,6 +27,7 @@
 %% API
 -export([start/0, start/1]).
 -export([status/0]).
+-export([install/0]).
 -export([start_link/0, start_link/1]).
 
 -export([init/1,
@@ -211,6 +212,10 @@
 
 status() ->
     io:format("candy is running\n").
+
+%% appimage? install target
+install() ->
+    can:install().
 
 %%%===================================================================
 %%% API
