@@ -25,10 +25,12 @@
 -behaviour(epxw).
 
 %% API
+-export([start0/0]).  %% make app image target
 -export([start/0, start/1]).
 -export([status/0]).
--export([install/0]).
--export([start_link/0, start_link/1]).
+-export([install/0, install_cmds/0]).
+
+%% -export([start_link/0, start_link/1]).
 
 -export([init/1,
 	 configure/2,
@@ -104,6 +106,13 @@
 
 -define(FONT_NAME, "Courier New").
 -define(FONT_SIZE, 14).
+
+
+-define(APP, ?MODULE).
+-define(APPSTR, ?MODULE_STRING).
+-define(DOTAPP, [$.|?APPSTR]).
+-define(APPPNG, ?APPSTR++".png").
+-define(APPDSK, ?APPSTR++".desktop").
 
 -define(verbose(F,A), ok).
 %% -define(verbose(F,A), io:format((F),(A))).
@@ -213,23 +222,128 @@
 status() ->
     io:format("candy is running\n").
 
-%% appimage? install target
+askpass() ->
+    filename:join(code:priv_dir(epx), "epx_askpass").
+
+%% runtime install, first time for APPIMAGE
 install() ->
-    can:install().
+    APPIMAGE = os:getenv("APPIMAGE",undefined),
+    if APPIMAGE =:= undefined ->
+	    ok;    
+       true ->
+	    Home = os:getenv("HOME"),
+	    {ok,Vsn} = application:get_key(?APP, vsn),
+	    VsnNL = Vsn++"\n",
+	    case file:read_file(filename:join([Home,?DOTAPP,"installed"])) of
+		{ok,BinVsn} ->
+		    case binary_to_list(BinVsn) of
+			Vsn -> ok; %% already installed
+			VsnNL -> ok; %% already installed
+			_ -> install_(Home, Vsn)
+		    end;
+		{error,enoent} -> install_(Home,Vsn)
+	    end
+    end.
+
+%% root should during real run be candy.AppDir
+%% config is set to candy.AppDir/candy.config
+install_(Home,Vsn) ->
+    APPIMAGE = os:getenv("APPIMAGE", ""),
+    APPDIR = os:getenv("APPDIR",""),
+    {User0,Admin0} = can:install_cmds(),
+    {User1,Admin1} = install_cmds_(Home,Vsn),
+    Dir = filename:join(Home,?DOTAPP),
+    file:make_dir(Dir),
+    os:cmd(string:join(User0++User1, ";")),
+
+    log_commands(Dir,["# APPIMAGE", ["echo ",APPIMAGE]]),
+    log_commands(Dir,["# APPDIR", ["echo ",APPDIR]]),
+    log_commands(Dir,["# USER0"|User0]),
+    log_commands(Dir,["# USER1"|User1]),
+    if Admin0 =:= [], Admin1 =:= [] ->
+	    ok;
+       true ->
+	    os:cmd("export SUDO_ASKPASS="++askpass()++"; sudo -A sh -c \""++
+		       string:join(Admin0++Admin1, ";")++"\""),
+	    log_commands(Dir,["# ADMIN0"|Admin0]),
+	    log_commands(Dir,["# ADMIN1"|Admin1]),
+	    ok
+    end.
+
+install_cmds() ->
+    Home = os:getenv("HOME"),
+    {ok,Vsn} = application:get_key(?APP, vsn),
+    install_cmds_(Home,Vsn).
+
+install_cmds_(Home,Vsn) ->
+    APPDIR = case os:getenv("APPDIR") of
+		 false -> "";
+		 AppD -> AppD
+	     end,
+    APPIMG = case os:getenv("APPIMAGE") of
+		 false -> "";
+		 AppI -> AppI
+	     end,
+    AppDir = case init:get_argument(root) of
+		 {ok,[[APPDIR]]} ->
+		     APPDIR;
+		 _ -> 
+		     code:priv_dir(candy)
+	     end,
+    {[lists:flatten(Cmd)||Cmd <- install_cmd_(Home, Vsn, AppDir,APPIMG)],
+     ["updatedb"]}.
+
+install_cmd_(Home, Vsn, AppDir,AppImg) ->
+    IconsDir = filename:join([AppDir,"desktop_icons","hicolor"]),
+    case file:list_dir(IconsDir) of
+	{ok,Sizes} ->
+	    lists:append(
+	      [
+	       [
+		["mkdir -p ", filename:join([Home,".local","share","icons","hicolor",Size,"apps"])],
+		["cp ", 
+		 filename:join([AppDir,"desktop_icons","hicolor",Size,
+				"apps",?APPPNG])," ",
+		 filename:join([Home,".local","share","icons","hicolor",Size,
+				"apps",?APPPNG])]] || Size <- Sizes]);
+	_ ->
+	    [["echo icondir=",IconsDir]]
+    end ++
+    [
+     ["cat ", filename:join(AppDir, ?APPDSK), 
+      " | sed 's%APPIMAGE%",AppImg,"%' > ",
+      filename:join([Home, "Desktop", string:titlecase(?APPDSK)])],
+     ["mkdir -p ", filename:join(Home,?DOTAPP)],
+     ["echo \"", Vsn, "\" > ", filename:join([Home,?DOTAPP,"installed"])]
+    ].
+
+%% log each command, one by one
+log_commands(Dir, [Cmd|Cmds]) ->
+    {ok,Fd} = file:open(filename:join(Dir,"install_log.txt"), [write,append]),
+    io:put_chars(Fd, [Cmd,"\n"]),
+    file:close(Fd),
+    log_commands(Dir, Cmds);
+log_commands(_Dir, []) ->
+    ok.
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+%% called from make appimage 
+start0() ->
+    application:load(?APP),
+    application:ensure_all_started(?APP),
+    start_it([], start).
+
 start() ->
     start([]).
 start(Options) ->
-    (catch error_logger:tty(false)),
+    application:load(?APP),
+    install(),
     low_latency(),
-    application:ensure_all_started(?MODULE),
+    application:ensure_all_started(?APP),
     start_it(Options, start).
-
-
-%%    gen_server:start(?MODULE, Options, []).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -238,13 +352,13 @@ start(Options) ->
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link() ->
-    start_link([]).
-start_link(Options) ->
-    (catch error_logger:tty(false)),
-    low_latency(),
-    application:ensure_all_started(?MODULE),
-    start_it(Options, start_link).
+%% start_link() ->
+%%     start_link([]).
+%% start_link(Options) ->
+%%     (catch error_logger:tty(false)),
+%%     low_latency(),
+%%     application:ensure_all_started(?MODULE),
+%%     start_it(Options, start_link).
 
 start_it(Options, Start) ->
     epxw:Start(?MODULE,
@@ -264,10 +378,7 @@ start_it(Options, Start) ->
 		{view_width,?WIDTH},
 		{view_height,?HEIGHT-(20+18)}]).
     
-
-%%    gen_server:start_link(?MODULE, Options, []).
-
-    %% make sure CANUSB is on full speed (+ other FTDI serial devices)
+%% make sure CANUSB is on full speed (+ other FTDI serial devices)
 low_latency() ->
     lists:foreach(
       fun(UsbDev) ->
@@ -1415,6 +1526,8 @@ set_status(_State={S,_D}) ->
     epxw:set_status_text(Status),
 
     WindowTitle = case maps:get(device_name, S#s.if_param, "") of
+		      "/dev/serial/by-id/usb-LAWICEL_CANUSB_" ++ _ ->
+			  "Candy@CANUSB";
 		      "" -> "Candy";
 		      DeviceName -> "Candy@"++DeviceName
 		  end,
@@ -1959,7 +2072,7 @@ update_layout(OldLayout, NewLayout, State={_S,_D}) ->
     invalidate_layout(Layout, State2).
 
 
-insert_layout(Layout, State={S,D}) ->
+insert_layout(Layout, State={S,_D}) ->
     ets:insert(S#s.frame_layout, Layout),
     epxw:set_view_size(Layout#layout.x+Layout#layout.width,
 		       Layout#layout.y+Layout#layout.height),

@@ -18,7 +18,8 @@ clean:
 	@if [ -d "test" -a -f "test/Makefile" ]; then (cd test && $(MAKE) clean); fi
 
 appimage:
-	erl -epx -noshell -s $(APP) $(CONFIG) -s servator make_appimage $(APP) -s erlang halt
+	erl -epx -noshell -s $(APP) start0 $(CONFIG) -s servator make_appimage $(APP) -s erlang halt
+	(cd $(APP).AppDir; ../../servator/priv/make_desktop_icons $(APP).png)
 	strip $(APP).AppDir/bin/beam.smp
 	strip $(APP).AppDir/bin/epmd
 	strip $(APP).AppDir/bin/erlc
@@ -31,7 +32,7 @@ appimage:
 	mv $(APPL)-$(MACHINE).AppImage $(APPL)-$(VSN)-$(MACHINE).AppImage
 
 osxapp:
-	erl -epx -noshell -s $(APP) $(CONFIG) -s servator make_osxapp $(APP) -s erlang halt
+	erl -sname candy -epx -noshell -s $(APP) $(CONFIG) -s servator make_osxapp $(APP) -s erlang halt
 	mkdir -p tmpdist
 	mv $(APPL).app tmpdist/
 	cd tmpdist/
