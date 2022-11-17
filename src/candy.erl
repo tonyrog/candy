@@ -276,14 +276,8 @@ install_cmds() ->
     install_cmds_(Home,Vsn).
 
 install_cmds_(Home,Vsn) ->
-    APPDIR = case os:getenv("APPDIR") of
-		 false -> "";
-		 AppD -> AppD
-	     end,
-    APPIMG = case os:getenv("APPIMAGE") of
-		 false -> "";
-		 AppI -> AppI
-	     end,
+    APPDIR = os:getenv("APPDIR", ""),
+    APPIMG = os:getenv("APPIMAGE", ""),
     AppDir = case init:get_argument(root) of
 		 {ok,[[APPDIR]]} ->
 		     APPDIR;
@@ -291,7 +285,7 @@ install_cmds_(Home,Vsn) ->
 		     code:priv_dir(candy)
 	     end,
     {[lists:flatten(Cmd)||Cmd <- install_cmd_(Home, Vsn, AppDir,APPIMG)],
-     ["updatedb"]}.
+     []}.
 
 install_cmd_(Home, Vsn, AppDir,AppImg) ->
     IconsDir = filename:join([AppDir,"desktop_icons","hicolor"]),
@@ -551,7 +545,7 @@ menu({menu,_Pos}, State={S,_D}) ->
 	    #if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid) ->
 		[{listen_only,LISTEN},{fd,FD},
 		 {bitrate,BitRate}, {bitrates, BitRates},
-		 {datarate,_DataRate}, {datarates,_DataRates}] =
+		 {datarate,DataRate}, {datarates,DataRates}] =
 		    Mod:getopts(Pid, [listen_only, fd, 
 				      bitrate, bitrates, 
 				      datarate, datarates]),
@@ -564,11 +558,20 @@ menu({menu,_Pos}, State={S,_D}) ->
 			   true -> "N/A"
 			end,
 		BitRates1 = sort_rates(BitRates),
+		DataRates1 = sort_rates(DataRates),
 		[{"Listen="++LISTEN_ON, "Ctrl+L"},
 		 {"Fd="++FD_ON, "Ctrl+F"}] ++
-		    [{rate_to_list(R,BitRate), "Alt+"++integer_to_list(I)} ||
-			{R,I} <- lists:zip(BitRates1, 
-					   lists:seq(1, length(BitRates1)))];
+		    [{rate_to_list(R,BitRate), "Alt+"++
+			  integer_to_list(I,16)} ||
+			{R,I} <- lists:zip(BitRates1,
+					   lists:seq(1, length(BitRates1)))]++
+		    if FD ->
+			    [{rate_to_list(R,DataRate), "Ctrl+"
+			      ++integer_to_list(I,16)} ||
+				{R,I} <- lists:zip(DataRates1, 
+						   lists:seq(1, length(DataRates1)))];
+		       true -> []
+		    end;
 	    _ ->
 		[{"Listen=N/A", "Ctrl+L"},
 		 {"Fd=N/A",     "Ctrl+F"},
@@ -595,7 +598,6 @@ rate_to_list(Rate,CurrentRate) ->
 	    Mark++integer_to_list(RateK) ++ "." ++
 		hd(integer_to_list(RateM)) ++ "k"
     end.
-	    
 
 select({_Phase,Rect}, {S,D}) ->
     ?verbose("SELECT: ~w\n", [Rect]),
@@ -625,7 +627,9 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   T              Swap groups (not implemented yet)
 %%   Ctrl+L         Listen mode toggle
 %%   Ctrl+F         FD allow toggle
-%%   Ctrl+1-9        Set datarate (FD)
+%%   Ctrl+1-9[A-E]  Set datarate (FD)
+%%   Ctrl+up        Datarate up
+%%   Ctrl+down      Datarate down
 %%   Ctrl+S         Save information to /home/$USER/candy.txt
 %%
 %% Global commands
@@ -750,6 +754,12 @@ command($q, _Selected, _Mod, State) ->
 
 command(I, _Selected, Mod, State) when Mod#keymod.alt, I >= $1, I =< $9 ->
     bitrate_select(I-$0, State);
+command(I, _Selected, Mod, State) when Mod#keymod.alt, I >= $a, I =< $e ->
+    bitrate_select((I-$a)+10, State);
+command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $1, I =< $9 ->
+    datarate_select(I-$0, State);
+command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $a, I =< $e ->
+    datarate_select((I-$a)+10, State);
 command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
     Fs = lists:usort([FID || {FID,_} <- Selected]),
     lists:foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, 
@@ -758,6 +768,10 @@ command(up, _Selected, Mod, State) when Mod#keymod.alt ->
     bitrate_prev(State);
 command(down, _Selected, Mod, State) when Mod#keymod.alt ->
     bitrate_next(State);
+command(up, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    datarate_prev(State);
+command(down, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    datarate_next(State);
 command($l, _Selected, Mod, State) when Mod#keymod.ctrl ->
     toggle_listen_only(State);
 command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
@@ -1152,6 +1166,52 @@ bitrate_index({S,_D}) ->
        true -> index(S#s.bitrate, S#s.bitrates)
     end.
 
+datarate_next(State0={S,D}) ->
+    I = datarate_index(State0)-1,
+    DataRates = S#s.datarates,
+    N = length(DataRates),
+    J = ((I+1) rem N) + 1,
+    Rate = lists:nth(J, DataRates),
+    setopts(S#s.if_can, [{datarate, Rate}]),
+    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
+    State = {S#s { datarate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
+    State.
+
+datarate_prev(State0={S,D}) ->
+    I = datarate_index(State0)-1,
+    DataRates = S#s.datarates,
+    N = length(DataRates),
+    J = ((I+(N-1)) rem N) + 1,
+    Rate = lists:nth(J, DataRates),
+    setopts(S#s.if_can, [{datarate, Rate}]),
+    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
+    State = {S#s { datarate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
+    State.
+
+datarate_select(I, _State0={S,D}) ->
+    DataRates = S#s.datarates,
+    N = length(DataRates),
+    J = ((I-1) rem N) + 1,
+    Rate = lists:nth(J, DataRates),
+    ?verbose("I=~w, J=~w, Rate=~w\n", [I,J,Rate]),
+    setopts(S#s.if_can, [{datarate, Rate}]),
+    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
+    State = {S#s { datarate = Rate1 }, D},
+    set_status(State),
+    epxw:invalidate(),
+    State.
+
+datarate_index({S,_D}) ->
+    if S#s.datarate =:= undefined, S#s.datarates =:= [] -> 0;
+       S#s.datarate =:= undefined, is_list(S#s.datarates) -> 1;
+       true -> index(S#s.datarate, S#s.datarates)
+    end.
+
+
 index(E, L) -> index_(E, L, 1).
 index_(E, [E|_], I) -> I;
 index_(E, [_|L], I) -> index_(E, L, I+1);
@@ -1503,6 +1563,7 @@ set_status(_State={S,_D}) ->
     LinkBitRate =
 	case S#s.bitrate of
 	    error ->   "BitRate: error";
+	    undefined ->   "BitRate: undef";
 	    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)++"k"
 	end,
     LinkFlags =
