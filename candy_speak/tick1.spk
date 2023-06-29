@@ -1,0 +1,6 @@
+#variable i:16 = 3
+#timer t1 1000
+
+i := i + 1 < t1
+t1 := 1 < t1
+> t1 = 1
