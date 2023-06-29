@@ -92,10 +92,12 @@ the case for multiple bit selection.
 		| Name '=' Cond
 		| Name '<' Cond
 		| '!' Name '<' Cond
+		| Name '^' Cond		    // Toggle (when Cond is true!)
 		
 	Declaration :=
-		  '#' 'digital' Name [Port':']Pin
-		| '#' 'can' Name CanBit
+		  '#' 'digital' Name [Port':']Pin     // GPIO
+          '#' 'variable' Name[:1] '=' '0'|'1' // variable
+		| '#' 'can' Name CanBit               // CAN frame bit
 		 
 	Cond :=
 		  Bit
@@ -124,15 +126,13 @@ the case for multiple bit selection.
 	Pos := 0..63
 	Hex := '0x' [0..9a..bA..F]+
 	Int := [0..9]+
-	ByteIndex = Pos
-	BitIndex = Pos
 	Name = Char+
 	Constant = Int | Hex
 
 # Normalisation
 
 To get a reasonable output from the above expression and
-statements only on "definition" ('=') per output should be
+statements only one "definition" ('=') per output should be
 given or one for ON (OUT '<') and one for OFF (!OUT '<') should
 be given
 
@@ -152,7 +152,7 @@ is neither turn on of turned off.
     A < X
 	A < Y
 
-Can be rewritten to
+Can be rewritten as
 
 	A < X; Y
 
@@ -210,8 +210,9 @@ FIXME: add signed/unsigned/little/big
 
 	ADeclaraion := 
 		| Declaration
-		| '#' 'analog' Name Channel [':'Bits]
-		| '#' 'can' Name ARange
+		| '#' 'analog' Name Channel [':'Bits]        // analog port
+		| '#' 'analog' Name '=' InitValue [':'Bits]  // variable
+		| '#' 'can' Name CanRange
 
 	ACond := 
 	  | '(' ACond ')'
@@ -235,11 +236,11 @@ FIXME: add signed/unsigned/little/big
       | AExpr '/' AExpr
       | AExpr '%' AExpr
 	  
-	ARange := Hex '[' Pos '..' Pos ']'
+	CanRange := Hex '[' Pos '..' Pos ']'
 	
 	AValue :=
 	  | Bit
-	  | ARange
+	  | CanRange
 	  | Name
 	  | Constant
 
@@ -259,9 +260,9 @@ Analog output can, currently, be set to specific value
 
 	#analog A 3:10
 	
-    A=0 = Cond0
-    A=1 = Cond1
-    A=2 = Cond2
+    A:=0 < Cond0
+    A:=1 < Cond1
+    A:=2 < Cond2
 	...
 	
 # How to execute CandySpeak
@@ -272,3 +273,44 @@ In the above example with analog assignment, if forexample Cond0 is false
 and Cond1 and Cond2 are true the output A=1 will be sent and Cond2 will
 not be checked.
 
+# Extension to Timer
+
+    TStatement := 
+		| Statement
+		| TDeclaration
+		| Name < Cond      // start timer
+		| !Name < Cond     // stop timer
+
+	TDeclaraion := 
+		| Declaration
+		| '#' 'timer' Name milliseconds
+		
+     TCond := 
+	     | Name             // timer name (running)
+
+Timer Name is true when timer (has been) running and is has a 
+timeout condition.
+	
+    #timer DEBOUNCE 200
+	#digital BUTTON 13
+	#digital LED    2
+	#digital LED-STATE = 0   // variable
+	
+	// start timer when button is pressed	
+	DEBOUNCE < BUTTON
+	// LED=on when timeout and button is still pressed
+	LED-STATE ^ DEBOUNCE, BUTTON
+	LED = LED-STATE
+
+# Tick program
+
+	#variable A:10 = 1   // declare a 10 bit variable A
+	#timer T1 1000       // declare a 1000ms (1s) timer 
+	A := A + 1 < T1      // set A = A + 1 when timer T1 times out
+	T1 < T1              // restart T1 when T1 times out
+	>T1 = 1              // start the timer T1
+
+# loop from 1 to 10
+
+	#variable A:10 = 0
+	A := A + 1 < (A < 10)
