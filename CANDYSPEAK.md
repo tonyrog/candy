@@ -46,11 +46,11 @@ to turn __off__ output OUT
 	
 to turn output __on__ if first bit in frame 0x218 byte 1 is 1
 
-	OUT < 0x218[1,0]
+	OUT = 1 ? 0x218[1,0]
 	
 this is the same as bit number 8
 
-	OUT < 0x218[8]
+	OUT = 1 ? 0x218[8]
 
 In CandySpeak the bits are numbered from left to right, 0..63
 and 0..7 in each byte. Bytes are numbered 0..7
@@ -67,13 +67,13 @@ Then OUT is then turned __on__ if bit 8 is __on__ in FRAME 0x218 otherwise OUT i
 
 So to conditionally turn output __on__
 
-    OUT < Expr
+    OUT = 1 ? Expr
 
 To conditionally turn the output __off__ we prefix with an exlamation mark '!' 
 
-	!OUT < Expr
+	OUT = 0 ? Expr
 
-To turn __on__ and __off__ using a conditional expression
+To turn __on__ and __off__ using a value of expression
 
     OUT = Expr
 	
@@ -83,51 +83,49 @@ Here is a BNF (like) grammar for the Boolean part of CandySpeak that
 preserve backward compatabilty with the old simple expression, except
 the case for multiple bit selection.
 
-	File :=
-		(Statement '\n')*
+	<file> :=
+		(<statement> '\n')*
 		
-	Statement :=
-		  Hex 0..7 Hex Hex Hex
-		| Declaration
-		| Name '=' Cond
-		| Name '<' Cond
-		| '!' Name '<' Cond
-		| Name '^' Cond		    // Toggle (when Cond is true!)
-		
-	Declaration :=
-		  '#' 'digital' Name [Port':']Pin     // GPIO
-          '#' 'variable' Name[:1] '=' '0'|'1' // variable
-		| '#' 'can' Name CanBit               // CAN frame bit
+	<statement> :=
+		  <frame-id> 0..7 <hex2> <hex2> <hex2>
+		| <declaration>
+		| <name> '=' <bit>
+		| <name> '=' <bit> '?' <cond>
+
+	<declaration> :=
+		  '#' 'digital' <name> [<port>':']<pin>
+          '#' 'variable' <name>[:1] ['=' '0'|'1']
+		| '#' 'can' <name> <can-bit>
 		 
-	Cond :=
-		  Bit
-		| '(' Cond ')'
-		| Cond ',' Cond
-		| Cond ';' Cond
-		! '!' Cond
+	<cond> :=
+		  <bit>
+		| '(' <cond> ')'
+		| <cond> ',' <cond>
+		| <cond> ';' <cond>
+		! '!' <cond>
 		
-	Bit :=
+	<bit> :=
 		  '0' | '1'
-	    | CanBit
-		| Name
+	    | <can-bit>
+		| <name>
 		
-	CanBit :=
-		  Hex 0..7 Hex Hex Hex
-		| Hex '[' Pos ']'
-		| Hex '[' BytePos ',' BitPos ']'
+	<can-bit> :=
+		  <frame-id> 0..7 <hex2> <hex2> <hex2>
+		| <frame-id> '[' <bit-pos> ']'
+		| <frame-id> '[' <byte-pos> ',' <bit-pos> ']'
 	
-		
-	Port := Int
-	Pin := Int
-	Channel := Int
-	Bits := Int
-	BytePos := 0..7
-	BitPos := 0..7
-	Pos := 0..63
-	Hex := '0x' [0..9a..bA..F]+
-	Int := [0..9]+
-	Name = Char+
-	Constant = Int | Hex
+    <frame-id> := <hex>
+	<port> := <int>
+	<pin> := <int> | <name>
+	<bits> := <int>
+	<byte-pos> := 0..7 | 0..63
+	<bit-pos>  := 0..7 | 0..512
+	<hex-digit> [0..9a..fA..F]
+	<hex> := '0x' <hex-digit>+
+	<hex2> := '0x' (<hex-digit> | <hex-digit><hex-digit>)
+	<int> := [0..9]+
+	<name> = <char>+
+	<constant> = <int> | <hex>
 
 # Normalisation
 
@@ -184,7 +182,7 @@ This should be interpreted as
 
 	DEFOUT = 0x218[2,2], 0x218[2,3]
 
-But is in reality it is interpreted as
+But in reality it is interpreted as
 
 	DEFOUT = 0x218[2,2]; 0x218[2,3]
 	
@@ -202,47 +200,46 @@ Is coded as
 
 FIXME: add signed/unsigned/little/big
 
-    AStatement := 
-		| Statement
-		| ADeclaration
-		| Name ':=' Constant '=' ACond
-		| Name ':=' Constant '<' ACond
+    <a-statement> := 
+		| <statement>
+		| <a-declaration>
+		| <name> '=' <a-expr> '?' <a-cond>
 
-	ADeclaraion := 
-		| Declaration
-		| '#' 'analog' Name Channel [':'Bits]        // analog port
-		| '#' 'analog' Name '=' InitValue [':'Bits]  // variable
-		| '#' 'can' Name CanRange
+	<a-declaraion> := 
+		| <declaration>
+		| '#' 'analog' <name> [':'<size>] [<iodir>] [<port>':'] <pin>
+		| '#' 'can' <name> <can-range>
 
-	ACond := 
-	  | '(' ACond ')'
-	  | ACond ',' ACond
-	  | ACond ';' ACond
-	  ! '!' ACond
-	  | AExpr '=' AExpr
-	  | AExpr '!=' AExpr
-      | AExpr '<' AExpr
-      | AExpr '<=' AExpr
-      | AExpr '>' AExpr
-      | AExpr '>=' AExpr
+	<a-cond> := 
+	  | '(' <a-cond> ')'
+	  | <a-cond> ',' <a-cond>
+	  | <a-cond> ';' <a-cond>
+	  ! '!' <a-cond>
+	  | <a-expr> '==' <a-expr>
+	  | <a-expr> '!=' <a-expr>
+      | <a-expr> '<' <a-expr>
+      | <a-expr> '<=' <a-expr>
+      | <a-expr> '>' <a-expr>
+      | <a-expr> '>=' <a-expr>
 
-    AExpr := 
-	     AValue 
-	  | '(' AExpr ')'
-	  | '-' AExpr
-	  | AExpr '+' AExpr
-      | AExpr '-' AExpr
-      | AExpr '*' AExpr
-      | AExpr '/' AExpr
-      | AExpr '%' AExpr
+    <a-expr> :=
+	     <a-value>
+	  | '(' <a-expr> ')'
+	  | '-' <a-expr>
+	  | <a-expr> '+' <a-expr>
+      | <a-expr> '-' <a-expr>
+      | <a-expr> '*' <a-expr>
+      | <a-expr> '/' <a-expr>
+      | <a-expr> '%' <a-expr>
 	  
-	CanRange := Hex '[' Pos '..' Pos ']'
-	
-	AValue :=
-	  | Bit
-	  | CanRange
-	  | Name
-	  | Constant
+	<a-value> :=
+	  | <bit>
+	  | <can-range>
+	  | <name>
+	  | <constant>
+
+	<can-range> := <frame-id> '[' <bit-pos> '..' <bit-pos> ']'
+    <iodir> := 'in' | 'out' | 'inout'	
 
 # Usage of Analog expressions
 
@@ -253,16 +250,16 @@ depending on input expressions
 	#can RPM   0x200[6..15]  // 10 bit from can bit 6
 	#digital HEADLIGHT 0:8   // relay output at port 0 pin 8
 	
-	HEADLIGHT < (SPEED > 100), (RPM > 1000)
-	!HEADLIGH < (SPEED < 20)
+	HEADLIGHT=1 ? (SPEED > 100), (RPM > 1000)
+	HEADLIGHT=0 ? (SPEED < 20)
 	
 Analog output can, currently, be set to specific value
 
 	#analog A 3:10
 	
-    A:=0 < Cond0
-    A:=1 < Cond1
-    A:=2 < Cond2
+    A=0 ? Cond0
+    A=1 ? Cond1
+    A=2 ? Cond2
 	...
 	
 # How to execute CandySpeak
@@ -275,42 +272,42 @@ not be checked.
 
 # Extension to Timer
 
-    TStatement := 
-		| Statement
-		| TDeclaration
-		| Name < Cond      // start timer
-		| !Name < Cond     // stop timer
+    <t-statement> := 
+		| <statement>
+		| <t-declaration>
+		|  <name> '=' 1 '?' <t-cond>     // start timer if
+		| !<name> '=' 0 '?' <t-cond>     // stop timer if
 
-	TDeclaraion := 
-		| Declaration
-		| '#' 'timer' Name milliseconds
+	<t-declaraion> := 
+		| <declaration>
+		| '#' 'timer' <name> <milliseconds>
 		
-     TCond := 
-	     | Name             // timer name (running)
+     <t-cond> := 
+	     | <name>             // timer name (running)
 
-Timer Name is true when timer (has been) running and is has a 
+Timer <name> is true when timer (has been) running and is has a 
 timeout condition.
 	
-    #timer DEBOUNCE 200
-	#digital BUTTON 13
-	#digital LED    2
-	#digital LED-STATE = 0   // variable
+    #timer    debounce_timer 200
+	#digital  button in  13
+	#digital  led    out 2
+	#variable led_state = 0
 	
 	// start timer when button is pressed	
-	DEBOUNCE < BUTTON
-	// LED=on when timeout and button is still pressed
-	LED-STATE ^ DEBOUNCE, BUTTON
-	LED = LED-STATE
+	debounce-timer = 1 ? button
+	// led=on when timeout and button is still pressed
+	led-state = (led_state+1) % 2 ? debounce_timer, button
+	led = led-state
 
 # Tick program
 
 	#variable A:10 = 1   // declare a 10 bit variable A
 	#timer T1 1000       // declare a 1000ms (1s) timer 
-	A := A + 1 < T1      // set A = A + 1 when timer T1 times out
-	T1 < T1              // restart T1 when T1 times out
+	A = A + 1 ? T1       // set A = A + 1 when timer T1 times out
+	T1 ? T1              // restart T1 when T1 times out
 	>T1 = 1              // start the timer T1
 
 # loop from 1 to 10
 
 	#variable A:10 = 0
-	A := A + 1 < (A < 10)
+	A = A + 1 ? (A < 10)

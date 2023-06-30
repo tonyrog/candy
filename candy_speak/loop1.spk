@@ -1,11 +1,12 @@
+// demo of three nesye
 #constant n:4 = 5
 #variable i:10
 #variable j:10
 #variable k:10
 
-i := i + 1 < (i < n)
-  j := j + 1 < (i == n)
-    k := k + 1 < (j == n)
-i := 1 < (i == n)
-j := 1 < (j == n)
-k := 1 < (k == n)
+i = i + 1 ? (i < n)
+  j = j + 1 ? (i == n)
+    k = k + 1 ? (j == n)
+i = 1 ? (i == n)
+j = 1 ? (j == n)
+k = 1 ? (k == n)

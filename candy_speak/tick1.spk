@@ -1,6 +1,9 @@
+// Program the step i every timeout t1 (1s)
 #variable i:16 = 3
 #timer t1 1000
+#digital LED out LED_BUILTIN
 
-i := i + 1 < t1
-t1 := 1 < t1
-> t1 = 1
+i = i + 1 ? t1		// increament i when t1 times out
+LED = (i%2) ? t1        // toggle led 
+t1 = 1 ? t1             // restart t1 when t1 times out
+> t1 = 1                // event: immediate start t1
