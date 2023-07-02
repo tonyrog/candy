@@ -89,8 +89,17 @@ the case for multiple bit selection.
 	<statement> :=
 		  <frame-id> 0..7 <hex2> <hex2> <hex2>
 		| <declaration>
-		| <name> '=' <bit>
-		| <name> '=' <bit> '?' <cond>
+		| <rule>
+		| <immediate>
+		
+	<rule> :=		
+		  <name> '=' <bit> '?' <cond>
+		  
+	<immediate> :=
+        | '>' <name> '=' <bit> |
+		| '>' reset               // reset all variable/rules ...
+		| '>' push                // push current variables/rule-set
+		| '>' pop                 // pop to previous variables/rule-set
 
 	<declaration> :=
 		  '#' 'digital' <name> [<port>':']<pin>
@@ -203,9 +212,17 @@ FIXME: add signed/unsigned/little/big
     <a-statement> := 
 		| <statement>
 		| <a-declaration>
-		| <name> '=' <a-expr> '?' <a-cond>
+		| <a-rule>
+		| <a-immediate>
 
-	<a-declaraion> := 
+	<a-rule> :=
+	    <rule>
+		| <name> '=' <a-expr> '?' <a-cond>
+	
+	<a-immediate> := 
+		'>' <name> = <a-expr>
+
+	<a-declaration> := 
 		| <declaration>
 		| '#' 'analog' <name> [':'<size>] [<iodir>] [<port>':'] <pin>
 		| '#' 'can' <name> <can-range>
@@ -239,7 +256,21 @@ FIXME: add signed/unsigned/little/big
 	  | <constant>
 
 	<can-range> := <frame-id> '[' <bit-pos> '..' <bit-pos> ']'
-    <iodir> := 'in' | 'out' | 'inout'	
+    <iodir> := 'in' | 'out' | 'inout'
+	
+# built in variables
+
+## tick - unsigned 32 bit
+
+Current time since system reset.
+
+## cycle - unsigned 32 bit
+
+Current cycle counter value since system reset.
+
+## latch - boolean
+
+Allow, (latch=0) or disallow (latch=1) system output. But do allow variable and buffered updates etc.
 
 # Usage of Analog expressions
 
@@ -275,13 +306,24 @@ not be checked.
     <t-statement> := 
 		| <statement>
 		| <t-declaration>
-		|  <name> '=' 1 '?' <t-cond>     // start timer if
-		| !<name> '=' 0 '?' <t-cond>     // stop timer if
-
+		| <t-rule>
+		| <t-immediate>
+		
 	<t-declaraion> := 
 		| <declaration>
 		| '#' 'timer' <name> <milliseconds>
-		
+
+	<t-rule> :=
+		<a-rule>
+		| <name> '=' 1 '?' <t-cond>             // start timer if
+		| <name> '=' 0 '?' <t-cond>             // stop timer if
+		| <name>.timeout = <a-expr> ? <t-cond>  // set timeout value
+
+	<t-immediate> :=
+		<a-immediate>
+		| '>' <name> = <a-expr>         // start/stop timer
+		| '>' <name>.timeout = <a-expr> // set timeout value
+
      <t-cond> := 
 	     | <name>             // timer name (running)
 

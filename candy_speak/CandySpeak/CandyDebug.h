@@ -24,23 +24,23 @@ void print_tokens(token_t* ts, int n)
     printf("\n");
 }
 
-static const char* format_iodir(int dir)
+static const char* format_dir(int dir)
 {
     switch(dir) {
-    case IODIR_IN: return "in";
-    case IODIR_OUT: return "out";
-    case IODIR_INOUT: return "inout";
-    case IODIR_NONE: return "";
+    case DIR_IN: return "in";
+    case DIR_OUT: return "out";
+    case DIR_INOUT: return "inout";
+    case DIR_NONE: return "";
     default: return "--";
     }
 }
 
 static void print_element(candy_element_t* elem)
 {
-    switch(elem->c_type) {
+    switch(elem->type) {
     case C_DIGITAL:
 	printf("#digital %s %s ",
-	       elem->name, format_iodir(elem->io.dir));	
+	       elem->name, format_dir(elem->dir));	
 	if (elem->io.port == -1)
 	    printf("%d", elem->io.pin);
 	else 
@@ -50,8 +50,8 @@ static void print_element(candy_element_t* elem)
     case C_ANALOG:
 	printf("#analog %s:%d %s ",
 	       elem->name,
-	       elem->bn,
-	       format_iodir(elem->io.dir));
+	       elem->size,
+	       format_dir(elem->dir));
 	if (elem->io.port == -1)
 	    printf("%d", elem->io.pin);
 	else 
@@ -71,10 +71,10 @@ static void print_element(candy_element_t* elem)
 	printf("#timer %s %d",  elem->name, elem->timer.timeout);
 	break;
     case C_VARIABLE:
-	printf("#variable %s:%d %d", elem->name, elem->bn, elem->value);
+	printf("#variable %s:%d %d", elem->name, elem->size, elem->cur.i32);
 	break;
     case C_CONSTANT:
-	printf("#constant %s:%d %d", elem->name, elem->bn, elem->value);
+	printf("#constant %s:%d %d", elem->name, elem->size, elem->cur.i32);
 	break;		
     }
 }
@@ -109,7 +109,7 @@ static void print_expr(xindex_t xi)
 	printf("%s", element[xp->ni].name);
 	break;
     case EXPR_CONST:
-	printf("%d", xp->value);
+	printf("%d", xp->v.i32);
 	break;
     case EXPR_CAN_RANGE:
 	printf("0x%x[%d..%d]", xp->crange.id,

@@ -30,7 +30,7 @@ void loop() {
   }
   candy_read_input();
   if (nevents) {
-    candy_run_rule(&event);
+    candy_run_event(&event);
     nevents = 0;
   }
   candy_run_rules();

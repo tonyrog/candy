@@ -30,21 +30,22 @@ int main(int argc, char** argv)
 	i += 2;
     }
 
-    while(i < argc) {
-	candy_parse_line(argv[i]);
-	i++;
-    }
-    while(fgets(linebuf, sizeof(linebuf), fin))
-	candy_parse_line(linebuf);
-
     while(1) {
-	candy_read_input();    // read io/can/analog etc
-	if (nevents) {
-	    candy_run_rule(&event);
+	if (i < argc) {
+	    candy_parse_line(argv[i]);
+	    i++;
+	}
+	else {
+	    if (fgets(linebuf, sizeof(linebuf), fin))
+		candy_parse_line(linebuf);
+	}
+	candy_read_input();         // read io/can/analog etc
+	if (nevents) {              // FIXME: event must be run immediate
+	    candy_run_event(&event);
 	    nevents = 0;
 	}
-	candy_run_rules();     // generate new value
- 	candy_write_output();
+	candy_run_rules();          // generate new value
+	candy_write_output();
     }
     exit(0);
 }

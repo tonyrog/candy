@@ -7,6 +7,7 @@
 #include <memory.h>
 #include <ctype.h>
 
+#define STACK_SIZE       8
 #define MAX_STRING_TAB   512
 #define MAX_NUM_TOKENS   64
 #define MAX_NUM_ELEMENTS 32
@@ -36,14 +37,13 @@ typedef struct {
     uint16_t bit_pos1;   // 0..7  | 0..512
 } can_range_t;
 
-#define IODIR_NONE  0x0
-#define IODIR_IN    0x1
-#define IODIR_OUT   0x2
-#define IODIR_INOUT 0x3
+#define DIR_NONE  0x0
+#define DIR_IN    0x1
+#define DIR_OUT   0x2
+#define DIR_INOUT 0x3
 
 // Digital / Analog port definition
 typedef struct {
-    uint8_t dir;  // IODIR_xxx
     int8_t port;  // -1 if port is not used
     int8_t pin;   // pin number
 } portbit_t;
@@ -53,11 +53,7 @@ typedef struct {
 #define C_TIMER_RUNNING  0x02
 #define C_TIMER_STOPPED  0x04
 
-#ifdef ARDUINO
-typedef unsigned long tick_t;
-#else
-typedef uint64_t tick_t;
-#endif
+typedef uint32_t tick_t;
 
 typedef struct {
     uint32_t timeout;    
@@ -128,12 +124,34 @@ typedef enum {
     C_TIMER     = 9,
 } candy_element_type_t;
 
+typedef enum {
+    BOOL    = 0,
+    INT8    = 1,    
+    UINT8   = 2,
+    INT16   = 3,
+    UINT16  = 4,        
+    INT32   = 5,
+    UINT32  = 6,
+} candy_value_type_t;
+
+typedef union {
+    uint8_t u8;
+    int8_t  i8;
+    uint16_t u16;
+    int16_t  i16;
+    uint32_t u32;
+    int32_t  i32;
+} candy_value_t;
+    
 typedef struct _candy_element_t {
-    char* name;      // str8 name! preceeded by 8-bit length terminated in 0
-    uint8_t bn;      // number of bits (1 for digital default=8? for analog)
-    uint8_t c_type;  // candy_element_type_t...
-    int32_t value;   // current value
-    int32_t value1;  // updated value
+    char* name;         // str8 name! preceeded by 8-bit length terminated in 0
+    uint8_t size;       // number of bits (1 for digital default=8? for analog)
+    uint8_t type;       // candy_element_type_t...
+    uint8_t dir;        // DIR_xxx variables | const=in | io | analog
+    uint8_t vtype;      // value type
+    uint32_t clk;       // assign clock cycle
+    candy_value_t cur;  // current value
+    candy_value_t new;  // new output value
     union {
 	portbit_t   io;
 	can_bit_t   can;
@@ -175,7 +193,7 @@ typedef uint16_t  eindex_t;    // element index
 typedef struct _candy_expr_t {
     candy_op_t op;
     union {
-	int value;                           // CONST
+	candy_value_t v;                     // CONST (depend on type)
 	eindex_t     ei;                     // NAME element[ei]
 	can_range_t  crange;                 // CAN_RANGE
 	can_bit_t    cbit;                   // CAN_BIT
@@ -192,6 +210,13 @@ typedef struct _candy_rule_t {
     xindex_t vi;                  // value expression
     xindex_t ci;                  // conditional expression
 } candy_rule_t;
+
+typedef struct _candy_state_t {
+    int nelements;
+    int nexprs;
+    int nrules;
+    int nstr;
+} candy_state_t;
 
 token_t ts[MAX_NUM_TOKENS+1];
 
@@ -212,6 +237,40 @@ int nevents = 0;  // 0 | 1
 candy_rule_t event;
 
 int verbose = 0;
+
+int sp = 0;
+candy_state_t stack[STACK_SIZE];
+
+candy_element_t* tick;
+candy_element_t* cycle;
+candy_element_t* latch;
+
+
+static void candy_push()
+{
+    if (sp >= STACK_SIZE) return;
+    stack[sp].nelements = nelements;
+    stack[sp].nexprs = nexprs;
+    stack[sp].nrules = nrules;
+    stack[sp].nstr = nstr;
+    sp++;
+}
+
+static void candy_pop()
+{
+    if (sp <= 0) return;
+    sp--;
+    nelements = stack[sp].nelements;
+    nexprs = stack[sp].nexprs;
+    nrules = stack[sp].nrules;
+    nstr = stack[sp].nstr;
+}
+
+static void candy_commit()
+{
+    if (sp <= 0) return;
+    sp--;
+}
 
 // boards:
 // ARUDINO_AVR_UNO
@@ -251,14 +310,6 @@ static tick_t time_tick(void)
     return millis();
 }
 
-static uint32_t time_elapsed_ms(tick_t since, tick_t* nowp)
-{
-    tick_t now = time_tick();
-    uint32_t td  = now - since;
-    if (nowp) *nowp = now;
-    return td;
-}
-
 static size_t candy_print_str(char* str)
 {
     return Serial.print(str);
@@ -291,16 +342,7 @@ static tick_t time_tick(void)
     struct timeval t;
     gettimeofday(&now, 0);
     timersub(&now, &boot_time, &t);
-    return t.tv_sec*1000000 + t.tv_usec;
-}
-
-// Must be called with in about half an hour since
-static uint32_t time_elapsed_ms(tick_t since, tick_t* nowp)
-{
-    tick_t now = time_tick();
-    uint32_t td  = now - since;
-    if (nowp) *nowp = now;
-    return td / 1000;
+    return t.tv_sec*1000 + t.tv_usec/1000;
 }
 
 static size_t candy_print_str(char* str)
@@ -319,6 +361,15 @@ static size_t candy_print_ln()
 }
 
 #endif
+
+// Must be called with in about half an hour since
+static uint32_t time_elapsed_ms(tick_t since, tick_t* nowp)
+{
+    tick_t now = time_tick();
+    uint32_t td  = now - since;
+    if (nowp) *nowp = now;
+    return td;
+}
 
 #ifdef DEBUG
 #include "CandyDebug.h"
@@ -476,13 +527,33 @@ int is_const(int tok)
 
 // '#' 'digital' <name> [IODir] [Port ':'] Pin
 
+// linux? rasberryip - wiring pi ?
+#ifndef ARDUINO
+#define LED_BUILTIN 13
+#define D0  0
+#define D1  1
+#define D2  2
+#define D3  3
+#define D4  4
+#define D5  5
+#define D6  6
+#define D7  7
+#define D8  8
+#define D9  9
+#define D10 10
+#define D11 11
+#define D12 12
+#define D13 13
+#define D14 14
+#define D15 15
+#endif
+
 int tok_to_digital_pin(token_t* tp, int dir)
 {
     if ((tp->tval == T_HEX)||((tp->tval == T_DEC))) {
 	return tok_to_int(tp);
     }
-#ifdef ARDUINO
-    if ((dir & IODIR_OUT) && tokeq("LED_BUILTIN", tp)) return LED_BUILTIN;
+    if ((dir & DIR_OUT) && tokeq("LED_BUILTIN", tp)) return LED_BUILTIN;
     if (tokeq("D0", tp)) return D0;
     if (tokeq("D1", tp)) return D1;
     if (tokeq("D2", tp)) return D2;
@@ -499,7 +570,6 @@ int tok_to_digital_pin(token_t* tp, int dir)
     if (tokeq("D13", tp)) return D13;
     if (tokeq("D14", tp)) return D14;
     if (tokeq("D15", tp)) return D15;
-#endif
     return -1;    
 }
 
@@ -513,21 +583,21 @@ static int candy_parse_digital(int j)
 {
     int j0 = j;
     int k = nelements;
-    int dir = IODIR_NONE; // use default
+    int dir = DIR_NONE; // use default
     if (!T(ts,j,T_WORD)) return CANDY_ERR;
     j++;
     if (T(ts,j,T_IN)||T(ts,j,T_OUT)||T(ts,j,T_INOUT)) {
 	switch(ts[j].tval) {
-	case T_IN: dir = IODIR_IN; break;
-	case T_OUT: dir = IODIR_OUT; break;
-	case T_INOUT: dir = IODIR_INOUT; break;
+	case T_IN: dir = DIR_IN; break;
+	case T_OUT: dir = DIR_OUT; break;
+	case T_INOUT: dir = DIR_INOUT; break;
 	default: break;
 	}
 	j++;
     }
-    element[k].c_type = C_DIGITAL;
-    element[k].bn = 1;
-    element[k].io.dir = dir;
+    element[k].type = C_DIGITAL;
+    element[k].size = 1;
+    element[k].dir = dir;
 
     if (T(ts,j,T_DEC) && T(ts,j+1,':') &&
 	is_digital_pin(ts[j+2].tval) && T(ts,j+3,T_END)) {
@@ -547,6 +617,27 @@ static int candy_parse_digital(int j)
     return CANDY_DEF;
 }
 
+// linux/raspberry wiringpi?
+#ifndef ARDUINO
+#define DAC 0
+#define A0  0
+#define A1  1
+#define A2  2
+#define A3  3
+#define A4  4
+#define A5  5
+#define A6  6
+#define A7  7
+#define A8  8
+#define A9  9
+#define A10 10
+#define A11 11
+#define A12 12
+#define A13 13
+#define A14 14
+#define A15 15
+#endif
+
 static int tok_to_analog_pin(token_t* tp, int dir)
 {
     if ((tp->tval == T_HEX)||((tp->tval == T_DEC))) {
@@ -564,7 +655,6 @@ static int tok_to_analog_pin(token_t* tp, int dir)
 	//   3,5,6,9                101       
 	return tok_to_int(tp);
     }
-#ifdef ARDUINO
     if (tokeq("DAC", tp)) return DAC;
 //    if (tokeq("DAC1", tp)) return DAC1;
     if (tokeq("A0", tp)) return A0;
@@ -573,7 +663,7 @@ static int tok_to_analog_pin(token_t* tp, int dir)
     if (tokeq("A3", tp)) return A3;
     if (tokeq("A4", tp)) return A4;
     if (tokeq("A5", tp)) return A5; // A0..A5 most boards
-#ifdef ARDUINO_MKR // what names to use?
+#if !defined(ARDUINO) || defined(ARDUINO_MKR) // what names to use?
     if (tokeq("A6", tp)) return A6; // A0..A6 MKR boards
     if (tokeq("A7", tp)) return A7; // A0..A7 Mini/Nano
     if (tokeq("A8", tp)) return A8;
@@ -584,7 +674,6 @@ static int tok_to_analog_pin(token_t* tp, int dir)
     if (tokeq("A13", tp)) return A13;
     if (tokeq("A14", tp)) return A14;
     if (tokeq("A15", tp)) return A15; // A0..A15 Mega
-#endif
 #endif
     return -1;
 }
@@ -601,29 +690,29 @@ static int candy_parse_analog(int j)
 {
     int j0 = j;
     int k = nelements;
-    int dir = IODIR_NONE;
+    int dir = DIR_NONE;
     
     if (!T(ts,j,T_WORD)) return CANDY_ERR;
     j++;
-    element[k].c_type = C_ANALOG;
+    element[k].type = C_ANALOG;
     if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
 	int n = tok_to_int(&ts[j+1]);
-	element[k].bn = (n > MAX_ADC_RESOLUTION) ? MAX_ADC_RESOLUTION : n;
+	element[k].size = (n > MAX_ADC_RESOLUTION) ? MAX_ADC_RESOLUTION : n;
 	j += 2;
     }
     else {
-	element[k].bn = MAX_ADC_RESOLUTION;
+	element[k].size = MAX_ADC_RESOLUTION;
     }
     if (T(ts,j,T_IN)||T(ts,j,T_OUT)||T(ts,j,T_INOUT)) {
 	switch(ts[j].tval) {
-	case T_IN: dir = IODIR_IN; break;
-	case T_OUT: dir = IODIR_OUT; break;
-	case T_INOUT: dir = IODIR_INOUT; break;
+	case T_IN: dir = DIR_IN; break;
+	case T_OUT: dir = DIR_OUT; break;
+	case T_INOUT: dir = DIR_INOUT; break;
 	default: break;
 	}
 	j++;
     }
-    element[k].io.dir = dir;
+    element[k].dir = dir;
     if (T(ts,j,T_DEC) && T(ts,j+1,':') && is_analog_pin(ts[j+2].tval) &&
 	T(ts,j+3,T_END)) {
 	element[k].io.port = tok_to_int(&ts[j]);
@@ -638,6 +727,9 @@ static int candy_parse_analog(int j)
     else {
 	return CANDY_ERR;
     }
+    element[k].vtype = INT32;
+    element[k].cur.i32 = element[k].new.i32 = 0;
+    element[k].clk = 0;
     make_str8(&element[k].name, &ts[j0]);
     nelements++;
     return CANDY_DEF;    
@@ -654,10 +746,13 @@ static int candy_parse_timer(int j)
     element[k].timer.timeout = tok_to_int(&ts[j]);
     j++;
     if (!T(ts,j,T_END)) return CANDY_ERR;
-    element[k].c_type = C_TIMER;
-    element[k].bn = sizeof(int)*8;
+    element[k].type = C_TIMER;
+    element[k].size = sizeof(int)*8;
     element[k].timer.flags = 0;
-    element[k].value = element[k].value1 = 0;
+    element[k].vtype = INT32;
+    element[k].dir   = DIR_INOUT;    
+    element[k].cur.i32 = element[k].new.i32 = 0;
+    element[k].clk = 0;
     nelements++;
     make_str8(&element[k].name, &ts[j0]);
     return CANDY_DEF;
@@ -679,7 +774,7 @@ static int candy_parse_can(int j)
     j++;
     if (T(ts,j,T_DEC)&&T(ts,j+1,T_HEX)&&T(ts,j+2,T_HEX)&&
 	T(ts,j+3,T_HEX)&&T(ts,j+4,T_END)) {
-	element[k].c_type = C_CAN_MATCH;
+	element[k].type = C_CAN_MATCH;
 	element[k].canm.byte_pos = tok_to_int(&ts[j]);
 	element[k].canm.mask = tok_to_int(&ts[j+1]);
 	element[k].canm.match1 = tok_to_int(&ts[j+2]);
@@ -687,20 +782,20 @@ static int candy_parse_can(int j)
     }
     else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,']')&&
 	     T(ts,j+3,T_END)) {
-	element[k].c_type = C_CAN_BIT1;
+	element[k].type = C_CAN_BIT1;
 	element[k].can.byte_pos = 0;  // not used
 	element[k].can.bit_pos = tok_to_int(&ts[4]);
     }    
     else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,',') &&
 	     T(ts,j+3,T_DEC)&&T(ts,j+4,']')&&T(ts,j+5,T_END)) {
-	element[k].c_type = C_CAN_BIT2;
+	element[k].type = C_CAN_BIT2;
 	element[k].can.byte_pos = tok_to_int(&ts[j+1]);
 	element[k].can.bit_pos = tok_to_int(&ts[j+3]);
     }
     else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,'.') && T(ts,j+3,'.') &&
 	     T(ts,j+4,T_DEC)&&T(ts,j+5,']')&&T(ts,j+6,T_END)) {
 	int p0, p1;
-	element[k].c_type = C_CAN_RANGE;
+	element[k].type = C_CAN_RANGE;
 	p0 = tok_to_int(&ts[j+1]);
 	p1 = tok_to_int(&ts[j+4]);
 	if ((p0 < 0) || (p0 > p1))
@@ -710,7 +805,10 @@ static int candy_parse_can(int j)
     }
     else
 	return CANDY_ERR;
-    element[k].value = element[k].value1 = 0;
+    element[k].vtype = INT32;
+    element[k].dir   = DIR_IN;
+    element[k].cur.i32 = element[k].new.i32 = 0;
+    element[k].clk = 0;    
     make_str8(&element[k].name, &ts[j0]);
     nelements++;
     return CANDY_DEF;    
@@ -725,15 +823,18 @@ static int candy_parse_constant(int j)
 
     if (!T(ts,j,T_WORD)) return CANDY_ERR;
     j++;
-    element[k].c_type = C_CONSTANT;
-    element[k].bn = 1; // fixme: default size?
+    element[k].type = C_CONSTANT;
+    element[k].size = 1; // fixme: default size?
     if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
-	element[k].bn = tok_to_int(&ts[j+1]);
+	element[k].size = tok_to_int(&ts[j+1]);
 	j += 2;
     }
+    element[k].vtype = INT32;
+    element[k].dir   = DIR_IN;
+    element[k].clk   = 0;    
     if (T(ts,j,'=') && is_const(ts[j+1].tval) && T(ts,j+2,T_END)) {
-	element[k].value = tok_to_int(&ts[j+1]);
-	element[k].value1 = element[k].value;
+	element[k].cur.i32 = tok_to_int(&ts[j+1]);
+	element[k].new.i32 = element[k].cur.i32;
     }
     else
 	return CANDY_ERR;
@@ -751,21 +852,24 @@ static int candy_parse_variable(int j)
 
     if (!T(ts,j,T_WORD)) return CANDY_ERR;
     j++;
-    element[k].c_type = C_VARIABLE;
-    element[k].bn = 1;  // fixme: default size? 
+    element[k].type = C_VARIABLE;
+    element[k].size = 1;  // fixme: default size? 
     if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
-	element[k].bn = tok_to_int(&ts[j+1]);
+	element[k].size = tok_to_int(&ts[j+1]);
 	j += 2;
     }
+    element[k].vtype = INT32;
+    element[k].dir   = DIR_INOUT;
+    element[k].clk = 0;    
     if (T(ts,j,'=') && is_const(ts[j+1].tval) && T(ts,j+2,T_END)) {
-	element[k].value = tok_to_int(&ts[j+1]);
+	element[k].cur.i32 = tok_to_int(&ts[j+1]);
     }
     else if (T(ts,j,T_END)) {
-	element[k].value = 0;
+	element[k].cur.i32 = 0;
     }
     else
 	return CANDY_ERR;
-    element[k].value1 = element[k].value;
+    element[k].new.i32 = element[k].cur.i32;
     make_str8(&element[k].name, &ts[j0]);    
     nelements++;
     return CANDY_DEF;
@@ -822,7 +926,7 @@ static xindex_t candy_parse_avalue(int* ppos)
     else if (T(ts,j,T_DEC) || T(ts,j,T_HEX)) {
 	candy_expr_t* xp = &expr[nexprs];
 	xp->op = EXPR_CONST;
-	xp->value = tok_to_int(&ts[j]);
+	xp->v.i32 = tok_to_int(&ts[j]);
 	*ppos = j+1;
 	return nexprs++;
     }
@@ -1011,7 +1115,7 @@ static xindex_t candy_parse_cond(int* ppos)
     xindex_t xi;
     is_cond_expr = 1;
     xi = candy_parse_disjunction(ppos);
-    is_cond_expr = 1;
+    is_cond_expr = 0;
     return xi;
 }
 
@@ -1030,44 +1134,53 @@ static int candy_parse_rule()
 #ifdef DEBUG	
 	fprintf(stder, "element %.*s not found\n", ts[j].len, ts[j].ptr);
 #endif
-	return 0;
+	return CANDY_ERR;
     }
     if (!T(ts,1,'=')) return CANDY_ERR;
     j = 2;
-    if ((rp->vi = candy_parse_expr(&j)) == CANDY_ERR)
+    if ((rp->vi = candy_parse_expr(&j)) == INVALID_INDEX)
 	return CANDY_ERR;
+    rp->ci = INVALID_INDEX;    
     if (T(ts,j,'?')) {
 	j++;
 	rp->ci  = candy_parse_cond(&j);
     }
-    else {
-	rp->ci = INVALID_INDEX;
-    }
+    if (!T(ts,j,T_END))
+	return CANDY_ERR;	
     nrules++;
     return CANDY_RULE;
 }
 
 static int candy_parse_event()
 {
+    eindex_t ei;
+    
     nevents = 0;
     if (T(ts,0,'>') && T(ts,1,T_WORD) && T(ts,2,'=')) {
-	eindex_t ei;
 	int j;
 	if ((ei = lookup_element(&ts[1])) == INVALID_INDEX) {
 #ifdef DEBUG
 	    fprintf(stderr, "element %.*s not found\n", ts[1].len, ts[1].ptr);
 #endif
-	    return 0;
+	    return CANDY_ERR;	    
 	}
 	event.ei = ei;
 	event.ci = INVALID_INDEX;
 	j = 3;
 	if ((event.vi = candy_parse_expr(&j)) == INVALID_INDEX)
 	    return CANDY_ERR;
+	// FIXME: look for T_END?
 	nevents = 1;
 	return CANDY_EVENT;
     }
-    return 0;
+    else if (T(ts,0,'>') && T(ts,1,T_WORD) && T(ts,2,T_END)) {
+	if ((ei = lookup_element(&ts[1])) == INVALID_INDEX)
+	    return CANDY_ERR;
+	candy_print_int(element[ei].cur.i32);
+	candy_print_ln();
+	return CANDY_EVENT;	
+    }
+    return CANDY_ERR;
 }
 
 static int candy_parse()
@@ -1201,16 +1314,44 @@ void candy_init()
     analogReadResolution(MAX_ADC_RESOLUTION);
     analogWriteResolution(MAX_DAC_RESOLUTION);    
 #endif
+    element[0].name     = "\4tick"+1;
+    element[0].size     = 32;
+    element[0].type     = C_VARIABLE;  // read only (but NOT constant)
+    element[0].dir      = DIR_IN;
+    element[0].vtype    = UINT32;    
+    element[0].cur.u32  = time_tick();
+    element[0].new.u32  = 0;
+    tick = &element[0];
+
+    element[1].name     = "\5cycle"+1;
+    element[1].size     = 32;
+    element[1].type     = C_VARIABLE;
+    element[1].dir      = DIR_IN;
+    element[1].vtype    = UINT32;
+    element[1].cur.u32  = 1;         // start at cycle 1
+    element[1].new.u32  = 0;
+    cycle = &element[1];
+
+    element[2].name   = "\5latch"+1;
+    element[2].size     = 1;
+    element[2].type     = C_VARIABLE;
+    element[2].dir      = DIR_INOUT;
+    element[2].vtype    = BOOL;
+    element[2].cur.u8   = 0;
+    element[2].new.u8   = 0;
+    latch = &element[2];
+    
+    nelements = 3;
 }
 
 int32_t eval_expr(xindex_t xi)
 {
     candy_expr_t* xp = &expr[xi];
     switch(xp->op) {
-    case EXPR_NAME:  return element[xp->ei].value;
-    case EXPR_CONST: return xp->value;
-    case EXPR_CAN_RANGE: return xp->value;
-    case EXPR_CAN_BIT: return xp->value;
+    case EXPR_NAME:      return element[xp->ei].cur.i32;
+    case EXPR_CONST:     return xp->v.i32;
+    case EXPR_CAN_RANGE: return xp->v.i32; // FIXME ???
+    case EXPR_CAN_BIT:   return xp->v.i32; // FIXME ???
     // rel-op
     case EXPR_LT: return eval_expr(xp->bin.li) < eval_expr(xp->bin.ri);
     case EXPR_LTE:return eval_expr(xp->bin.li) <= eval_expr(xp->bin.ri);
@@ -1247,18 +1388,22 @@ int32_t eval_expr(xindex_t xi)
 static void candy_read_input()
 {
     int i;
+
+    cycle->cur.u32++;
+    tick->cur.u32 = time_tick();
+    
     for (i = 0; i < nelements; i++) {
 	candy_element_t* elem = &element[i];
-	switch(elem->c_type) {
+	switch(elem->type) {
 	case C_CONSTANT: break;
 	case C_VARIABLE: break;
 	case C_DIGITAL:
-	    if (elem->io.dir & IODIR_IN)
-		elem->value = gpio_get(elem->io.port, elem->io.pin);
+	    if (elem->dir & DIR_IN)
+		elem->cur.i32 = gpio_get(elem->io.port, elem->io.pin);
 	    break;
 	case C_ANALOG:
-	    if (elem->io.dir & IODIR_IN)
-		elem->value = adc_get(elem->io.port, elem->io.pin);
+	    if (elem->dir & DIR_IN)
+		elem->cur.i32 = adc_get(elem->io.port, elem->io.pin);
 	    break;
 	case C_CAN_BIT1: {  // bitpos
 	    int len;	    
@@ -1267,7 +1412,7 @@ static void candy_read_input()
 		int bitpos = elem->can.bit_pos;
 		int pos = bitpos >> 3;  // byte pos
 		if (pos < len)
-		    elem->value = (ptr[pos] >> (7-(bitpos & 7))) & 1;
+		    elem->cur.i32 = (ptr[pos] >> (7-(bitpos & 7))) & 1;
 	    }
 	    break;
 	}
@@ -1278,7 +1423,7 @@ static void candy_read_input()
 		int pos    = elem->can.byte_pos;
 		int bitpos = elem->can.bit_pos;
 		if (pos < len)
-		    elem->value = (ptr[pos] >> (7-(bitpos & 7))) & 1;
+		    elem->cur.i32 = (ptr[pos] >> (7-(bitpos & 7))) & 1;
 	    }
 	    break;
 	}
@@ -1290,9 +1435,9 @@ static void candy_read_input()
 		if (pos < len) {
 		    uint8_t val = ptr[pos];
 		    if ((val & elem->canm.mask) == elem->canm.match1)
-			elem->value = 1;
+			elem->cur.i32 = 1;
 		    else if ((val & elem->canm.mask) == elem->canm.match0)
-			elem->value = 0;
+			elem->cur.i32 = 0;
 		}
 	    }
 	    break;
@@ -1312,19 +1457,19 @@ static void candy_read_input()
 		if (pos < len)
 		    value = (value << 8) | ptr[pos];
 	    }
-	    elem->value = (value >> (7-(bit_pos1 & 7))) & ((1 << n)-1);
+	    elem->cur.i32 = (value >> (7-(bit_pos1 & 7))) & ((1 << n)-1);
 	    break;
 	}
 	    
 	case C_TIMER: {
 	    // true if timeout
-	    elem->value = 0;
+	    elem->cur.i32 = 0;
 	    if (elem->timer.flags & C_TIMER_TIMEOUT)
-		elem->value = 1;
+		elem->cur.i32 = 1;
 	    else if (elem->timer.flags & C_TIMER_RUNNING) {
 		uint32_t elapsed = time_elapsed_ms(elem->timer.start_tick,NULL);
 		if (elapsed >= elem->timer.timeout) {
-		    elem->value = 1;
+		    elem->cur.i32 = 1;
 		    elem->timer.flags &= ~C_TIMER_RUNNING;
 		    elem->timer.flags |= C_TIMER_TIMEOUT;
 		}
@@ -1342,55 +1487,59 @@ static void candy_write_output()
     int i;
     for (i = 0; i < nelements; i++) {
 	candy_element_t* elem = &element[i];
-	switch(elem->c_type) {
+	switch(elem->type) {
 	case C_CONSTANT: break;
 	case C_VARIABLE:
-	    if (elem->value != elem->value1) {
-		elem->value = elem->value1;
+	    if ((elem->dir & DIR_OUT) && (elem->cur.i32 != elem->new.i32)) {
+		elem->cur.i32 = elem->new.i32;
 		if (verbose) {
 		    candy_print_str("SET: ");
 		    candy_print_str(elem->name);
 		    candy_print_str(" = ");
-		    candy_print_int(elem->value);
+		    candy_print_int(elem->cur.i32);
 		    candy_print_ln();
 		}
 	    }
 	    break;
 	case C_DIGITAL:
-	    if (elem->io.dir & IODIR_OUT) {
-		if (elem->value != elem->value1) {
-		    elem->value = elem->value1;
-		    gpio_set(elem->io.port, elem->io.pin, elem->value);
+	    if (latch->cur.u32) break;
+	    if (elem->dir & DIR_OUT) {
+		if (elem->cur.i32 != elem->new.i32) {
+		    elem->cur.i32 = elem->new.i32;
+		    gpio_set(elem->io.port, elem->io.pin, elem->cur.i32);
 		    if (verbose) {
 			candy_print_str("GPIO-SET: ");
 			candy_print_str(elem->name);
+			candy_print_str(" ");			
 			if (elem->io.port >= 0) {
 			    candy_print_int(elem->io.port);
 			    candy_print_str(":");
 			}
 			candy_print_int(elem->io.pin);
 			candy_print_str(" = ");
-			candy_print_int(elem->value);
+			candy_print_int(elem->cur.i32);
 			candy_print_ln();
 		    }
 		}
 	    }
 	    break;
 	case C_ANALOG:
-	    if (elem->io.dir & IODIR_OUT) {
-		if (elem->value != elem->value1) {
-		    elem->value = elem->value1;
-		    dac_set(elem->io.port, elem->io.pin, elem->value);
+	    if (latch->cur.u32) break;	    
+	    if (elem->dir & DIR_OUT) {
+		if (elem->cur.i32 != elem->new.i32) {
+		    elem->cur.i32 = elem->new.i32;
+		    dac_set(elem->io.port, elem->io.pin, elem->cur.i32);
 		    if (verbose) {
 			candy_print_str("DAC-SET: ");
 			candy_print_str(elem->name);
+			candy_print_str(" ");
 			if (elem->io.port >= 0) {
 			    candy_print_int(elem->io.port);
 			    candy_print_str(":");
 			}
 			candy_print_int(elem->io.pin);
 			candy_print_str(" = ");
-			candy_print_int(elem->value);
+			candy_print_int(elem->cur.i32);
 			candy_print_ln();
 		    }		    
 		}
@@ -1400,11 +1549,12 @@ static void candy_write_output()
 	case C_CAN_BIT2:	
 	case C_CAN_MATCH:
 	case C_CAN_RANGE:
+	    if (latch->cur.u32) break;
 	    // fixme: send can message?
 	    break;
 	case C_TIMER:
-	    if (elem->value1 && !(elem->timer.flags & C_TIMER_RUNNING)) {
-		elem->value = 0; // not timed out, just started
+	    if (elem->new.i32 && !(elem->timer.flags & C_TIMER_RUNNING)) {
+		elem->cur.i32 = 0; // not timed out, just started
 		elem->timer.start_tick = time_tick();
 		elem->timer.flags |= C_TIMER_RUNNING;
 		elem->timer.flags &= ~C_TIMER_TIMEOUT;
@@ -1416,9 +1566,10 @@ static void candy_write_output()
 		    candy_print_ln();
 		}
 	    }
-	    else if ((elem->value1==0) && elem->timer.flags & C_TIMER_RUNNING) {
+	    else if ((elem->new.i32==0) &&
+		     elem->timer.flags & C_TIMER_RUNNING) {
 		// stop timer
-		elem->value = 0; // stopped not timed out!
+		elem->cur.i32 = 0; // stopped not timed out!
 		elem->timer.flags &= ~C_TIMER_RUNNING;
 		elem->timer.flags |= C_TIMER_STOPPED;
 		if (verbose) {
@@ -1431,20 +1582,31 @@ static void candy_write_output()
     }
 }
 
-static void candy_run_rule(candy_rule_t* rp)
+static void candy_run_rule_(candy_rule_t* rp, uint32_t clk)
 {
-    int32_t value;
     candy_element_t* elem = &element[rp->ei];
-    value = (rp->ci == INVALID_INDEX) ? 1 : eval_expr(rp->ci);
-    if (value)
-	elem->value1 = eval_expr(rp->vi);
+    // element may be set AND element not set in this cycle
+    if ((elem->dir & DIR_OUT) && (elem->clk != clk)) { 
+	int32_t value = (rp->ci == INVALID_INDEX) ? 1 : eval_expr(rp->ci);
+	if (value) {
+	    elem->new.i32 = eval_expr(rp->vi);
+	    elem->clk = clk;
+	}
+    }
+}
+
+static void candy_run_event(candy_rule_t* rp)
+{
+    candy_run_rule_(&event, cycle->cur.u32);
+    candy_pop();
 }
 
 static void candy_run_rules()
 {
     int i;
+    uint32_t clk = cycle->cur.u32;
     for (i = 0; i < nrules; i++) {
-	candy_run_rule(&rule[i]);
+	candy_run_rule_(&rule[i], clk);
     }
 }
 
@@ -1457,10 +1619,13 @@ static void candy_parse_line(char* buf)
 #ifdef DEBUG
     print_tokens(ts, n);
 #endif
+    candy_push();
     switch (candy_parse()) {
     case CANDY_EMPTY:
+	candy_pop();
 	break;
     case CANDY_ERR:
+	candy_pop();
 	candy_print_str("ERR\n");  // FIXME: add reason
 #ifdef DEBUG	
 	printf("parse error\n");
@@ -1468,6 +1633,7 @@ static void candy_parse_line(char* buf)
 #endif
 	break;
     case CANDY_DEF:
+	candy_commit();
 	candy_print_str("DEF ");
 	candy_print_str(element[nelements-1].name);
 	candy_print_str(" OK\n");
@@ -1478,6 +1644,7 @@ static void candy_parse_line(char* buf)
 #endif
 	break;
     case CANDY_RULE:
+	candy_commit();
 	candy_print_str("RULE ");
 	candy_print_str(element[rule[nrules-1].ei].name);
 	candy_print_str(" OK\n");	
@@ -1491,7 +1658,7 @@ static void candy_parse_line(char* buf)
 	candy_print_str("EVENT ");
 	candy_print_str(element[event.ei].name);
 	candy_print_str(" OK\n");
-#ifdef DEBUG	
+#ifdef DEBUG
 	printf("EVENT: ");
 	print_rule(&event);
 	printf("\n");
