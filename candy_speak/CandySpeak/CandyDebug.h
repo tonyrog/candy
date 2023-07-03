@@ -115,15 +115,15 @@ static void print_expr(xindex_t xi)
 	printf("0x%x[%d..%d]", xp->crange.id,
 	       xp->crange.bit_pos0,
 	       xp->crange.bit_pos0);
-	break;	
-    case EXPR_CAN_BIT:
-	if (xp->cbit.byte_pos == -1)
-	    printf("0x%x[%d]", xp->cbit.id, xp->cbit.bit_pos);
-	else
-	    printf("0x%x[%d,%d]",
-		   xp->cbit.id,
-		   xp->cbit.byte_pos,
-		   xp->cbit.bit_pos);
+	break;
+    case EXPR_CAN_BIT1:
+	printf("0x%x[%d]", xp->cbit.id, xp->cbit.bit_pos);
+	break;
+    case EXPR_CAN_BIT2:
+	printf("0x%x[%d,%d]",
+	       xp->cbit.id,
+	       xp->cbit.byte_pos,
+	       xp->cbit.bit_pos);
 	break;	
     case EXPR_LT:
     case EXPR_LTE:
@@ -137,7 +137,7 @@ static void print_expr(xindex_t xi)
     case EXPR_MINUS:
     case EXPR_TIMES:
     case EXPR_DIVIDE:
-    case EXPR_REMAINDER:		
+    case EXPR_REMAINDER:
 	print_expr(xp->bin.li);
 	printf(" %s ", format_op(xp->op));
 	print_expr(xp->bin.ri);
