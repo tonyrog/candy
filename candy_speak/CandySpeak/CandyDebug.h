@@ -65,8 +65,8 @@ static void print_element(candy_element_t* elem)
 	printf("#can %s %x[%d,%d]", elem->name,
 	       elem->can.id, elem->can.byte_pos, elem->can.bit_pos);
     case C_CAN_RANGE:
-	printf("#can %s %x[%d..%d]", elem->name,
-	       elem->canr.id, elem->canr.bit_pos0, elem->canr.bit_pos1);	
+	printf("#can %s %x[%d:%d]", elem->name,
+	       elem->canr.id, elem->canr.pos, elem->canr.len);	
     case C_TIMER:
 	printf("#timer %s %d",  elem->name, elem->timer.timeout);
 	break;
@@ -112,9 +112,8 @@ static void print_expr(xindex_t xi)
 	printf("%d", xp->v.i32);
 	break;
     case EXPR_CAN_RANGE:
-	printf("0x%x[%d..%d]", xp->crange.id,
-	       xp->crange.bit_pos0,
-	       xp->crange.bit_pos0);
+	printf("0x%x[%d:%d]", xp->crange.id,
+	       xp->crange.pos, xp->crange.len);
 	break;
     case EXPR_CAN_BIT1:
 	printf("0x%x[%d]", xp->cbit.id, xp->cbit.bit_pos);

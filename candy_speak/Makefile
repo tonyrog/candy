@@ -7,3 +7,6 @@ candy_speak:	candy_speak.o
 
 candy_speak.o:	candy_speak.c  CandySpeak/CandySpeak.h CandySpeak/CandyDebug.h
 	$(CC) -c $(CFLAGS) $<
+
+setup:
+	(cd CandySpeak; git clone https://github.com/tonyrog/bitpack)

@@ -12,9 +12,10 @@
 
 int main(int argc, char** argv)
 {
-    char linebuf[128];
+    char linebuf[MIN_LINE_LENGTH];
     FILE* fin = stdin;
     int i = 1;
+    int fixpoint = 0;
 
     candy_init();
     
@@ -39,12 +40,17 @@ int main(int argc, char** argv)
 	    if (fgets(linebuf, sizeof(linebuf), fin))
 		candy_parse_line(linebuf);
 	}
-	candy_read_input();         // read io/can/analog etc
-	if (nevents) {              // FIXME: event must be run immediate
+	candy_read_input();
+	if (nevents) {
 	    candy_run_event(&event);
 	    nevents = 0;
 	}
-	candy_run_rules();          // generate new value
+	// fixme: set time/loop limit
+	do {
+	    candy_run_rules();
+	} while(fixpoint && nupdates);
+
+	candy_emit_frames();	
 	candy_write_output();
     }
     exit(0);

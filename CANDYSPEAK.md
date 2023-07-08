@@ -100,6 +100,7 @@ the case for multiple bit selection.
 		| '>' reset               // reset all variable/rules ...
 		| '>' push                // push current variables/rule-set
 		| '>' pop                 // pop to previous variables/rule-set
+		| '>' save                // make current rule set permanent
 
 	<declaration> :=
 		  '#' 'digital' <name> [<port>':']<pin>
@@ -119,8 +120,7 @@ the case for multiple bit selection.
 		| <name>
 		
 	<can-bit> :=
-		  <frame-id> 0..7 <hex2> <hex2> <hex2>
-		| <frame-id> '[' <bit-pos> ']'
+		  <frame-id> '[' <bit-pos> ']'
 		| <frame-id> '[' <byte-pos> ',' <bit-pos> ']'
 	
     <frame-id> := <hex>
@@ -128,7 +128,7 @@ the case for multiple bit selection.
 	<pin> := <int> | <name>
 	<bits> := <int>
 	<byte-pos> := 0..7 | 0..63
-	<bit-pos>  := 0..7 | 0..512
+	<bit-pos>  := 0..7 | 0..511
 	<hex-digit> [0..9a..fA..F]
 	<hex> := '0x' <hex-digit>+
 	<hex2> := '0x' (<hex-digit> | <hex-digit><hex-digit>)
@@ -136,99 +136,74 @@ the case for multiple bit selection.
 	<name> = <char>+
 	<constant> = <int> | <hex>
 
-# Normalisation
-
-To get a reasonable output from the above expression and
-statements only one "definition" ('=') per output should be
-given or one for ON (OUT '<') and one for OFF (!OUT '<') should
-be given
-
-For example two definitions of output A
-
-    A = Y ; (U, V)
-	A = X
-
-is not reasonable but
-
-    A < Y ; (U, V)
-	!A < X
-	
-may be, in this case there are situations where A
-is neither turn on of turned off.
-
-    A < X
-	A < Y
-
-Can be rewritten as
-
-	A < X; Y
-
-and
-
-	A < X
-	!A < !X
-
-can be rewritten to
-
-    A = X
-	
 # Interpretation of old single line or multiple lines
 
 The current output is just one single line, for example
 
     0x218 2 0x40 0x40 0x00
 
-The interpretation of this line is, where DEFOUT is the,
+The interpretation of this line is, where DEF_OUT is the,
 currently, only output.
 
-	DEFOUT = 0x218[2,1]
+	DEF_OUT = 1 ? (0x218[2,1] == 1)
+	DEF_OUT = 0 ? (0x218[2,1] == 0)
 
 But for multiple bits the story is a bit different
 
     0x218 2 0x30 0x30 0x00
 
-This should be interpreted as 
+The interpretation is coded as:
 
-	DEFOUT = 0x218[2,2], 0x218[2,3]
-
-But in reality it is interpreted as
-
-	DEFOUT = 0x218[2,2]; 0x218[2,3]
+	DEF_OUT = 1 ? (0x218[2,2] == 1)
+	DEF_OUT = 1 ? (0x218[2,3] == 1)
 	
-The suggestion is to interpret multiple bits selected bits as an OR
-expression (;) so two lines like
-
+	DEF_OUT = 0 ? (0x218[2,2] == 0)
+	DEF_OUT = 0 ? (0x218[2,3] == 0)
+	
+On take precedence over Off, but multiple old lines
+won't really work:
+	
     0x218 2 0x40 0x40 0x00
     0x219 3 0xC0 0xC0 0x00
-	
+
 Is coded as
 
-	DEFOUT = 0x218[2,1]; 0x219[3,0]; 0x219[3,1]
+    DEF_OUT = 1 ? (0x218[2,1] == 1)
+    DEF_OUT = 0 ? (0x218[2,1] == 0)
+	
+    DEF_OUT = 1 ? (0x219[3,0] == 1)
+    DEF_OUT = 1 ? (0x219[3,1] == 1)
+    DEF_OUT = 0 ? (0x218[3,0] == 0)	
+    DEF_OUT = 0 ? (0x218[3,1] == 0)
+	
+Then the first Off will take precedence but the desired effect
+it probably to have all Off clauses after ALL On clauses.
 	
 # Extension to Analog
 
 FIXME: add signed/unsigned/little/big
 
     <a-statement> := 
-		| <statement>
+		  <statement>
 		| <a-declaration>
 		| <a-rule>
 		| <a-immediate>
 
 	<a-rule> :=
-	    <rule>
+	      <rule>
 		| <name> '=' <a-expr> '?' <a-cond>
 	
 	<a-immediate> := 
 		'>' <name> = <a-expr>
+		'>' <name>
 
 	<a-declaration> := 
-		| <declaration>
+		  <declaration>
 		| '#' 'analog' <name> [':'<size>] [<iodir>] [<port>':'] <pin>
 		| '#' 'can' <name> <can-range>
 
 	<a-cond> := 
-	  | '(' <a-cond> ')'
+	    '(' <a-cond> ')'
 	  | <a-cond> ',' <a-cond>
 	  | <a-cond> ';' <a-cond>
 	  ! '!' <a-cond>
@@ -250,12 +225,14 @@ FIXME: add signed/unsigned/little/big
       | <a-expr> '%' <a-expr>
 	  
 	<a-value> :=
-	  | <bit>
+	    <bit>
 	  | <can-range>
 	  | <name>
 	  | <constant>
 
-	<can-range> := <frame-id> '[' <bit-pos> '..' <bit-pos> ']'
+	<can-range> := 
+		  <frame-id> '[' <bit-pos> '..' <bit-pos> ']'
+		| <frame-id> '[' <bit-pos> ':' <bit-len> ']'
     <iodir> := 'in' | 'out' | 'inout'
 	
 # built in variables
