@@ -92,29 +92,32 @@ the case for multiple bit selection.
 		| <rule>
 		| <immediate>
 		
-	<rule> :=		
-		  <name> '=' <bit> '?' <cond>
+	<rule> :=
+		  <name> '=' <bit> '?' <condition>
 		  
 	<immediate> :=
-        | '>' <name> '=' <bit> |
+        | '>' <name> '=' <bit>    // set value
+        | '>' <name>              // print value
 		| '>' reset               // reset all variable/rules ...
 		| '>' push                // push current variables/rule-set
 		| '>' pop                 // pop to previous variables/rule-set
 		| '>' save                // make current rule set permanent
+		| '>' list                // list all rules (* is saved rules)
+		| '>' clear               // clear all rules and saved rules
 
 	<declaration> :=
-		  '#' 'digital' <name> [<port>':']<pin>
-          '#' 'variable' <name>[:1] ['=' '0'|'1']
+		  '#' 'digital' <name> <iodir> [<port>':']<pin>
+          '#' 'variable' <name>[':' '1'] ['=' '0'|'1']
 		| '#' 'can' <name> <can-bit>
 		 
-	<cond> :=
-		  <bit>
-		| '(' <cond> ')'
-		| <cond> ',' <cond>
-		| <cond> ';' <cond>
-		! '!' <cond>
+	<condition> :=
+		  <value>
+		| '(' <condition> ')'
+		| <condition> '&&' <condition>
+		| <condition> '||' <condition>
+		! '!' <condition>
 		
-	<bit> :=
+	<value> :=
 		  '0' | '1'
 	    | <can-bit>
 		| <name>
@@ -135,6 +138,7 @@ the case for multiple bit selection.
 	<int> := [0..9]+
 	<name> = <char>+
 	<constant> = <int> | <hex>
+    <iodir> := 'in' | 'out' | 'inout'	
 
 # Interpretation of old single line or multiple lines
 
@@ -191,7 +195,7 @@ FIXME: add signed/unsigned/little/big
 
 	<a-rule> :=
 	      <rule>
-		| <name> '=' <a-expr> '?' <a-cond>
+		| <name> '=' <a-expr> '?' <a-condition>
 	
 	<a-immediate> := 
 		'>' <name> = <a-expr>
@@ -200,13 +204,16 @@ FIXME: add signed/unsigned/little/big
 	<a-declaration> := 
 		  <declaration>
 		| '#' 'analog' <name> [':'<size>] [<iodir>] [<port>':'] <pin>
+        | '#' 'variable' <name>[':'<size>] ['=' <a-expr>]
+        | '#' 'constant' <name>[':'<size>] '=' <a-expr>
 		| '#' 'can' <name> <can-range>
 
-	<a-cond> := 
-	    '(' <a-cond> ')'
-	  | <a-cond> ',' <a-cond>
-	  | <a-cond> ';' <a-cond>
-	  ! '!' <a-cond>
+	<a-condition> := 
+        <a-expr>
+	  | '(' <a-condition> ')'
+	  | <a-condition> '&&' <a-condition>
+	  | <a-condition> '||' <a-condition>
+	  ! '!' <a-condition>
 	  | <a-expr> '==' <a-expr>
 	  | <a-expr> '!=' <a-expr>
       | <a-expr> '<' <a-expr>
@@ -225,7 +232,7 @@ FIXME: add signed/unsigned/little/big
       | <a-expr> '%' <a-expr>
 	  
 	<a-value> :=
-	    <bit>
+	    <can-bit>
 	  | <can-range>
 	  | <name>
 	  | <constant>
@@ -233,7 +240,6 @@ FIXME: add signed/unsigned/little/big
 	<can-range> := 
 		  <frame-id> '[' <bit-pos> '..' <bit-pos> ']'
 		| <frame-id> '[' <bit-pos> ':' <bit-len> ']'
-    <iodir> := 'in' | 'out' | 'inout'
 	
 # built in variables
 
@@ -287,22 +293,29 @@ not be checked.
 		| <t-immediate>
 		
 	<t-declaraion> := 
-		| <declaration>
+		| <a-declaration>
 		| '#' 'timer' <name> <milliseconds>
 
 	<t-rule> :=
 		<a-rule>
-		| <name> '=' 1 '?' <t-cond>             // start timer if
-		| <name> '=' 0 '?' <t-cond>             // stop timer if
-		| <name>.timeout = <a-expr> ? <t-cond>  // set timeout value
+		| <name> '=' 1 '?' <t-condition>    // start timer if
+		| <name> '=' 0 '?' <t-condition>    // stop timer if
+          // dynamic set timeout interval
+		| <name>.timeout = <t-expr> ? <t-condition>
 
 	<t-immediate> :=
 		<a-immediate>
 		| '>' <name> = <a-expr>         // start/stop timer
 		| '>' <name>.timeout = <a-expr> // set timeout value
 
-     <t-cond> := 
-	     | <name>             // timer name (running)
+     <t-condition> := 
+           <a-condition>
+	     | <t-expr>
+		 
+	 <t-expr> :=
+		 <a-expr>
+		 | 'timeout' '(' name ')'        // time is in timeout
+
 
 Timer <name> is true when timer (has been) running and is has a 
 timeout condition.
@@ -315,16 +328,16 @@ timeout condition.
 	// start timer when button is pressed	
 	debounce-timer = 1 ? button
 	// led=on when timeout and button is still pressed
-	led-state = (led_state+1) % 2 ? debounce_timer, button
+	led-state = (led_state+1) % 2 ? timeout(debounce_timer) && button
 	led = led-state
 
 # Tick program
 
-	#variable A:10 = 1   // declare a 10 bit variable A
-	#timer T1 1000       // declare a 1000ms (1s) timer 
-	A = A + 1 ? T1       // set A = A + 1 when timer T1 times out
-	T1 ? T1              // restart T1 when T1 times out
-	>T1 = 1              // start the timer T1
+	#variable A:10 = 1      // declare a 10 bit variable A
+	#timer T1 1000          // declare a 1000ms (1s) timer 
+	A = A + 1 ? timeout(T1) // set A = A + 1 when timer T1 times out
+	T1=1 ? timeout(T1)      // restart T1 when T1 times out
+	>T1 = 1                 // start the timer T1
 
 # loop from 1 to 10
 

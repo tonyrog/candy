@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <memory.h>
-#include <ctype.h>
 
 #include "bitpack/bitpack.h"
 
@@ -16,13 +15,16 @@
 #define MAX_NUM_ELEMENTS 32
 #define MAX_NUM_RULES    32
 #define MAX_NUM_EXPRS    64
+#define MAX_CODE_WORDS   64
 #define MAX_XNODES       5
+#define MAX_CAN_FRAMES   8
+#define DEFAULT_BIT_SIZE (sizeof(int)*8)
 
 typedef struct {
     uint32_t id;
     int8_t   byte_pos;   // 0..7  | 0..63 | -1
     uint16_t bit_pos;    // 0..7  | 0..512 |
-} can_bit_t;
+} candy_bit_t;
 
 // <frame-id> '[' pos0 .. pos1 ']  - extract pos1-pos0+1 bits (pos1 >= pos0)
 // <frame-id> '[' pos ':' len ']  - extract pos-(pos+len-1) len bits
@@ -30,7 +32,16 @@ typedef struct {
     uint32_t id;         // Frame ID
     uint16_t pos;   // 0..63  | 0..512 - start bit
     uint16_t len;   // 1..32           - number of bits
-} can_range_t;
+} candy_range_t;
+
+typedef struct {
+    uint32_t inhibit;   // ms before next frame
+    uint32_t last_tick; // tick for last send
+    uint32_t id;
+    uint8_t  mark;      // mark for transmission
+    uint8_t  len;
+    uint8_t data[8];
+} candy_frame_t;
 
 #define DIR_NONE  0x0
 #define DIR_IN    0x1
@@ -55,28 +66,6 @@ typedef struct {
     uint32_t flags;        
     tick_t start_tick;
 } ctimer_t;
-    
-enum {
-    T_END = 0,
-    T_DEC = 256,       // [-](0-9)+
-    T_HEX = 257,       // [-]0x(0-9A-Fa-f)+
-    T_WORD = 258,      // [A-Za-z_@][0-9A-Za-z_@]
-    T_DIGITAL = 259,   // #digital
-    T_ANALOG = 260,   // #analog
-    T_TIMER = 261,    // #timer
-    T_CAN = 262,       // #can
-    T_VARIABLE = 263, // #variable
-    T_CONSTANT = 264,    // #constant
-    T_IN = 265,         // in
-    T_OUT = 266,       // out
-    T_INOUT = 267,     // inout
-};
-
-typedef struct {
-    const char* ptr;  // pointer into input buffer
-    uint16_t len;     // string length    
-    uint16_t tval;    // token value (char | 256..263..)
-} token_t;
 
 // Def :=
 // '#' 'constant' <name> [:<size>] '=' Value
@@ -112,9 +101,9 @@ typedef enum {
     C_VARIABLE  = 2,    
     C_DIGITAL   = 3,
     C_ANALOG    = 4,
-    C_CAN_BIT1  = 5,   // bitpos
-    C_CAN_BIT2  = 6,   // byte & bit
-    C_CAN_RANGE = 7,
+    C_CANDY_BIT1  = 5,   // bitpos
+    C_CANDY_BIT2  = 6,   // byte & bit
+    C_CANDY_RANGE = 7,
     C_TIMER     = 8,
 } candy_element_type_t;
 
@@ -147,19 +136,19 @@ typedef struct _candy_element_t {
     candy_value_t cur;  // current value
     candy_value_t nxt;  // new output value
     union {
-	portbit_t   io;
-	can_bit_t   can;
-	can_range_t canr;
-	ctimer_t    timer;
+	portbit_t     io;
+	candy_bit_t   can;
+	candy_range_t canr;
+	ctimer_t      timer;
     };
 } candy_element_t;
 
 typedef enum {
     EXPR_NAME,  // analog/digital/variable/timer...
     EXPR_CONST, // constant value
-    EXPR_CAN_RANGE,
-    EXPR_CAN_BIT1,   // bitpos FrameID[bit-pos]
-    EXPR_CAN_BIT2,   // byte&bit-pos  FrameID[byte-pos,bit-pos]
+    EXPR_CANDY_RANGE,
+    EXPR_CANDY_BIT1,   // bitpos FrameID[bit-pos]
+    EXPR_CANDY_BIT2,   // byte&bit-pos  FrameID[byte-pos,bit-pos]
     // rel-op
     EXPR_LT,        // A < B
     EXPR_LTE,       // A <= B
@@ -169,8 +158,8 @@ typedef enum {
     EXPR_NEQ,       // A != B
     // logic-op
     EXPR_NOT,       // !A    
-    EXPR_OR,        // A ; B
-    EXPR_AND,       // A , B
+    EXPR_OR,        // A || B
+    EXPR_AND,       // A && B
     // arith-op
     EXPR_NEG,       // -A
     EXPR_PLUS,      // A + B
@@ -178,7 +167,17 @@ typedef enum {
     EXPR_TIMES,     // A * B
     EXPR_DIVIDE,    // A / B
     EXPR_REMAINDER, // A % B
+    EXPR_BAND,      // A & B
+    EXPR_BOR,       // A | B
+    EXPR_BXOR,      // A ^ B
+    EXPR_BNOT,      // ~A
+    EXPR_BSL,       // A << B
+    EXPR_BSR,       // A >> B
+
+    EXPR_JZ,        // followed by label
+    EXPR_JNZ,       // followed by label
 } candy_op_t;
+
 
 #define INVALID_INDEX 0xffff   // may not be used as index
 typedef uint16_t  xindex_t;    // expr index
@@ -187,12 +186,12 @@ typedef uint16_t  eindex_t;    // element index
 typedef struct _candy_expr_t {
     candy_op_t op;
     union {
-	candy_value_t v;                     // CONST (depend on type)
-	eindex_t     ei;                     // NAME element[ei]
-	can_range_t  crange;                 // CAN_RANGE
-	can_bit_t    cbit;                   // CAN_BIT
-	xindex_t     mi;                     // NOT, NEG
-	struct {  // bin-op: LT,LTE,GT,GTE,EQ,NEQ,AND,OR...
+	candy_value_t v;         // CONST (depend on type)
+	eindex_t     ei;         // NAME element[ei]
+	candy_range_t  crange;   // CANDY_RANGE
+	candy_bit_t    cbit;     // CANDY_BIT
+	xindex_t       una;      // EXPR_NOT, EXPR_NEG, EXPR_BNOT...
+	struct {  // EXPR_xxx
 	    xindex_t li;
 	    xindex_t ri;
 	} bin;
@@ -222,18 +221,22 @@ typedef enum {
     E_ELEM_OVERFLOW,      // too many element definitions
 } candy_error_t;
 
-
-token_t ts[MAX_NUM_TOKENS+1];
-
 int nelements;
 candy_element_t element[MAX_NUM_ELEMENTS];
 
 int nexprs;
 candy_expr_t expr[MAX_NUM_EXPRS];
 
+int ncodes;
+static int32_t code[MAX_CODE_WORDS];  // 2-bit tagged 30-bit signed integers!
+
 int nrules;
 candy_rule_t rule[MAX_NUM_RULES];
 
+int nframes;
+candy_frame_t send[MAX_CAN_FRAMES];
+candy_frame_t recv[MAX_CAN_FRAMES];
+		   
 int nstr;
 char str[MAX_STRING_TAB];
 
@@ -243,7 +246,7 @@ candy_rule_t event;
 
 int nupdates; // number of elements updated during rules eval
 
-int verbose = 0;
+int verbose = 1;
 
 int sp = 0;
 candy_state_t stack[STACK_SIZE];
@@ -279,19 +282,40 @@ candy_error_t candy_errno = E_OK;
 #define RW_VARIABLE_BOOL(elem, name, value) \
     VARIABLE((elem), (name), DIR_INOUT, BOOL, 1, (value))
 
+
+static int can_recv_find(uint32_t id)
+{
+    int i;
+    for (i = 0; i < nframes; i++) {
+	if (recv[i].id == id)
+	    return i;
+    }
+    return -1;
+}
+
+static int can_send_find(uint32_t id)
+{
+    int i;
+    for (i = 0; i < nframes; i++) {
+	if (send[i].id == id)
+	    return i;
+    }
+    return -1;
+}
+
 // boards:
-// ARUDINO_AVR_UNO
-// ARUDINO_AVR_DUEMILANOVE
-// ARDUINO_ITSYBITSY_M0
-// ARDUINO_SAM_DUE
+// ARDUINO_AVR_UNO
+// ARDUINO_AVR_DUEMILANOVE
+// ARUDINO_ITSYBITSY_M0
+// ARUDINO_SAM_DUE
 // ARDUINO_SAM3X8E
 // ARDUINO_SAM_ZERO
 // SAMD_SERIES
 // .. boards.txt howto find families and properties?
 // platform.txt ?
 
-
 #ifdef ARDUINO
+#include <Arduino_CAN.h>
 #if defined(ARDUINO_ZERO) || defined(ARDUINO_DUE) || defined(ARDUINO_MKR)
 #define MAX_ADC_RESOLUTION 12
 #define MAX_DAC_RESOLUTION 12
@@ -327,9 +351,41 @@ static size_t candy_print_int(int val)
     return Serial.print(val);
 }
 
+static size_t candy_print_hex(int val)
+{
+    return Serial.print(val, HEX);
+}
+
 static size_t candy_print_ln()
 {
     return Serial.println();
+}
+
+static void candy_can_init()
+{
+    CAN.begin(CanBitRate::BR_250k);
+}
+
+static void candy_send_can_frame(candy_frame_t* cframe)
+{
+    CanMsg msg(cframe->id, cframe->len, cframe->data);
+    CAN.write(msg);
+}
+
+static int candy_recv_can_frame(tick_t t)
+{
+    if (CAN.available()) {
+	int i;
+	CanMsg const msg = CAN.read();
+	if ((i = can_recv_find(msg.id)) >= 0) {
+	    memcpy(recv[i].data, msg.data, msg.data_length);
+	    recv[i].len = msg.data_length;
+	    recv[i].mark = 1;
+	    recv[i].last_tick = t;
+	}
+	return 1;
+    }
+    return 0;
 }
     
 #else
@@ -352,6 +408,16 @@ static tick_t time_tick(void)
     return t.tv_sec*1000 + t.tv_usec/1000;
 }
 
+static size_t candy_print_char(char c)
+{
+    return printf("%c", c);
+}
+
+static size_t candy_print_str_len(const char* str, int len)
+{
+    return printf("%.*s", len, str);
+}
+
 static size_t candy_print_str(const char* str)
 {
     return printf("%s", str);
@@ -362,9 +428,27 @@ static size_t candy_print_int(int val)
     return printf("%d", val);    
 }
 
+static size_t candy_print_hex(int val)
+{
+    return printf("%x", val);    
+}
+
 static size_t candy_print_ln()
 {
     return printf("\n");
+}
+
+static void candy_can_init()
+{
+}
+
+static void candy_send_can_frame(candy_frame_t* cframe)
+{
+}
+
+static int candy_recv_can_frame(tick_t t)
+{
+    return 0;
 }
 
 #endif
@@ -385,12 +469,9 @@ static size_t candy_print_error(candy_error_t err)
 }
 
 // Must be called with in about half an hour since
-static uint32_t time_elapsed_ms(tick_t since, tick_t* nowp)
+static uint32_t time_elapsed_ms(tick_t since, tick_t now)
 {
-    tick_t now = time_tick();
-    uint32_t td  = now - since;
-    if (nowp) *nowp = now;
-    return td;
+    return now - since;
 }
 
 static void candy_push()
@@ -431,14 +512,15 @@ static void candy_reset()
     nstr      = 0;
     nevents   = 0;
     sp        = 0;
-    nupdates  = 0;    
+    nupdates  = 0;
+    nframes   = 0;
 
     xp = &expr[i=nexprs++];
     xp->op = EXPR_CONST;
     xp->v.i32 = 0;
     expr_vi_0 = i;
 
-    xp = &expr[i=nexprs++];    
+    xp = &expr[i=nexprs++];
     xp->op = EXPR_CONST;
     xp->v.i32 = 1;
     expr_vi_1 = i;
@@ -459,6 +541,12 @@ static void candy_reset()
 #include "CandyDebug.h"
 #endif
 
+#include "CandyParse.h"
+
+token_t ts[MAX_NUM_TOKENS+1];
+
+
+
 static char* make_str8(const char** pptr, token_t* tp)
 {
     char* dst = &str[nstr];
@@ -473,74 +561,6 @@ static char* make_str8(const char** pptr, token_t* tp)
     nstr += (tp->len+2);
     return dst;
 }
-
-static int dec_to_int(const char* ptr, int len)
-{
-    int x = 0, sign = 0;
-    if (ptr[0] == '-') {
-	sign = 1;
-	ptr++;
-	len--;
-    }
-    while(len) {
-	x = 10*x + (*ptr - '0');
-	ptr++;
-	len--;
-    }
-    return sign ? -x : x;
-}
-
-static int hex_to_int(const char* ptr, int len)
-{
-    int x = 0, sign = 0;
-    if (ptr[0] == '-') {
-	sign = 1;
-	ptr++;
-	len--;
-    }
-    if ((ptr[0] == '0') && (ptr[1] == 'x')) {
-	ptr += 2;
-	len -= 2;
-    }
-    while(len) {
-	if (isdigit(*ptr))
-	    x = 16*x + (*ptr - '0');
-	else if (isupper(*ptr))
-	    x = 16*x + ((*ptr - 'A')+10);
-	else if (islower(*ptr))
-	    x = 16*x + ((*ptr - 'a')+10);
-	ptr++;
-	len--;
-    }
-    return sign ? -x : x;
-}
-
-static int tok_to_int(token_t* tp)
-{
-    if (tp->tval == T_HEX)
-	return hex_to_int(tp->ptr, tp->len);
-    else if (tp->tval == T_DEC)
-	return dec_to_int(tp->ptr, tp->len);
-    return -1;
-}
-	
-static int tokeq(const char* name, token_t* tp)
-{
-    const char* tptr = tp->ptr;
-    int len = tp->len;
-    while(len) {
-	if (*name != *tptr)
-	    return 0;
-	name++;
-	tptr++;
-	len--;
-    }
-    if ((len == 0) && (*name == '\0'))
-	return 1;
-    return 0;
-}
-
-#define T(tv,i,v) ((tv)[(i)].tval == (v))
 
 static eindex_t lookup_element_by_str(const char* str, uint16_t len)
 {
@@ -563,56 +583,6 @@ static eindex_t lookup_element(token_t* tp)
     return lookup_element_by_str(tp->ptr, tp->len);
 }
 
-static char* candy_tok0(char* p, token_t* tp)
-{
-    int i;
-    if (p[0]=='-') {
-	if ((p[1]=='0') && (p[2]== 'x')) { // hex
-	    i = 3;
-	    goto hex;
-	}
-	if (isdigit(p[1])) {
-	    i = 2;
-	    goto dec;
-	}
-    }
-    else if ((p[0]=='0') && (p[1]== 'x')) { // hex
-	i = 2;
-	goto hex;
-    }
-    else if (isdigit(p[0])) {
-	i = 1;
-	goto dec;
-    }
-    else if (isalpha(p[0]) || (p[0]=='_') || (p[0]=='@')) {
-	i = 1;
-	goto word;
-    }
-    tp->tval = p[0];
-    return p+1; 
-    
-word:
-    while(isalnum(p[i]) || (p[i]=='_') || (p[i]=='@'))
-	i++;
-    tp->tval = T_WORD;
-    return p+i;
-dec:	    
-    while (isdigit(p[i]))
-	i++;
-    tp->tval = T_DEC;
-    return p+i;
-
-hex:
-    while (isxdigit(p[i]))
-	i++;
-    tp->tval = T_HEX;
-    return p+i;
-}
-
-int is_const(int tok)
-{
-    return ((tok == T_DEC)||(tok == T_HEX));
-}
 
 // '#' 'digital' <name> [IODir] [Port ':'] Pin
 
@@ -672,6 +642,8 @@ int is_digital_pin(int tok)
     return ((tok == T_DEC)||(tok == T_WORD));
 }
 
+#define T(tv,i,v) ((tv)[(i)].tval == (v))
+
 // '#' 'digital' <name> [<iodir>] [<port> ':'] <pin>
 static int candy_parse_digital(int j)
 {
@@ -697,7 +669,7 @@ static int candy_parse_digital(int j)
     element[k].size = 1;
     element[k].dir = dir;
 
-    if (T(ts,j,T_DEC) && T(ts,j+1,':') &&
+    if (T(ts,j,T_DEC) && T(ts,j+1,T_COLON) &&
 	is_digital_pin(ts[j+2].tval) && T(ts,j+3,T_END)) {
 	element[k].io.port = tok_to_int(&ts[j]);
 	if ((element[k].io.pin = tok_to_digital_pin(&ts[j+2],dir)) < 0)
@@ -796,7 +768,7 @@ static int candy_parse_analog(int j)
 	return CANDY_ERROR(E_SYNTAX);
     j++;
     element[k].type = C_ANALOG;
-    if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
+    if (T(ts,j,T_COLON) && T(ts,j+1,T_DEC)) {
 	int n = tok_to_int(&ts[j+1]);
 	element[k].size = (n > MAX_ADC_RESOLUTION) ? MAX_ADC_RESOLUTION : n;
 	j += 2;
@@ -814,7 +786,7 @@ static int candy_parse_analog(int j)
 	j++;
     }
     element[k].dir = dir;
-    if (T(ts,j,T_DEC) && T(ts,j+1,':') && is_analog_pin(ts[j+2].tval) &&
+    if (T(ts,j,T_DEC) && T(ts,j+1,T_COLON) && is_analog_pin(ts[j+2].tval) &&
 	T(ts,j+3,T_END)) {
 	element[k].io.port = tok_to_int(&ts[j]);
 	if ((element[k].io.pin =  tok_to_analog_pin(&ts[j+2],dir)) == -1)
@@ -853,7 +825,7 @@ static int candy_parse_timer(int j)
     if (!T(ts,j,T_END))
 	return CANDY_ERROR(E_SYNTAX);
     element[k].type = C_TIMER;
-    element[k].size = sizeof(int)*8;
+    element[k].size = DEFAULT_BIT_SIZE;
     element[k].timer.flags = 0;
     element[k].vtype = INT32;
     element[k].dir   = DIR_INOUT;    
@@ -882,19 +854,21 @@ static int candy_parse_can(int j)
 	return CANDY_ERROR(E_SYNTAX);
     element[k].can.id = tok_to_int(&ts[j]);    
     j++;
-    if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,']') && T(ts,j+3,T_END)) {
-	element[k].type = C_CAN_BIT1;
+    if (T(ts,j,T_LEFT_BRACKET)&&T(ts,j+1,T_DEC)&&
+	T(ts,j+2,T_RIGHT_BRACKET) && T(ts,j+3,T_END)) {
+	element[k].type = C_CANDY_BIT1;
 	element[k].can.byte_pos = 0;  // not used
 	element[k].can.bit_pos = tok_to_int(&ts[4]);
     }    
-    else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,',') &&
-	     T(ts,j+3,T_DEC)&&T(ts,j+4,']')&&T(ts,j+5,T_END)) {
-	element[k].type = C_CAN_BIT2;
+    else if (T(ts,j,T_LEFT_BRACKET)&&T(ts,j+1,T_DEC)&&T(ts,j+2,T_COMMA) &&
+	     T(ts,j+3,T_DEC)&&T(ts,j+4,T_RIGHT_BRACKET)&&T(ts,j+5,T_END)) {
+	element[k].type = C_CANDY_BIT2;
 	element[k].can.byte_pos = tok_to_int(&ts[j+1]);
 	element[k].can.bit_pos = tok_to_int(&ts[j+3]);
     }
-    else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,'.') && T(ts,j+3,'.') &&
-	     T(ts,j+4,T_DEC)&&T(ts,j+5,']')&&T(ts,j+6,T_END)) {
+    else if (T(ts,j,T_LEFT_BRACKET)&&T(ts,j+1,T_DEC)&&T(ts,j+2,T_FULL_STOP) &&
+	     T(ts,j+3,T_FULL_STOP) &&
+	     T(ts,j+4,T_DEC)&&T(ts,j+5,T_RIGHT_BRACKET)&&T(ts,j+6,T_END)) {
 	int len;
 	int pos = tok_to_int(&ts[j+1]);
 	int pos1 = tok_to_int(&ts[j+4]);
@@ -902,28 +876,51 @@ static int candy_parse_can(int j)
 	    return CANDY_ERROR(E_RANGE);
 	if ((len = (pos1-pos)+1) > 32)
 	    return CANDY_ERROR(E_RANGE);
-	element[k].type = C_CAN_RANGE;	
+	element[k].type = C_CANDY_RANGE;	
 	element[k].canr.pos = pos;
 	element[k].canr.len = len;
     }
-    else if (T(ts,j,'[')&&T(ts,j+1,T_DEC)&&T(ts,j+2,':') &&
-	     T(ts,j+3,T_DEC)&&T(ts,j+4,']')&&T(ts,j+5,T_END)) {
+    else if (T(ts,j,T_LEFT_BRACKET)&&T(ts,j+1,T_DEC)&&T(ts,j+2,T_COLON) &&
+	     T(ts,j+3,T_DEC)&&T(ts,j+4,T_RIGHT_BRACKET)&&T(ts,j+5,T_END)) {
 	int pos = tok_to_int(&ts[j+1]);
 	int len = tok_to_int(&ts[j+3]);
 	if ((pos < 0) || (pos >= 512) || (len <= 0) || (len > 32))
 	    return CANDY_ERROR(E_RANGE);	    
-	element[k].type = C_CAN_RANGE;	
+	element[k].type = C_CANDY_RANGE;	
 	element[k].canr.pos = pos;
 	element[k].canr.len = len;
     } 
     else
 	return CANDY_ERROR(E_SYNTAX);
+    // create or remove a frame
+    if (can_recv_find(element[k].can.id) < 0) {
+	int j;
+	if ((j=nframes) >= MAX_CAN_FRAMES)
+	    return CANDY_ERROR(E_RANGE);
+	send[j].inhibit = 50;  // 20Hz!
+	send[j].last_tick = 0;	
+	send[j].id = element[k].can.id;
+	send[j].mark = 0;
+	send[j].len = 8;
+	memset(send[j].data, 0, sizeof(send[j].data));
+	recv[j].id = element[k].can.id;
+	send[j].inhibit = 50;  // 20Hz!
+	send[j].last_tick = 0;
+	send[j].mark = 0;	
+	recv[j].len = 8;
+	memset(recv[j].data, 0, sizeof(recv[j].data));
+	nframes++;
+    }
     element[k].vtype = INT32;
     element[k].dir   = DIR_IN;
     element[k].cur.i32 = element[k].nxt.i32 = 0;
-    element[k].clk = 0;    
+    element[k].clk = 0;
     make_str8(&element[k].name, &ts[j0]);
     nelements++;
+
+    
+
+    
     return CANDY_DEF;    
 }
 //
@@ -939,15 +936,15 @@ static int candy_parse_constant(int j)
 	return CANDY_ERROR(E_SYNTAX);
     j++;
     element[k].type = C_CONSTANT;
-    element[k].size = 1; // fixme: default size?
-    if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
+    element[k].size = DEFAULT_BIT_SIZE;
+    if (T(ts,j,T_COLON) && T(ts,j+1,T_DEC)) {
 	element[k].size = tok_to_int(&ts[j+1]);
 	j += 2;
     }
     element[k].vtype = INT32;
     element[k].dir   = DIR_IN;
     element[k].clk   = 0;    
-    if (T(ts,j,'=') && is_const(ts[j+1].tval) && T(ts,j+2,T_END)) {
+    if (T(ts,j,T_EQUALS_SIGN) && is_const(ts[j+1].tval) && T(ts,j+2,T_END)) {
 	element[k].cur.i32 = tok_to_int(&ts[j+1]);
 	element[k].nxt.i32 = element[k].cur.i32;
     }
@@ -971,8 +968,8 @@ static int candy_parse_variable(int j)
 	return CANDY_ERROR(E_SYNTAX);
     j++;
     element[k].type = C_VARIABLE;
-    element[k].size = 1;  // fixme: default size? 
-    if (T(ts,j,':') && T(ts,j+1,T_DEC)) {
+    element[k].size = DEFAULT_BIT_SIZE;
+    if (T(ts,j,T_COLON) && T(ts,j+1,T_DEC)) {
 	element[k].size = tok_to_int(&ts[j+1]);
 	j += 2;
     }
@@ -1013,7 +1010,7 @@ static xindex_t candy_parse_avalue(int* ppos)
 {
     int j = *ppos;
     
-    if (T(ts,j,'(')) {
+    if (T(ts,j,T_LEFT_PARANTHESES)) {
 	xindex_t xi;
 	j++;
 	if (is_cond_expr) {
@@ -1024,16 +1021,16 @@ static xindex_t candy_parse_avalue(int* ppos)
 	    if ((xi = candy_parse_expr(&j)) == INVALID_INDEX)
 		return INVALID_INDEX;
 	}
-	if (T(ts,j,')')) {
+	if (T(ts,j,T_RIGHT_PARANTHESES)) {
 	    *ppos = j+1;
 	    return xi;
 	}
 	return CANDY_INVALID(E_SYNTAX);  // missing ')'
     }
     else if (T(ts,j,T_HEX) &&
-	     T(ts,j+1,'[') && is_const(ts[j+2].tval) &&	
-	     T(ts,j+3,'.') && T(ts,j+4,'.') &&
-	     is_const(ts[j+5].tval) && T(ts,j+6,']')) {
+	     T(ts,j+1,T_LEFT_BRACKET) && is_const(ts[j+2].tval) &&	
+	     T(ts,j+3,T_FULL_STOP) && T(ts,j+4,T_FULL_STOP) &&
+	     is_const(ts[j+5].tval) && T(ts,j+6,T_RIGHT_BRACKET)) {
 	candy_expr_t* xp = &expr[nexprs];
 	int len;
 	int pos = tok_to_int(&ts[j+2]);
@@ -1042,7 +1039,7 @@ static xindex_t candy_parse_avalue(int* ppos)
 	    return CANDY_INVALID(E_SYNTAX);
 	if ((len = (pos1-pos)+1) > 32)
 	    return CANDY_INVALID(E_RANGE);
-	xp->op = EXPR_CAN_RANGE;
+	xp->op = EXPR_CANDY_RANGE;
 	xp->crange.id = tok_to_int(&ts[j]);
 	xp->crange.pos = pos;
 	xp->crange.len = len;
@@ -1050,8 +1047,9 @@ static xindex_t candy_parse_avalue(int* ppos)
 	return nexprs++;
     }
     else if (T(ts,j,T_HEX) &&
-	     T(ts,j+1,'[') && is_const(ts[j+2].tval) &&	
-	     T(ts,j+3,':') && is_const(ts[j+4].tval) && T(ts,j+5,']')) {
+	     T(ts,j+1,T_LEFT_BRACKET) && is_const(ts[j+2].tval) &&	
+	     T(ts,j+3,T_COLON) && is_const(ts[j+4].tval) &&
+	     T(ts,j+5,T_RIGHT_BRACKET)) {
 	candy_expr_t* xp = &expr[nexprs];
 	int pos = tok_to_int(&ts[j+2]);
 	int len = tok_to_int(&ts[j+4]);
@@ -1059,7 +1057,7 @@ static xindex_t candy_parse_avalue(int* ppos)
 	    return CANDY_INVALID(E_RANGE);
 	if (len > 32)
 	    return CANDY_INVALID(E_RANGE);
-	xp->op = EXPR_CAN_RANGE;
+	xp->op = EXPR_CANDY_RANGE;
 	xp->crange.id = tok_to_int(&ts[j]);
 	xp->crange.pos = pos;
 	xp->crange.len = len;
@@ -1067,14 +1065,14 @@ static xindex_t candy_parse_avalue(int* ppos)
 	return nexprs++;
     }    
     else if (T(ts,j,T_HEX) &&
-	     T(ts,j+1,'[') &&
+	     T(ts,j+1,T_LEFT_BRACKET) &&
 	     is_const(ts[j+2].tval) &&	
-	     T(ts,j+3,',') &&
+	     T(ts,j+3,T_COMMA) &&
 	     is_const(ts[j+4].tval) &&
-	     T(ts,j+5,']')) {
+	     T(ts,j+5,T_RIGHT_BRACKET)) {
 	candy_expr_t* xp = &expr[nexprs];
 	int byte_pos, bit_pos;
-	xp->op = EXPR_CAN_BIT2;
+	xp->op = EXPR_CANDY_BIT2;
 	xp->cbit.id = tok_to_int(&ts[j]);
 	byte_pos = tok_to_int(&ts[j+2]);
 	bit_pos = tok_to_int(&ts[j+4]);
@@ -1088,11 +1086,11 @@ static xindex_t candy_parse_avalue(int* ppos)
 	return nexprs++;
     }
     else if (T(ts,j,T_HEX) &&
-	     T(ts,j+1,'[') &&
+	     T(ts,j+1,T_LEFT_BRACKET) &&
 	     is_const(ts[j+2].tval) &&	
-	     T(ts,j+3,']')) {
+	     T(ts,j+3,T_RIGHT_BRACKET)) {
 	candy_expr_t* xp = &expr[nexprs];
-	xp->op = EXPR_CAN_BIT1;
+	xp->op = EXPR_CANDY_BIT1;
 	xp->cbit.id = tok_to_int(&ts[j]);
 	xp->cbit.byte_pos = 0;  // bit used
 	xp->cbit.bit_pos = tok_to_int(&ts[j+2]);
@@ -1111,8 +1109,10 @@ static xindex_t candy_parse_avalue(int* ppos)
 	candy_expr_t* xp;
 	if ((ei = lookup_element(&ts[j])) == INVALID_INDEX) {
 #ifdef DEBUG
-	    fprintf(stderr, "word %.*s not found\n",
-		    ts[j].len, ts[j].ptr);
+	    candy_print_str("word ");
+	    candy_print_str_len(ts[j].ptr,ts[j].len);
+	    candy_print_str("not found");
+	    candy_print_ln();
 #endif
 	    return CANDY_INVALID(E_ELEMENT_NOT_FOUND);
 	}
@@ -1133,7 +1133,7 @@ static xindex_t candy_parse_mul(int* ppos)
     if ((li = candy_parse_avalue(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;
     j = *ppos;
-    while(T(ts,j,'*') || T(ts,j,'/') || T(ts,j,'%')) {
+    while(T(ts,j,T_STAR) || T(ts,j,T_SLASH) || T(ts,j,T_PERCENT)) {
 	xindex_t ri;
 	candy_expr_t* xp;
 	*ppos = j+1;
@@ -1141,9 +1141,9 @@ static xindex_t candy_parse_mul(int* ppos)
 	    return INVALID_INDEX;
 	xp = &expr[nexprs];
 	switch(ts[j].tval) {
-	case '*': xp->op = EXPR_TIMES; break;
-	case '/': xp->op = EXPR_DIVIDE; break;
-	case '%': xp->op = EXPR_REMAINDER; break;
+	case T_STAR: xp->op = EXPR_TIMES; break;
+	case T_SLASH: xp->op = EXPR_DIVIDE; break;
+	case T_PERCENT: xp->op = EXPR_REMAINDER; break;
 	default: return CANDY_INVALID(E_SYNTAX);
 	}
 	xp->bin.li = li;
@@ -1162,7 +1162,7 @@ static xindex_t candy_parse_add(int* ppos)
     if ((li = candy_parse_mul(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;
     j = *ppos;
-    while(T(ts,j,'+') || T(ts,j,'-')) {
+    while(T(ts,j,T_PLUS) || T(ts,j,T_MINUS)) {
 	xindex_t ri;	
 	candy_expr_t* xp;
 	*ppos = j+1;	
@@ -1170,8 +1170,8 @@ static xindex_t candy_parse_add(int* ppos)
 	    return INVALID_INDEX;
 	xp = &expr[nexprs];
 	switch(ts[j].tval) {
-	case '+': xp->op = EXPR_PLUS; break;
-	case '-': xp->op = EXPR_MINUS; break;
+	case T_PLUS: xp->op = EXPR_PLUS; break;
+	case T_MINUS: xp->op = EXPR_MINUS; break;
 	default: return CANDY_INVALID(E_SYNTAX);
 	}
 	xp->bin.li = li;
@@ -1198,35 +1198,17 @@ static xindex_t candy_parse_relation(int* ppos)
     if ((li = candy_parse_expr(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;
     j = *ppos;
-    if (T(ts,j,'<') && T(ts,j+1,'=')) {
-	op = EXPR_LTE;
-	j += 2;
-    }
-    else if (T(ts,j,'<')) {
-	op = EXPR_LT;
-	j += 1;
-    }
-    else if (T(ts,j,'>') && T(ts,j+1,'=')) {
-	op = EXPR_GTE;
-	j += 2;
-    }
-    else if (T(ts,j,'>')) {
-	op = EXPR_GT;
-	j += 1;
-    }
-    else if (T(ts,j,'=') && T(ts,j+1,'=')) {
-	op = EXPR_EQ;
-	j += 2;
-    }
-    else if (T(ts,j,'!') && T(ts,j+1,'=')) {
-	op = EXPR_NEQ;
-	j += 2;
-    }
-    else {
-	// fixme: check that li is boolean?
+    switch(ts[j].tval) {
+    case T_LESS_THAN_OR_EQUAL_SIGN: op = EXPR_LTE; break;
+    case T_LESS_THAN_SIGN: op = EXPR_LT; break;
+    case T_GREATER_THAN_OR_EQUAL_SIGN: op = EXPR_GTE; break;
+    case T_GREATER_THAN_SIGN: op = EXPR_GT; break;
+    case T_DOUBLE_EQUALS_SIGN: op = EXPR_EQ; break;
+    case T_NOT_EQUALS_SIGN: op = EXPR_NEQ; break;
+    default:
 	return li;
     }
-    *ppos = j;
+    *ppos = j+1;
     if ((ri = candy_parse_expr(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;	
     xp = &expr[nexprs];
@@ -1236,7 +1218,7 @@ static xindex_t candy_parse_relation(int* ppos)
     return nexprs++;
 }
 
-// A,B,C,D
+// A && B && C && D
 static xindex_t candy_parse_conjunction(int* ppos)
 {
     xindex_t li;
@@ -1245,8 +1227,8 @@ static xindex_t candy_parse_conjunction(int* ppos)
     if ((li = candy_parse_relation(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;
     j = *ppos;
-    while(T(ts,j,',')) {
-	xindex_t ri;        
+    while(T(ts,j,T_DOUBLE_AMPERSAND)) {
+	xindex_t ri;
 	candy_expr_t* xp;
 	*ppos = j+1;	
 	if ((ri = candy_parse_relation(ppos)) == INVALID_INDEX)
@@ -1261,7 +1243,7 @@ static xindex_t candy_parse_conjunction(int* ppos)
     return li;
 }
 
-// A;B;C;D
+// A || B || C || D
 static xindex_t candy_parse_disjunction(int* ppos)
 {
     xindex_t li;    
@@ -1270,7 +1252,7 @@ static xindex_t candy_parse_disjunction(int* ppos)
     if ((li = candy_parse_conjunction(ppos)) == INVALID_INDEX)
 	return INVALID_INDEX;
     j = *ppos;
-    while(T(ts,j,';')) {
+    while(T(ts,j,T_DOUBLE_VERTICAL_BAR)) {
 	xindex_t ri;
 	candy_expr_t* xp;
 	*ppos = j+1;
@@ -1310,18 +1292,21 @@ static int candy_parse_rule()
     if (!T(ts,0,T_WORD))
 	return CANDY_ERROR(E_SYNTAX);
     if ((rp->ei = lookup_element(&ts[0])) == INVALID_INDEX) {
-#ifdef DEBUG	
-	fprintf(stder, "element %.*s not found\n", ts[0].len, ts[0].ptr);
+#ifdef DEBUG
+	candy_print_str("element '");
+	candy_print_str_len(ts[0].ptr, ts[0].len);
+	candy_print_str("' not found)");
+	candy_print_ln();
 #endif
 	return CANDY_ERROR(E_ELEMENT_NOT_FOUND);
     }
-    if (!T(ts,1,'='))
+    if (!T(ts,1,T_EQUALS_SIGN))
 	return CANDY_ERROR(E_SYNTAX);
     j = 2;
     if ((rp->vi = candy_parse_expr(&j)) == INVALID_INDEX)
 	return CANDY_ERR;
     rp->ci = INVALID_INDEX;
-    if (T(ts,j,'?')) {
+    if (T(ts,j,T_QUESTION_MARK)) {
 	j++;
 	rp->ci = candy_parse_cond(&j);
     }
@@ -1353,7 +1338,7 @@ static int candy_parse_old_rule()
 	uint8_t  match_0   = tok_to_int(&ts[4]);
 	uint16_t ei;	
 	uint8_t  bit = 0x80;
-	can_bit_t cbit;
+	candy_bit_t cbit;
 	int i, k;
 
 	cbit.id = tok_to_int(&ts[0]);
@@ -1386,7 +1371,7 @@ static int candy_parse_old_rule()
 		if ((k=nexprs++) >= MAX_NUM_EXPRS)
 		    return CANDY_ERROR(E_EXPR_OVERFLOW);
 		cbit.bit_pos = i;
-		expr[k].op   = EXPR_CAN_BIT2;
+		expr[k].op   = EXPR_CANDY_BIT2;
 		expr[k].cbit = cbit;
 		rule[j].ei = ei;
 		rule[j].vi = expr_vi_1;
@@ -1405,7 +1390,7 @@ static int candy_parse_old_rule()
 		if ((k=nexprs++) >= MAX_NUM_EXPRS)
 		    return CANDY_ERROR(E_EXPR_OVERFLOW);
 		cbit.bit_pos = i;
-		expr[k].op   = EXPR_CAN_BIT2;
+		expr[k].op   = EXPR_CANDY_BIT2;
 		expr[k].cbit = cbit;
 		rule[j].ei = ei;
 		rule[j].vi = expr_vi_0;
@@ -1426,11 +1411,15 @@ static int candy_parse_event()
     eindex_t ei;
     
     nevents = 0;
-    if (T(ts,0,'>') && T(ts,1,T_WORD) && T(ts,2,'=')) {
+    if (T(ts,0,T_GREATER_THAN_SIGN) &&
+	T(ts,1,T_WORD) && T(ts,2,T_EQUALS_SIGN)) {
 	int j;
 	if ((ei = lookup_element(&ts[1])) == INVALID_INDEX) {
 #ifdef DEBUG
-	    fprintf(stderr, "element %.*s not found\n", ts[1].len, ts[1].ptr);
+	    candy_print_str("word ");
+	    candy_print_str_len(ts[1].ptr,ts[1].len);
+	    candy_print_str("not found");
+	    candy_print_ln();
 #endif
 	    return CANDY_ERROR(E_ELEMENT_NOT_FOUND);
 	}
@@ -1443,12 +1432,32 @@ static int candy_parse_event()
 	nevents = 1;
 	return CANDY_EVENT;
     }
-    else if (T(ts,0,'>') && T(ts,1,T_WORD) && T(ts,2,T_END)) {
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_WORD) && T(ts,2,T_END)) {
 	if ((ei = lookup_element(&ts[1])) == INVALID_INDEX)
 	    return CANDY_ERROR(E_ELEMENT_NOT_FOUND);
 	candy_print_int(element[ei].cur.i32);
 	candy_print_ln();
 	return CANDY_EVENT;	
+    }
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_RESET) && T(ts,2,T_END)) {
+	candy_reset();
+	return CANDY_EVENT;		
+    }
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_PUSH) && T(ts,2,T_END)) {
+	candy_push();  // FIXME: handle overflow
+	return CANDY_EVENT;
+    }
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_POP) && T(ts,2,T_END)) {
+	candy_pop();   // FIXME: handle underflow
+	return CANDY_EVENT;
+    }
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_LIST) && T(ts,2,T_END)) {
+	// list
+	return CANDY_EVENT;	
+    }
+    else if (T(ts,0,T_GREATER_THAN_SIGN) && T(ts,1,T_CLEAR) && T(ts,2,T_END)) {
+	// clear
+	return CANDY_EVENT;
     }
     return CANDY_ERROR(E_SYNTAX);    
 }
@@ -1481,58 +1490,13 @@ static int candy_parse()
 	return candy_parse_rule();
     case T_HEX:
 	return candy_parse_old_rule();
-    case '>':
+    case T_GREATER_THAN_SIGN:
 	return candy_parse_event();
     default:
 	return CANDY_ERROR(E_SYNTAX);
     }
 }
 
-int candy_scan_line(token_t* ts, char* ptr)
-{
-    int i = 0;
-next:
-    while(isblank(*ptr))
-	ptr++;
-    if ((ptr[0]=='/') && (ptr[1]=='/')) {
-	ts[i].tval = T_END;
-	ts[i].len = 0;
-	ts[i].ptr = "end";
-	return i;
-    }
-    else if ((*ptr == '\n') || (*ptr == '\0')) {
-	ts[i].tval = T_END;
-	ts[i].len = 0;
-	ts[i].ptr = "end";
-	return i;
-    }
-    ts[i].ptr = ptr;
-    ptr = candy_tok0(ptr, &ts[i]);
-    ts[i].len = ptr - ts[i].ptr;
-    // check for keywords
-    if (ts[i].tval==T_WORD) { 
-	if (tokeq("digital", &ts[i]))
-	    ts[i].tval = T_DIGITAL;
-	else if (tokeq("can", &ts[i]))
-	    ts[i].tval = T_CAN;
-	else if (tokeq("analog", &ts[i]))
-	    ts[i].tval = T_ANALOG;
-	else if (tokeq("timer", &ts[i]))
-	    ts[i].tval = T_TIMER;
-	else if (tokeq("variable", &ts[i]))
-	    ts[i].tval = T_VARIABLE;
-	else if (tokeq("constant", &ts[i]))
-	    ts[i].tval = T_CONSTANT;
-	else if (tokeq("in", &ts[i]))
-	    ts[i].tval = T_IN;
-	else if (tokeq("out", &ts[i]))
-	    ts[i].tval = T_OUT;
-	else if (tokeq("inout", &ts[i]))
-	    ts[i].tval = T_INOUT;
-    }
-    i++;
-    goto next;
-}
 
 int gpio_get(int port, int pin)
 {
@@ -1564,14 +1528,7 @@ void dac_set(int port, int pin, int value)
 #endif    
 }
 
-const uint8_t* can_frame_get(uint32_t id, int* lenp)
-{
-    if (id == 0x123) {
-	*lenp = 8;
-	return (uint8_t*) "\0\1\2\3\4\5\6\7";
-    }
-    return NULL;
-}
+    
 
 void candy_init()
 {
@@ -1584,21 +1541,21 @@ void candy_init()
     time_init();
 #ifdef ARDUINO
     analogReadResolution(MAX_ADC_RESOLUTION);
-    analogWriteResolution(MAX_DAC_RESOLUTION);    
+    analogWriteResolution(MAX_DAC_RESOLUTION);
 #endif
+    candy_can_init();
     candy_reset();
 }
 
 // <can-frame>'[' <bit-pos> ']'
-static int32_t candy_read_can_bit1(can_bit_t* cp, int32_t* valuep)
+static int32_t candy_read_candy_bit1(candy_bit_t* cp, int32_t* valuep)
 {
-    int len;
-    const uint8_t* ptr = can_frame_get(cp->id, &len);	    
-    if (ptr != NULL) {
+    int i;
+    if ((i = can_recv_find(cp->id)) >= 0) {
 	int bitpos = cp->bit_pos;
 	int pos = bitpos >> 3;  // byte pos
-	if (pos < len) {
-	    *valuep = get_bit_le(ptr, bitpos);
+	if (pos < recv[i].len) {
+	    *valuep = get_bit_be(recv[i].data, bitpos);
 	    return 1;
 	}
     }
@@ -1606,13 +1563,12 @@ static int32_t candy_read_can_bit1(can_bit_t* cp, int32_t* valuep)
 }
 
 // <can-frame>'['<byte-pos>',' <bit-pos>']'
-static int candy_read_can_bit2(can_bit_t* cp, int32_t* valuep)
+static int candy_read_candy_bit2(candy_bit_t* cp, int32_t* valuep)
 {
-    int len;
-    const uint8_t* ptr = can_frame_get(cp->id, &len);
-    if (ptr != NULL) {
-	if (cp->byte_pos < len) {
-	    *valuep = get_bit_le2(ptr, cp->byte_pos, cp->bit_pos);
+    int i;
+    if ((i = can_recv_find(cp->id)) >= 0) {
+	if (cp->byte_pos < recv[i].len) {
+	    *valuep = get_bit_be2(recv[i].data, cp->byte_pos, cp->bit_pos);
 	    return 1;
 	}
     }
@@ -1621,21 +1577,63 @@ static int candy_read_can_bit2(can_bit_t* cp, int32_t* valuep)
 
 // <frame-id>'[' <bit-pos1> '.''.' <bit-pos2>']'
 // <frame-id>'[' <bit-pos> ':' <bit-len> ']'
-static int candy_read_can_range(can_range_t* crp, int32_t* valuep)
+static int candy_read_candy_range(candy_range_t* crp, int32_t* valuep)
 {
-    int len;
-    const uint8_t* ptr = can_frame_get(crp->id, &len);
-
-    if (ptr != NULL) {
+    int i;
+    if ((i = can_recv_find(crp->id)) >= 0) {    
 	int bpos = (crp->pos + crp->len - 1) >> 3;
-
-	if (bpos < len) {
-	    get_bits_be(ptr, (uint32_t*)valuep, crp->pos, crp->len);
+	if (bpos < recv[i].len) {
+	    get_bits_be(recv[i].data, (uint32_t*)valuep, crp->pos, crp->len);
 	    return 1;
 	}
     }
     return 0;
 }
+
+
+// <can-frame>'[' <bit-pos> ']'
+static int32_t candy_write_candy_bit1(candy_bit_t* cp, int32_t value)
+{
+    int i;
+    if ((i = can_send_find(cp->id)) >= 0) {        
+	int bit_pos = cp->bit_pos;
+	int byte_pos = bit_pos >> 3;  // byte pos
+	if (byte_pos < send[i].len) {
+	    set_bit_be(send[i].data, bit_pos, value);
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+// <can-frame>'['<byte-pos>',' <bit-pos>']'
+static int candy_write_candy_bit2(candy_bit_t* cp, int32_t value)
+{
+    int i;
+    if ((i = can_send_find(cp->id)) >= 0) {    
+	if (cp->byte_pos < send[i].len) {
+	    set_bit_be2(send[i].data, cp->byte_pos, cp->bit_pos, value);
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+// <frame-id>'[' <bit-pos1> '.''.' <bit-pos2>']'
+// <frame-id>'[' <bit-pos> ':' <bit-len> ']'
+static int candy_write_candy_range(candy_range_t* crp, int32_t value)
+{
+    int i;
+    if ((i = can_send_find(crp->id)) >= 0) {        
+	int byte_pos = (crp->pos + crp->len - 1) >> 3;
+	if (byte_pos < send[i].len) {
+	    set_bits_be(send[i].data, value, crp->pos, crp->len);
+	    return 1;
+	}
+    }
+    return 0;
+}
+
 
 int32_t eval_expr(xindex_t xi)
 {
@@ -1643,21 +1641,21 @@ int32_t eval_expr(xindex_t xi)
     switch(xp->op) {
     case EXPR_NAME:      return element[xp->ei].cur.i32;
     case EXPR_CONST:     return xp->v.i32;
-    case EXPR_CAN_RANGE: {
+    case EXPR_CANDY_RANGE: {
 	int32_t val;
-	if (candy_read_can_range(&xp->crange, &val))
+	if (candy_read_candy_range(&xp->crange, &val))
 	    return val;
 	return 0;
     }
-    case EXPR_CAN_BIT1: {
+    case EXPR_CANDY_BIT1: {
 	int32_t val;
-	if (candy_read_can_bit1(&xp->cbit, &val))
+	if (candy_read_candy_bit1(&xp->cbit, &val))
 	    return val;
 	return 0;
     }
-    case EXPR_CAN_BIT2: {
+    case EXPR_CANDY_BIT2: {
 	int32_t val;
-	if (candy_read_can_bit2(&xp->cbit, &val))
+	if (candy_read_candy_bit2(&xp->cbit, &val))
 	    return val;
 	return 0;
     }	
@@ -1669,11 +1667,11 @@ int32_t eval_expr(xindex_t xi)
     case EXPR_EQ: return eval_expr(xp->bin.li) == eval_expr(xp->bin.ri);
     case EXPR_NEQ: return eval_expr(xp->bin.li) != eval_expr(xp->bin.ri);
     // logic-op
-    case EXPR_NOT: return !eval_expr(xp->mi);
+    case EXPR_NOT: return !eval_expr(xp->una);
     case EXPR_OR: return eval_expr(xp->bin.li) || eval_expr(xp->bin.ri);
     case EXPR_AND: return eval_expr(xp->bin.li) && eval_expr(xp->bin.ri);
     // arith-op
-    case EXPR_NEG: return -eval_expr(xp->mi);
+    case EXPR_NEG: return -eval_expr(xp->una);
     case EXPR_PLUS: return eval_expr(xp->bin.li) + eval_expr(xp->bin.ri);
     case EXPR_MINUS: return eval_expr(xp->bin.li) - eval_expr(xp->bin.ri);
     case EXPR_TIMES: return eval_expr(xp->bin.li) * eval_expr(xp->bin.ri);
@@ -1692,15 +1690,20 @@ int32_t eval_expr(xindex_t xi)
     }
 }
 
+static void candy_read_can_frames(tick_t t)
+{
+    while(candy_recv_can_frame(t))
+	;
+}
 
 // load all gpio/analog/can-data into the buffer value
-static void candy_read_input()
+static void candy_read_input(tick_t t)
 {
     int i;
 
     cycle->cur.u32++;
-    tick->cur.u32 = time_tick();
-    
+    tick->cur.u32 = t;
+
     for (i = 0; i < nelements; i++) {
 	candy_element_t* elem = &element[i];
 	switch(elem->type) {
@@ -1714,14 +1717,14 @@ static void candy_read_input()
 	    if (elem->dir & DIR_IN)
 		elem->cur.i32 = adc_get(elem->io.port, elem->io.pin);
 	    break;
-	case C_CAN_BIT1:
-	    candy_read_can_bit1(&elem->can, &elem->cur.i32);
+	case C_CANDY_BIT1:
+	    candy_read_candy_bit1(&elem->can, &elem->cur.i32);
 	    break;
-	case C_CAN_BIT2:
-	    candy_read_can_bit2(&elem->can, &elem->cur.i32);
+	case C_CANDY_BIT2:
+	    candy_read_candy_bit2(&elem->can, &elem->cur.i32);
 	    break;
-	case C_CAN_RANGE:
-	    candy_read_can_range(&elem->canr, &elem->cur.i32);
+	case C_CANDY_RANGE:
+	    candy_read_candy_range(&elem->canr, &elem->cur.i32);
 	    break;
 	case C_TIMER: {
 	    // true if timeout
@@ -1729,7 +1732,7 @@ static void candy_read_input()
 	    if (elem->timer.flags & C_TIMER_TIMEOUT)
 		elem->cur.i32 = 1;
 	    else if (elem->timer.flags & C_TIMER_RUNNING) {
-		uint32_t elapsed = time_elapsed_ms(elem->timer.start_tick,NULL);
+		uint32_t elapsed = time_elapsed_ms(elem->timer.start_tick,t);
 		if (elapsed >= elem->timer.timeout) {
 		    elem->cur.i32 = 1;
 		    elem->timer.flags &= ~C_TIMER_RUNNING;
@@ -1744,7 +1747,7 @@ static void candy_read_input()
     }
 }
 
-static void candy_write_output()
+static void candy_write_output(tick_t t)
 {
     int i;
     for (i = 0; i < nelements; i++) {
@@ -1807,16 +1810,29 @@ static void candy_write_output()
 		}
 	    }
 	    break;
-	case C_CAN_BIT1:
-	case C_CAN_BIT2:
-	case C_CAN_RANGE:
-	    if (latch->cur.u32) break;
-	    // fixme: write bits into can frame
+	case C_CANDY_BIT1: {
+	    if (latch->cur.u32) break;	    
+	    candy_write_candy_bit1(&elem->can, elem->nxt.i32);
+	    elem->cur.i32 = elem->nxt.i32;
 	    break;
+	}
+	    
+	case C_CANDY_BIT2: {
+	    if (latch->cur.u32) break;	    
+	    candy_write_candy_bit2(&elem->can, elem->nxt.i32);
+	    elem->cur.i32 = elem->nxt.i32;
+	    break;
+	}
+	case C_CANDY_RANGE: {
+	    if (latch->cur.u32) break;	    
+	    candy_write_candy_range(&elem->canr, elem->nxt.i32);
+	    elem->cur.i32 = elem->nxt.i32;
+	    break;
+	}
 	case C_TIMER:
 	    if (elem->nxt.i32 && !(elem->timer.flags & C_TIMER_RUNNING)) {
 		elem->cur.i32 = 0; // not timed out, just started
-		elem->timer.start_tick = time_tick();
+		elem->timer.start_tick = t;
 		elem->timer.flags |= C_TIMER_RUNNING;
 		elem->timer.flags &= ~C_TIMER_TIMEOUT;
 		if (verbose) {
@@ -1844,16 +1860,22 @@ static void candy_write_output()
 }
 
 // emit all updated CAN frames 
-static void candy_emit_frames()
+static void candy_write_can_frames(tick_t t)
 {
-
+    int i;
+    for (i = 0; i < nframes; i++) {
+	if (t > (send[i].last_tick + send[i].inhibit)) { // >= ?
+	    candy_send_can_frame(&send[i]);
+	    send[i].last_tick = t;
+	}
+    }
 }
 
 static void candy_run_rule_(candy_rule_t* rp, uint32_t clk)
 {
     candy_element_t* elem = &element[rp->ei];
     // element may be set AND element not set in this cycle
-    if ((elem->dir & DIR_OUT) && (elem->clk != clk)) { 
+    if ((elem->dir & DIR_OUT) && (elem->clk != clk)) {
 	int32_t value = (rp->ci == INVALID_INDEX) ? 1 : eval_expr(rp->ci);
 	if (value) {
 	    elem->nxt.i32 = eval_expr(rp->vi);

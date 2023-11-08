@@ -2,28 +2,6 @@
 #ifndef __CANDY_DEBUG_H__
 #define __CANDY_DEBUG_H__
 
-void print_tokens(token_t* ts, int n)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-	switch(ts[i].tval) {
-	case T_DEC: printf(";DEC:%d", dec_to_int(ts[i].ptr,ts[i].len)); break;
-	case T_HEX: printf(";HEX:%x", hex_to_int(ts[i].ptr,ts[i].len)); break;
-	case T_DIGITAL: printf(";#DIGITAL:"); break;
-	case T_ANALOG: printf(";#ANALOG:");break;
-	case T_TIMER: printf(";#TIMER:");break;
-	case T_CAN: printf(";#CAN:"); break;
-	case T_VARIABLE: printf(";#VARIABLE:"); break;
-	case T_CONSTANT: printf(";#CONSTANT:"); break;
-	case T_WORD:printf(";WORD:'%.*s'", ts[i].len, ts[i].ptr); break;
-	default: printf(";CHAR:'%c'", *ts[i].ptr); break;
-	}
-    }
-    if (ts[n].tval == T_END)
-	printf(";END");
-    printf("\n");
-}
-
 static const char* format_dir(int dir)
 {
     switch(dir) {
@@ -39,42 +17,87 @@ static void print_element(candy_element_t* elem)
 {
     switch(elem->type) {
     case C_DIGITAL:
-	printf("#digital %s %s ",
-	       elem->name, format_dir(elem->dir));	
+	candy_print_str("#digital ");
+	candy_print_str(elem->name);
+	candy_print_str(" ");
+	candy_print_str(format_dir(elem->dir));
+	candy_print_str(" ");
 	if (elem->io.port == -1)
-	    printf("%d", elem->io.pin);
-	else 
-	    printf("%d:%d", 
-		   elem->io.port, elem->io.pin);
+	    candy_print_int(elem->io.pin);
+	else {
+	    candy_print_int(elem->io.port);
+	    candy_print_str(":");	
+	    candy_print_int(elem->io.pin);
+	}
 	break;
     case C_ANALOG:
-	printf("#analog %s:%d %s ",
-	       elem->name,
-	       elem->size,
-	       format_dir(elem->dir));
+	candy_print_str("#analog ");
+	candy_print_str(elem->name);
+	candy_print_str(":");
+	candy_print_int(elem->size);
+	candy_print_str(" ");
+	candy_print_str(format_dir(elem->dir));
+	candy_print_str(" ");	
 	if (elem->io.port == -1)
-	    printf("%d", elem->io.pin);
-	else 
-	    printf("%d:%d", 
-		   elem->io.port, elem->io.pin);
-	break;	
-    case C_CAN_BIT1:
-	printf("#can %s %x[%d]", elem->name,
-	       elem->can.id, elem->can.bit_pos);
-    case C_CAN_BIT2:
-	printf("#can %s %x[%d,%d]", elem->name,
-	       elem->can.id, elem->can.byte_pos, elem->can.bit_pos);
-    case C_CAN_RANGE:
-	printf("#can %s %x[%d:%d]", elem->name,
-	       elem->canr.id, elem->canr.pos, elem->canr.len);	
+	    candy_print_int(elem->io.pin);
+	else {
+	    candy_print_int(elem->io.port);
+	    candy_print_str(":");	
+	    candy_print_int(elem->io.pin);
+	}
+	break;
+    case C_CANDY_BIT1:
+	candy_print_str("#can ");
+	candy_print_str(elem->name);
+	candy_print_str(" 0x");
+	candy_print_int(elem->can.id);
+	candy_print_str("[");
+	candy_print_int(elem->can.bit_pos);
+	candy_print_str("]");
+	break;
+    case C_CANDY_BIT2:
+	candy_print_str("#can ");
+	candy_print_str(elem->name);
+	candy_print_str(" 0x");
+	candy_print_int(elem->can.id);
+	candy_print_str("[");
+	candy_print_int(elem->can.byte_pos);
+	candy_print_str(",");
+	candy_print_int(elem->can.bit_pos);
+	candy_print_str("]");
+	break;
+    case C_CANDY_RANGE:
+	candy_print_str("#can ");
+	candy_print_str(elem->name);
+	candy_print_str(" 0x");
+	candy_print_int(elem->canr.id);
+	candy_print_str("[");
+	candy_print_int(elem->canr.pos);
+	candy_print_str(":");
+	candy_print_int(elem->canr.len);
+	candy_print_str("]");	
+	break;
     case C_TIMER:
-	printf("#timer %s %d",  elem->name, elem->timer.timeout);
+	candy_print_str("#timer ");
+	candy_print_str(elem->name);
+	candy_print_str(" ");
+	candy_print_int(elem->timer.timeout);
 	break;
     case C_VARIABLE:
-	printf("#variable %s:%d %d", elem->name, elem->size, elem->cur.i32);
+	candy_print_str("#variable ");
+	candy_print_str(elem->name);
+	candy_print_str(":");
+	candy_print_int(elem->size);
+	candy_print_str(" = ");
+	candy_print_int(elem->cur.i32);
 	break;
     case C_CONSTANT:
-	printf("#constant %s:%d %d", elem->name, elem->size, elem->cur.i32);
+	candy_print_str("#constant ");
+	candy_print_str(elem->name);
+	candy_print_str(":");
+	candy_print_int(elem->size);
+	candy_print_str(" = ");
+	candy_print_int(elem->cur.i32);	
 	break;		
     }
 }
@@ -97,6 +120,14 @@ static const char* format_op(candy_op_t op)
     case EXPR_TIMES: return "*";
     case EXPR_DIVIDE: return "/";
     case EXPR_REMAINDER: return "%";
+
+    case EXPR_BAND: return "&";
+    case EXPR_BOR: return "|";
+    case EXPR_BXOR: return "^";
+    case EXPR_BNOT: return "~";
+    case EXPR_BSL: return "<<";
+    case EXPR_BSR: return "<<";
+	
     default: return "??";
     }
 }
@@ -106,24 +137,36 @@ static void print_expr(xindex_t xi)
     candy_expr_t* xp = &expr[xi];
     switch(xp->op) {
     case EXPR_NAME:
-	printf("%s", element[xp->ni].name);
+	candy_print_str(element[xp->ei].name);
 	break;
     case EXPR_CONST:
-	printf("%d", xp->v.i32);
+	candy_print_int(xp->v.i32);
 	break;
-    case EXPR_CAN_RANGE:
-	printf("0x%x[%d:%d]", xp->crange.id,
-	       xp->crange.pos, xp->crange.len);
+    case EXPR_CANDY_RANGE:
+	candy_print_str("0x");
+	candy_print_hex(xp->crange.id);
+	candy_print_str("[");
+	candy_print_int(xp->crange.pos);
+	candy_print_str(":");
+	candy_print_int(xp->crange.len);
+	candy_print_str("]");
 	break;
-    case EXPR_CAN_BIT1:
-	printf("0x%x[%d]", xp->cbit.id, xp->cbit.bit_pos);
+    case EXPR_CANDY_BIT1:
+	candy_print_str("0x");
+	candy_print_hex(xp->cbit.id);
+	candy_print_str("[");
+	candy_print_int(xp->cbit.bit_pos);
+	candy_print_str("]");
 	break;
-    case EXPR_CAN_BIT2:
-	printf("0x%x[%d,%d]",
-	       xp->cbit.id,
-	       xp->cbit.byte_pos,
-	       xp->cbit.bit_pos);
-	break;	
+    case EXPR_CANDY_BIT2:
+	candy_print_str("0x");
+	candy_print_hex(xp->cbit.id);
+	candy_print_str("[");
+	candy_print_int(xp->cbit.byte_pos);
+	candy_print_str(",");
+	candy_print_int(xp->cbit.bit_pos);
+	candy_print_str("]");
+	break;
     case EXPR_LT:
     case EXPR_LTE:
     case EXPR_GT:
@@ -137,14 +180,22 @@ static void print_expr(xindex_t xi)
     case EXPR_TIMES:
     case EXPR_DIVIDE:
     case EXPR_REMAINDER:
+    case EXPR_BAND:
+    case EXPR_BOR:
+    case EXPR_BXOR:
+    case EXPR_BSL:
+    case EXPR_BSR:	
 	print_expr(xp->bin.li);
-	printf(" %s ", format_op(xp->op));
+	candy_print_str(" ");
+	candy_print_str(format_op(xp->op));
+	candy_print_str(" ");
 	print_expr(xp->bin.ri);
 	break;
     case EXPR_NOT:
-    case EXPR_NEG:	
-	printf("%s", format_op(xp->op));
-	print_expr(xp->mi);
+    case EXPR_NEG:
+    case EXPR_BNOT:
+	candy_print_str(format_op(xp->op));
+	print_expr(xp->una);
 	break;
     default:
 	break;
@@ -153,10 +204,11 @@ static void print_expr(xindex_t xi)
 
 static void print_rule(candy_rule_t* rp)
 {
-    printf("%s = ", element[rp->ni].name);
+    candy_print_str(element[rp->ei].name);
+    candy_print_str(" = ");
     print_expr(rp->vi);
     if (rp->ci == INVALID_INDEX) {
-	printf(" ? ");
+	candy_print_str(" ? ");
 	print_expr(rp->ci);
     }
 }

@@ -1,0 +1,17 @@
+// demo-1:
+// arduino setup
+//  button on digital pin D2
+//  led on digital pin D13
+//  analog input (10 bit) on A0
+//
+//  when button is push led should turn on
+//  A0 regulates number of milliseconds before turn off
+//
+#digital Button  in D2
+#digital Led     out D13
+#analog  Trim:10 in A0
+#variable StartTick:10 = 0
+
+Led = 1 ? !Button
+StartTick = tick ? !Button
+Led = 0 ? (tick - StartTick) > A0

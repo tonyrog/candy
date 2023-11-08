@@ -1,0 +1,19 @@
+// butons are inverted
+#digital A in 2
+#digital B in 3
+#digital C in 4
+#digital LED out 5
+#variable state:8 = 0
+
+// Återställ state och släck LED om någon knapp släpps
+state = 0 ? A==1
+state = 0 ? B==1 && state > 1
+state = 0 ? C==1 && state > 2
+
+// Steg-för-steg-logik för knapptryckning i ordningen A, B, C
+state = 1 ? A==0 && state == 0
+state = 2 ? A==0 && B==0 && state == 1
+state = 3 ? A==0 && B==0 && C==0 && state == 2
+
+LED = 1 ? state == 3
+LED = 0 ? state == 0

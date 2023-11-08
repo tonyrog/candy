@@ -86,6 +86,9 @@
 	 menu_border_color             = green
 	}).
 
+-define(SCREEN_COLOR,            {0,255,255}). %% {192,192,192}).
+-define(HIGH_COLOR,              {0,255,0}).
+-define(LOW_COLOR,               {200,200,200}).   %% light gray
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
 -define(TEXT_COLOR,              {0,0,0,0}).       %% black text
@@ -116,11 +119,14 @@
 
 -define(verbose(F,A), ok).
 %% -define(verbose(F,A), io:format((F),(A))).
+-define(FMT_HORIZONTAL_PAD, 4).
+-define(FMT_VERTICAL_PAD,   3).
 
 -record(fmt,
 	{
-	 dx :: integer(),   %% position relative #layout.x
-	 dy :: integer(),   %% position relative #layout.y
+	 dx :: integer(),        %% position relative #layout.x
+	 dy :: integer(),        %% position relative #layout.y
+	 dpos = 0 :: integer(),  %% row relative #layout.pos
 	 width :: non_neg_integer(),
 	 height :: non_neg_integer(),
 	 hidden = false :: boolean(),
@@ -136,19 +142,19 @@
 %% can frame color
 -record(color,
 	{
-	 background  = ?LAYOUT_BACKGROUND_COLOR,
-	 foreground  = ?TEXT_COLOR,               %% text color
-	 border      = ?FRAME_BORDER_COLOR,       %% frame border color
+	 background   = ?LAYOUT_BACKGROUND_COLOR,
+	 foreground   = ?TEXT_COLOR,               %% text color
+	 border       = ?FRAME_BORDER_COLOR,       %% frame border color
 	 background1  = ?HIGHLIGHT_COLOR1,
 	 foreground1  = ?TEXT_HIGHLIGHT_COLOR
 	}).
 
 -record(layout,
 	{
-	 id  :: integer(),             %% frame id
-	 pos :: integer(),             %% list position
+	 key :: integer(),             %% frame key (id - (err+fd)
+	 pos :: integer(),             %% list position/row
+	 npos :: integer(),            %% layout occupy npos rows (wrapped)
 	 pos0 :: integer(),            %% original list position
-	 src :: integer(),             %% source position when move/sort
 	 style = normal :: normal | fixed | collapsed | hidden | deleted,
 	 color = #color{} :: #color{}, %% color profile
 	 x     :: integer(),           %% x offset
@@ -195,16 +201,15 @@
 	 glyph_height,
 	 glyph_ascent,
 	 %%
-	 frame,          %% ets: #can_frame{}
-	 frame_layout,   %% ets: #layout{}
-	 frame_counter,  %% ets: ID -> Counter
-	 frame_freq,     %% ets: {ID,Time,OldCounter}
-	 frame_anim,     %% ets: {ID,FmtPos} -> Counter
+	 frame,          %% ets: {frame_key(ID),#can_frame{}}
+	 frame_diff,     %% ets: {frame_key(ID),[BitOffset]}
+	 frame_layout,   %% ets: {frame_key(ID),#layout{}}
+	 frame_counter,  %% ets: {frame_key(ID),Counter}
+	 frame_freq,     %% ets: {frame_key(ID),Time,OldCounter,String}
+	 frame_anim,     %% ets: {{frame_key(ID),FmtPos},Counter}
 	 %% background_color :: epx:epx_color(),
 	 menu_profile,
-	 row_width     = 0,
 	 row_height    = 0,
-	 row_pad = 3,
 	 next_pos = 1,
 	 hide :: epx:epx_pixmap()
 	}).
@@ -215,8 +220,19 @@
 	 tick :: undefined | reference(),
 	 selection,                 %% current selection rect
 	 selected = [],             %% selected frames [{FID,Pos}]
-	 content :: #window_content{}
+	 screen_color = ?SCREEN_COLOR,
+	 content :: #window_content{},
+	 auto_detect = undefined :: undefined | high | low,
+	 auto_detect_tmr = undefined :: undefined | reference()
 	}).
+
+-define(TICK_INTERVAL, 100).
+
+-define(AUTO_DETECT_INIT_INTERVAL, 3000).
+-define(AUTO_DETECT_HIGH_INTERVAL, 2000).
+-define(AUTO_DETECT_LOW_INTERVAL,  2000).
+-define(AUTO_DETECT_EDGE_INTERVAL,  500).
+-define(AUTO_DETECT_EDGE_GUESSING,  100).
 
 
 status() ->
@@ -364,6 +380,7 @@ start_it(Options, Start) ->
 		{scroll_hndl_color, blue},
 		{scroll_bar_size,   14},
 		{scroll_hndl_size,  10},
+		{screen_color,      ?SCREEN_COLOR},
 		{left_bar, 0},
 		{right_bar, 0},
 		{top_bar, 20},
@@ -413,14 +430,7 @@ init(Options) ->
     epx:window_enable_events(Window, no_auto_repeat),
 
     RowHeight = H + 2,
-    NRows = S0#s.nrows + 2,  %% 2 collapsed frame rows
-    _Height = NRows*(RowHeight+S0#s.row_pad) - S0#s.row_pad,
-    %% FORMAT= ID X|R|E L 01 23 45 67 01 23 45 67
-    %% maximum width = 
-    %%   ID: 3FF (11-bit) | 1FFFFFFF (29-bit)
-    %% Data: 64 bit : 8*8 (16 char) | 64*1 (64 char) | X|R
-    %% Given 8 byte groups in base 2
-    Width = 1*(8*W+4+2) + 3*(1*W+4+2) + 1*(1*W+4+2) + 8*(6+8*W+4+2) - 2,
+
     BitRates0 = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
 
     {IF,
@@ -454,17 +464,18 @@ init(Options) ->
 	   glyph_width  = W,
 	   glyph_height = H,
 	   glyph_ascent = epx:font_info(Font, ascent),
-	   frame = ets:new(frame, [{keypos,#can_frame.id}]),
-	   frame_layout  = ets:new(frame_layout, [{keypos,#layout.id}]),
+	   frame         = ets:new(frame, []),
+	   frame_diff    = ets:new(frame_diff, []),
+	   frame_layout  = ets:new(frame_layout, []),
 	   frame_counter = ets:new(frame_counter, []),
 	   frame_anim    = ets:new(frame_anim, []),
 	   frame_freq    = ets:new(frame_freq, []),
 	   menu_profile  = MProfile,
-	   row_width     = Width,
 	   row_height    = RowHeight,
 	   hide = hide_pixels()
 	  },
-    State = {S1, #d{} },
+
+    State = {S1, #d{ } },
     Model = proplists:get_value(model, Env, any),
     State1 = load_frame_layout(Model, State),
     set_status(State1),
@@ -618,26 +629,33 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   --
 %%   G              Group selected bits
 %%   Shift+G        Ungroup selected bits
-%%   H              Sort Low -> High frames by frame id
-%%   Ctrl+H         Sort High -> Low frames by frame id
 %%   1-8            Split in groups of 1 to 8 bits
-%%   Alt+1-9        Set bitrate 
-%%   Alt+up         Bitrate up
-%%   Alt+down       Bitrate down
-%%   T              Swap groups (not implemented yet)
-%%   Ctrl+L         Listen mode toggle
-%%   Ctrl+F         FD allow toggle
-%%   Ctrl+1-9[A-E]  Set datarate (FD)
-%%   Ctrl+up        Datarate up
-%%   Ctrl+down      Datarate down
 %%   Ctrl+S         Save information to /home/$USER/candy.txt
 %%
-%% Global commands
-%%   Q              Quit application
+%% Frames
+%%   H              Sort Low -> High frames by frame id
+%%   Ctrl+H         Sort High -> Low frames by frame id
+%%
 %%   up             Arrow up, scroll up
 %%   down           Arrow down, scroll down
 %%   pageup         Page up, scroll one page up
 %%   pagedown       Page down, scroll one page down
+%%
+%%   A              Start/Stop auto detect
+%%   T              Filter frames not used
+%%   U              Undelete deleted frames
+%%   
+%% Global commands
+%%   Q              Quit application
+%%
+%%   Ctrl+L         Listen mode toggle
+%%   Ctrl+F         FD allow toggle
+%%   Alt+1-9        Set bitrate 
+%%   Alt+up         Bitrate up
+%%   Alt+down       Bitrate down
+%%   Ctrl+1-9[A-E]  Set datarate (FD)
+%%   Ctrl+up        Datarate up
+%%   Ctrl+down      Datarate down
 %%
 command(Key, Mod, State={_,D}) ->
     ?verbose("COMMAND: key=~p, mod=~p\n", [Key, Mod]),
@@ -648,7 +666,6 @@ command(Key, Mod, State={_,D}) ->
 	    {noreply, State1}
     end.
 	     
-
 command($x, Selected, _Mod, State) ->
     set_base(Selected, 16, State);
 command($d, Selected, _Mod, State) ->
@@ -660,53 +677,57 @@ command($b, Selected, _Mod, State) ->
 command($c, Selected, _Mod, State) ->
     set_base(Selected, c, State);
 command($G, Selected, Mod, State) when Mod#keymod.shift ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foldl(fun(FID,Si) -> split_half_fid(FID,Selected,Si) end, State, Fs);
+    Keys = lists:usort([Key || {Key,_} <- Selected]),
+    lists:foldl(fun(Key,Si) -> split_half_fid(Key,Selected,Si) end,
+		State, Keys);
 command($g, Selected, _Mod, _State = {S,D}) ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
+    Keys = lists:usort([Key || {Key,_} <- Selected]),
     %% select min pos foreach FID and keep as selected
     Selected1 = lists:foldl(
-		  fun(FID, Acc) ->
-			  MinPos = lists:min([Pos || {F,Pos} <- Selected, 
-						     F =:= FID]),
-			  [{FID,MinPos}|Acc]
-		  end, [], Fs),
+		  fun(Key, Acc) ->
+			  MinPos = lists:min([Pos || {K,Pos} <- Selected, 
+						     K =:= Key]),
+			  [{Key,MinPos}|Acc]
+		  end, [], Keys),
     State1 = {S, D#d { selected = Selected1 }},
-    lists:foldl(fun(FID,Si) -> merge_fid(FID, Selected, Si) end, State1, Fs);
+    lists:foldl(fun(Key,Si) -> merge_fid(Key, Selected, Si) end, State1, Keys);
 command($h, _Selected, Mod, State) ->
-    %% sort all fields by frame id
-    FIDs0Pos0 = fold_layout(
-		  fun(Li, Acc, _Si) ->
-			  case Li#layout.style of
-			      deleted -> Acc;
-			      hidden -> Acc;
-			      collapsed -> Acc;
-			      _ ->
-				  if Mod#keymod.alt ->
-					  %% sort according to original pos
-					  [{Li#layout.pos0,Li#layout.id}|Acc];
-				     true ->
-					  %% sort according to id
-					  [{0,Li#layout.id}|Acc]
-				  end
+    %% get list of {SortKey,NumberOfRows,LayoutKey}
+    SNK =  
+	fold_layout(
+	  fun(Li, Acc, _Si) ->
+		  case Li#layout.style of
+		      deleted -> Acc;
+		      hidden -> Acc;
+		      collapsed -> Acc;
+		      _ ->
+			  if Mod#keymod.alt ->
+				  %% sort according to original pos
+				  [{Li#layout.pos0,Li#layout.npos,
+				    Li#layout.key}|Acc];
+			     true ->
+				  %% sort according to key
+				  [{0,Li#layout.npos,Li#layout.key}|Acc]
 			  end
-		  end, [], State),
-    FIDs1Pos0 = 
+		  end
+	  end, [], State),
+    %% sort SNK according to sort key (reversed if ctrl is pressed)
+    NK = 
 	if Mod#keymod.ctrl ->
-		[Lj || {_SortKey,Lj} <- lists:reverse(lists:sort(FIDs0Pos0))];
+		[{Nj,Kj} || {_SortKey,Nj,Kj} <- lists:reverse(lists:sort(SNK))];
 	   true ->
-		[Lj || {_SortKey,Lj} <- lists:sort(FIDs0Pos0)]
+		[{Nj,Kj} || {_SortKey,Nj,Kj} <- lists:sort(SNK)]
 	end,
-    FIDsPos = maps:from_list(lists:zip(FIDs1Pos0, 
-				       lists:seq(1,length(FIDs1Pos0)))),
+    %% Generate a map of new layout positions
+    KP = layout_pos_map(NK),
     State1 =
 	each_layout(
 	  fun(Li, Si) ->
-		  case maps:get(Li#layout.id, FIDsPos, hidden) of
+		  case maps:get(Li#layout.key, KP, hidden) of
 		      hidden ->
 			  Si;
 		      Pos ->
-			  L2 = Li#layout { pos = Pos, src = Li#layout.pos },
+			  L2 = Li#layout { pos = Pos },
 			  L3 = position_normal(L2, Si),
 			  insert_layout(L3, Si)
 		  end
@@ -714,18 +735,18 @@ command($h, _Selected, Mod, State) ->
     epxw:invalidate(),
     State1;
 command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
-    FIDs = lists:usort([FID || {FID,_} <- Selected]),
+    Keys = lists:usort([Key || {Key,_} <- Selected]),
     Bytes = 
 	lists:foldr(
-	  fun(FID,Acc) ->
-		  Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+	  fun(Key,Acc) ->
+		  Sel = lists:filter(fun({F,_}) -> F =:= Key end, Selected),
 		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-		  L = lookup_layout(FID, State),
+		  L = lookup_layout(Key, State),
 		  Format = L#layout.format,
 		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
 		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
 		  %% ?verbose("SAVE FID=0x~s Bits=~w\n", [integer_to_list(FID,16), Bs]),
-		  ["0x",integer_to_list(FID,16),
+		  ["0x",integer_to_list(Key,16),
 		   [[ %% byte index in decimal
 		     [" ", integer_to_list(B div 8),  
 		      %% byte mask
@@ -736,7 +757,7 @@ command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
 		      " 0x00" ] || {B,_Len} <- G]
 		    || G <- Bs],
 		   "\n" | Acc]
-	  end, [], FIDs),
+	  end, [], Keys),
     %% User =  os:getenv("USER"),
     Home = case os:getenv("HOME") of
 	       false -> "/tmp";
@@ -761,9 +782,9 @@ command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $1, I =< $9 ->
 command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $a, I =< $e ->
     datarate_select((I-$a)+10, State);
 command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
-    Fs = lists:usort([FID || {FID,_} <- Selected]),
-    lists:foldl(fun(FID,Si) -> split_fid(FID, Selected, I-$0, Si) end, 
-		State, Fs);
+    Keys = lists:usort([Key || {Key,_} <- Selected]),
+    lists:foldl(fun(Key,Si) -> split_fid(Key, Selected, I-$0, Si) end, 
+		State, Keys);
 command(up, _Selected, Mod, State) when Mod#keymod.alt ->
     bitrate_prev(State);
 command(down, _Selected, Mod, State) when Mod#keymod.alt ->
@@ -776,10 +797,92 @@ command($l, _Selected, Mod, State) when Mod#keymod.ctrl ->
     toggle_listen_only(State);
 command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
     toggle_fd(State);
-
+command($a, _Selected, _Mod, _State = {S,D}) ->
+    case D#d.auto_detect_tmr of
+	undefined -> %% start auto detect mode
+	    epxw:profile_set(screen_color, ?LOW_COLOR),
+	    epxw:invalidate(),
+	    ets:delete_all_objects(S#s.frame_diff),
+	    Tmr = erlang:start_timer(?AUTO_DETECT_INIT_INTERVAL,self(),high),
+	    %% set auto_detect to undefined to dissallow detection until high
+	    {S, D#d { auto_detect = undefined, auto_detect_tmr = Tmr,
+		      screen_color = ?SCREEN_COLOR
+		    } };
+	TRef ->
+	    epxw:profile_set(screen_color, ?SCREEN_COLOR),
+	    epxw:invalidate(),
+	    erlang:cancel_timer(TRef),
+	    receive
+		{timeout,TRef,_} -> ok
+	    after 0 -> ok
+	    end,
+	    {S, D#d { auto_detect = undefined, 
+		      auto_detect_tmr = undefined,
+		      screen_color = ?SCREEN_COLOR }}
+    end;
+command($u, _Selected, _Mod, State) ->
+    %% undelete all deleted frames
+    Ls =
+	fold_layout(
+	  fun(L,Acc,_Si) ->
+		  case L#layout.style of
+		      deleted ->
+			  [{undelete,L}|Acc];
+		      _ -> Acc
+		  end
+	  end, [], State),
+    {S1,D1} =
+	lists:foldl(
+	  fun({undelete,L}, Stt0={S,D}) ->
+		  LPos = S#s.next_pos,
+		  L1 = reposition_normal(LPos, L, Stt0),
+		  NextPos = LPos+L1#layout.npos,
+		  Stt1 = {S#s { next_pos = NextPos }, D},
+		  insert_layout(L1, Stt1)
+	  end, State, Ls),
+    epxw:invalidate(),
+    {S1,D1#d{ selected = [] }};
+    
+command($t, _Selected, _Mod, State={S,_}) ->
+    Ls =
+	fold_layout(
+	  fun(L,Acc,_Si) ->
+		  case L#layout.style of
+		      deleted -> Acc;
+		      hidden -> Acc;
+		      collapsed -> Acc;
+		      _ ->
+			  case ets:lookup(S#s.frame_diff, L#layout.key) of
+			      [] -> Acc; %% maybe delete?
+			      [{_,[]}] -> [{delete, L}|Acc];
+			      [{_,Bs}] -> [{select, L, Bs}|Acc]
+			  end
+		  end
+	  end, [], State),
+    {Selected,{S1,D1}} =
+	lists:foldl(
+	  fun({delete,L}, {Sel,St0}) ->
+		  {L1, St1} = remove_layout(L, St0),
+		  St2 = insert_layout(L1, St1),
+		  {Sel,St2};
+	     ({select,L,_Bs}, {Sel,S0}) ->
+		  %% FIXME: find fields matching bits in Bs?
+		  {[{L#layout.key,[?ID_FMT_POSITION]}|Sel], S0}
+	  end, {[],State}, Ls),
+    epxw:invalidate(),
+    {S1,D1#d{ selected = Selected }};
 command(Symbol, _Selected, Mod, State) ->
     io:format("unhandled command ~p\n", [Symbol]),
     {reply,{Symbol,Mod},State}.
+
+%% form [ {NumberOfRows, LayoutKey} ] create new positions form 1...
+layout_pos_map(NK) ->
+    layout_pos_map_(NK, 1, []).
+
+layout_pos_map_([{N,Key}|NK], Pos0, Acc) ->
+    layout_pos_map_(NK, Pos0+N, [{Key,Pos0}|Acc]);
+layout_pos_map_([], _Pos0, Acc) ->
+    maps:from_list(Acc).
 
 %% Load data display for various models (test)
 load_frame_layout(prius, State) ->
@@ -814,6 +917,7 @@ load_pid_list([], State) ->
 load_pid(FID, Name, FormList, _State={S,D}) ->
     NameBits = iolist_to_binary(Name),
     Pos = S#s.next_pos,
+    Key = frame_key(FID),
     Format = 
 	list_to_tuple(
 	  [
@@ -826,19 +930,20 @@ load_pid(FID, Name, FormList, _State={S,D}) ->
 	   #fmt { field=len,base=16,type=unsigned,bits=[{2,4}]} |
 	   FormList ]),
     L0 = #layout {
-	    id = FID,
-	    pos = Pos,
+	    key   = Key,
+	    pos   = Pos,
 	    style = fixed, %% do not collapse
 	    format = Format
 	   },
-    State1 = {S#s{next_pos=Pos+1}, D},
+    NPos1 = Pos+1,
+    State1 = {S#s{next_pos=NPos1}, D},
     L1 = position_layout(L0, State1),
-    State2 = insert_layout(L1, State1),
-    ets:insert(S#s.frame_counter, {FID, 0}),
-    ets:insert(S#s.frame, #can_frame{id=FID,len=8,
-					     data=(<<0,0,0,0,0,0,0,0>>)
-					    }),
-    redraw_fid(FID, State2).
+    NPos2 = NPos1+L1#layout.npos,
+    State2 = insert_layout(L1, {S#s{next_pos=NPos2},D}),
+    ets:insert(S#s.frame_counter, {Key, 0}),
+    Frame =  #can_frame{id=FID,len=8, data=(<<0,0,0,0,0,0,0,0>>) },
+    ets:insert(S#s.frame, {Key,Frame}),
+    redraw_by_key(Key, State2).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -896,6 +1001,23 @@ handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
 	true ->
 	    {noreply, tick_start(State)}
     end;
+
+%% toggle auto_detect to high
+handle_info({timeout,Ref,high}, {S,D}) when Ref =:= D#d.auto_detect_tmr ->
+    epxw:profile_set(screen_color, ?HIGH_COLOR),
+    TRef = erlang:start_timer(?AUTO_DETECT_HIGH_INTERVAL, self(), low),
+    epxw:invalidate(),
+    State1 = {S, D#d { auto_detect = high, auto_detect_tmr = TRef, 
+		       screen_color = ?HIGH_COLOR }},
+    {noreply, State1};
+%% toggle auto_detect to low
+handle_info({timeout,Ref,low}, {S, D}) when Ref =:= D#d.auto_detect_tmr ->
+    epxw:profile_set(screen_color, ?LOW_COLOR),
+    TRef = erlang:start_timer(?AUTO_DETECT_LOW_INTERVAL, self(), high),
+    epxw:invalidate(),
+    State1 = {S, D#d { auto_detect = low, auto_detect_tmr = TRef,
+		       screen_color = ?LOW_COLOR }},
+    {noreply, State1};
 
 %%
 %% Interface has changed, pick up new message
@@ -989,11 +1111,17 @@ handle_can_frames(CanFrames, S) ->
 	    handle_can_frames([Frame|CanFrames], S)
     after 0 -> %% or a short time?
 	    process_can_frames(lists:reverse(CanFrames),S,
-			       false, 0, sets:new())
+			       false, #{})
     end.
 
+%% keep EFF/RTR flags, strip FD/ERR
+-define(CAN_KEY_MASK, (?CAN_EFF_MASK bor ?CAN_EFF_FLAG bor ?CAN_RTR_FLAG)).
+
+frame_key(FID) ->
+    FID band ?CAN_KEY_MASK.
+
 process_can_frames([#can_frame{id=FID}|Fs], {S,D},
-		   _Redraw, RedrawCount, RedrawSet) when
+		   _Redraw, RedrawSet) when
       FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
     Err = lists:foldl(
 	    fun({Bit,Flag}, Acc) ->
@@ -1011,29 +1139,32 @@ process_can_frames([#can_frame{id=FID}|Fs], {S,D},
 		      {?CAN_ERR_RESTARTED,   restarted}]),
     %% ?verbose(" status = ~w\n", [Fs]),
     process_can_frames(Fs, {S#s { if_error = Err }, D},
-		       true, RedrawCount, RedrawSet);
+		       true, RedrawSet);
 process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
-		   Redraw, RedrawCount, RedrawSet) ->
-    case ets:lookup(S#s.frame, FID) of
-	[Frame] -> %% no change
-	    ets:update_counter(S#s.frame_counter, FID, 1),
-	    process_can_frames(Fs, State, Redraw, RedrawCount, RedrawSet);
-	[Frame0] ->
-	    ets:insert(S#s.frame, Frame),
-	    ets:update_counter(S#s.frame_counter, FID, 1),
-	    case diff_frames(FID,Frame,Frame0,State) of
+		   Redraw, RedrawSet) ->
+    %% filter out extra flags err/fd ...
+    Key = frame_key(FID),
+    case ets:lookup(S#s.frame, Key) of
+	[{_,Frame}] -> %% no change
+	    ets:update_counter(S#s.frame_counter, Key, 1),
+	    process_can_frames(Fs, State, Redraw, RedrawSet);
+	[{_,OldFrame}] ->
+	    ets:insert(S#s.frame, {Key,Frame}),
+	    ets:update_counter(S#s.frame_counter, Key, 1),
+	    case diff_frames(FID,Frame,OldFrame,State) of
 		[] ->
 		    process_can_frames(Fs, tick_restart(State),
-				       Redraw, RedrawCount, RedrawSet);
-		Diff ->
-		    [ ets:insert(S#s.frame_anim,{{FID,Pos},255})|| Pos <- Diff],
-		    process_can_frames(Fs, tick_restart(State),
+				       Redraw, RedrawSet);
+		Diff -> %% [LayoutPosList]
+		    State1 = auto_detect_bits(Key, Frame, OldFrame, State),
+		    KLi = [{Key,Li} || Li <- Diff],
+		    [ ets:insert(S#s.frame_anim,{Ki,255})|| Ki <- KLi],
+		    process_can_frames(Fs, tick_restart(State1),
 				       Redraw,
-				       RedrawCount+1,
-				       sets:add_element(FID,RedrawSet))
+				       RedrawSet#{ Key => true })
 	    end;
 	[] ->
-	    ets:insert(S#s.frame, Frame),
+	    ets:insert(S#s.frame, {Key,Frame}),
 	    IDFmt =
 		if FID band ?CAN_EFF_FLAG =/= 0 ->
 			#fmt {field=id,base=16,type=unsigned,bits=[{4,29}]};
@@ -1046,22 +1177,22 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
 		   true ->
 			default_format(IDFmt)
 		end,
-	    [ ets:insert(S#s.frame_anim,{{FID,Pos},255}) ||
+	    [ ets:insert(S#s.frame_anim,{{Key,Pos},255}) ||
 		Pos <- lists:seq(1,tuple_size(Format))  ],
-	    
 	    LPos = S#s.next_pos,
-	    Layout1 = #layout { id=FID, pos=LPos, pos0=LPos, format=Format },
-	    Layout2 = position_layout(Layout1, State),
+	    L1 = #layout { key=Key, pos=LPos, pos0=LPos, format=Format },
+	    L2 = position_layout(L1, State),
+
+	    NextPos = LPos+L2#layout.npos,
+	    State1 = {S#s{ next_pos = NextPos}, D},
+	    State2 = insert_layout(L2, State1),
 	    
-	    State1 = {S#s{ next_pos = LPos+1}, D},
-	    State2 = insert_layout(Layout2, State1),
-	    
-	    ets:insert(S#s.frame_counter, {FID, 1}),
-	    ets:insert(S#s.frame_freq, {FID,erlang:system_time(millisecond),1,""}),
+	    ets:insert(S#s.frame_counter, {Key, 1}),
+	    ets:insert(S#s.frame_freq, {Key,erlang:system_time(millisecond),1,""}),
 	    process_can_frames(Fs, tick_restart(State2),
-			       true, RedrawCount+1, RedrawSet)
+			       true, RedrawSet)
     end;
-process_can_frames([], State, Redraw, _RedrawCount, RedrawSet) ->
+process_can_frames([], State, Redraw, RedrawSet) ->
     if Redraw ->
 	    epxw:invalidate(),
 	    State;
@@ -1070,19 +1201,75 @@ process_can_frames([], State, Redraw, _RedrawCount, RedrawSet) ->
 		0 ->
 		    State;
 		_Count ->
-		    %% display_saved(_Count, _RedrawCount),
-		    sets:fold(
-		      fun(FID, Statei) ->
-			      redraw_fid(FID, Statei)
+		    maps:fold(
+		      fun(Key,_,Statei) ->
+			      redraw_by_key(Key, Statei)
 		      end, State, RedrawSet)
 	    end
     end.
 
-display_saved(Count, RedrawCount) when Count < RedrawCount ->
-    io:format("saved ~w redraws\n", [RedrawCount-Count]);
-display_saved(_Count, _RedrawCount) ->
-    ok.
+is_auto_detect({_,#d { auto_detect = Auto }}) -> Auto =/= undefined.
+
+auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
+    case is_auto_detect(State) of
+	false ->
+	    State;  %% bit detection is not running
+	true ->
+	    case is_auto_edge(State) of
+		true -> %% Frame was received inside detection "window"
+		    case ets:lookup(S#s.frame_diff,Key) of
+			[] -> %% no bits yet, regard all switched bits
+			    B1 = diff_bits(Frame,OldFrame),
+			    ets:insert(S#s.frame_diff, {Key,B1}),
+			    State;
+			[{_,[]}] -> %% disabled
+			    State;
+			[{_,B0}] ->
+			    B1 = diff_bits(Frame,OldFrame),
+			    %% remove switched from 
+			    B2 = B0--(B0--B1),
+			    ets:insert(S#s.frame_diff, {Key,B2}),
+			    io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			    State
+		    end;
+		false -> %% NewFrame was received outside detection "window"
+		    case ets:lookup(S#s.frame_diff,Key) of
+			[] -> %% no bits detected sofar
+			    State;
+			[{_,[]}] -> %% all bits are discarded already
+			    State;
+			[{_,B0}] -> %% current bits
+			    B1 = diff_bits(Frame,OldFrame),
+			    %% remove switch bits in B1 (switched)
+			    B2 = B0 -- B1,
+			    ets:insert(S#s.frame_diff, {Key,B2}),
+			    io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			    State
+		    end
+	    end
+		
+    end.
     
+
+%% return true if auto_detect was switched within edge interval!
+is_auto_edge(_State={_,#d{ auto_detect = Auto, auto_detect_tmr = Tmr}}) 
+  when is_reference(Tmr), Auto =/= undefined ->
+    case erlang:read_timer(Tmr) of
+	false -> false;
+	Remain when Auto =:= high -> 
+	    T = ?AUTO_DETECT_HIGH_INTERVAL-Remain,
+	    (((T < 0) andalso (-T < ?AUTO_DETECT_EDGE_GUESSING)) 
+	     orelse
+	       ((T >= 0) andalso (T =< ?AUTO_DETECT_EDGE_INTERVAL)));
+	Remain when Auto =:= low -> 
+	    T = ?AUTO_DETECT_LOW_INTERVAL-Remain,
+	    (((T < 0) andalso (-T < ?AUTO_DETECT_EDGE_GUESSING)) 
+	     orelse
+	       ((T >= 0) andalso (T =< ?AUTO_DETECT_EDGE_INTERVAL)))
+    end;
+is_auto_edge(_) ->
+    false.
+
 cell_hit(Xy, Layout, State={S,D}) ->
     case fmt_from_coord(Xy, Layout) of
 	false ->
@@ -1094,30 +1281,28 @@ cell_hit(Xy, Layout, State={S,D}) ->
 	    {Vx,Vy,Vw,Vh} = view_rect(State2),
 	    epxw:set_view_size(max(0,Vx+Vw-1), max(0,Vy+Vh-1)),
 	    State2;
-	    
 	{_I, Fmt} when Fmt#fmt.field =:= id,
 		       Layout#layout.style =:= collapsed ->
 	    Layout1 = Layout#layout { style = normal },
 	    update_layout(Layout, Layout1, State);
-
 	{I, _Fmt} ->
 	    Mod = epxw:keymod(),
 	    if Mod#keymod.shift ->  
 		    %% add to or remove from selection
-		    FID = Layout#layout.id,
+		    Key = Layout#layout.key,
 		    Selected = 
-			case lists:member({FID,I}, D#d.selected) of
+			case lists:member({Key,I}, D#d.selected) of
 			    true -> 
-				lists:delete({FID,I},D#d.selected);
+				lists:delete({Key,I},D#d.selected);
 			    false ->
-				[{FID,I} | D#d.selected]
+				[{Key,I} | D#d.selected]
 			end,
 		    D1 = D#d { selected = Selected },
 		    State1 =  {S,D1},
-		    redraw_fid(FID, State1);
+		    redraw_by_key(Key, State1);
 	       true ->
-		    FID = Layout#layout.id,
-		    deselect(State, [{FID,I}])
+		    Key = Layout#layout.key,
+		    deselect(State, [{Key,I}])
 	    end
     end.
 
@@ -1266,16 +1451,16 @@ toggle_fd({S,D}) ->
 
 %% deselect all and selecte the NewSelected
 deselect({S,D}, NewSelected) ->
-    Fs = lists:usort([FID || {FID,_} <- D#d.selected ++ NewSelected]),
+    Keys = lists:usort([Key || {Key,_} <- D#d.selected ++ NewSelected]),
     State = {S, D#d { selected = NewSelected }},
-    lists:foldl(fun(FID,Si) -> redraw_fid(FID, Si) end, State, Fs).
+    lists:foldl(fun(Key,Si) -> redraw_by_key(Key, Si) end, State, Keys).
 
 
 %% Set base to 'Base' in selected cells
 set_base(Selected, Base, State) ->
     lists:foldl(
-      fun({FID,I}, Si) ->
-	      L= #layout{format=Format} = lookup_layout(FID,Si),
+      fun({Key,I}, Si) ->
+	      L= #layout{format=Format} = lookup_layout(Key,Si),
 	      Fmt = element(I, Format),
 	      if Fmt#fmt.field =:= data ->
 		      Fmt1 = Fmt#fmt { base = Base },
@@ -1300,41 +1485,49 @@ select_fmts(_I,[],Acc,_Sel) ->
     lists:reverse(Acc).
 
 %% split Selected group in FID in sizes of Size bits
-split_fid(FID, Selected, Size,State) ->
-    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+split_fid(Key, Selected, Size,State) ->
+    Sel = lists:filter(fun({K,_}) -> K =:= Key end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    L = lookup_layout(FID, State),
+    L = lookup_layout(Key, State),
     Format = L#layout.format,
     FmtList1 = split_size(1, Size, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    %% State1 = insert_layout(L1, State),
+    set_anim(Key, L1, 0, State),
     update_layout(L, L1, State).
 
-split_half_fid(FID, Selected, State) ->
-    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+split_half_fid(Key, Selected, State={_S,_D}) ->
+    Sel = lists:filter(fun({K,_}) -> K =:= Key end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    L = lookup_layout(FID, State),
+    L = lookup_layout(Key, State),
     Format = L#layout.format,
     FmtList1 = split_halfs(1, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    %% State1 = insert_layout(L1, State),
+    set_anim(Key, L1, 0, State),
     update_layout(L, L1, State).
 
-merge_fid(FID, Selected, State) ->
-    Sel = lists:filter(fun({F,_}) -> F =:= FID end, Selected),
+merge_fid(Key, Selected, State) ->
+    %% Sel is fields only from Key fields
+    Sel = lists:filter(fun({K,_}) -> K =:= Key end, Selected),
     PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-    L = lookup_layout(FID, State),
+    L = lookup_layout(Key, State),
     Format = L#layout.format,
     FmtList1 = merge_fmts(1, tuple_to_list(Format), [], PosList),
     Format1 = list_to_tuple(FmtList1),
     L1 = L#layout { format=Format1 },
-    State1 = insert_layout(L1, State),
-    update_layout(L, L1, State1).
+    %% State1 = insert_layout(L1, State),  %% FIXME: check this
+    set_anim(Key, L1, 0, State),
+    update_layout(L, L1, State).
+
+%% set animation value for data cells - fixme check fmt + data?
+set_anim(Key, Layout, Value, _State={S,_D}) ->
+    [ ets:insert(S#s.frame_anim,{{Key,Pos},Value}) ||
+	Pos <- lists:seq(9, tuple_size(Layout#layout.format)) ].
 
 %% merge selected data bit fields
 merge_fmts(I,[Fmt1,Fmt2|FmtList],Acc,Sel) when 
+      Fmt1#fmt.dpos =:= Fmt2#fmt.dpos,
       Fmt1#fmt.field =:= data, Fmt2#fmt.field =:= data ->
     case lists:member(I, Sel) andalso lists:member(I+1,Sel) of
 	true ->
@@ -1418,40 +1611,22 @@ make_bit_chunks(Fmt, Pos, _Chunk, Remain, Acc) ->
     [Fmt#fmt{ bits=[{Pos,Remain}]}|Acc].
 
 tick_start(_State={S,D}) ->
-    {S, D#d { tick = erlang:start_timer(100, self(), tick)}}.
+    {S, D#d { tick = erlang:start_timer(?TICK_INTERVAL, self(), tick)}}.
 
 tick_restart(State={_S,D}) when D#d.tick =:= undefined ->
     tick_start(State);
 tick_restart(State) ->
     State.
 
+-ifdef(not_used).
 tick_stop(State={_S,D}) when D#d.tick =:= undefined ->
     State;
 tick_stop(_State={S,D}) ->
     erlang:cancel_time(D#d.tick),
     {S, D#d { tick = undefined }}.
+-endif.
     
 default_format(IDFmt) ->
-    {
-     #fmt { field=hide, type=undefined },
-     IDFmt,
-     #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
-     #fmt { field=id,base=0,type={enum,{"-","F"}},bits=[{0,1}]},
-     #fmt { field=id,base=0,type={enum,{"-","X"}},bits=[{1,1}]},
-     #fmt { field=id,base=0,type={enum,{"-","R"}},bits=[{2,1}]},
-     #fmt { field=id,base=0,type={enum,{"-","E"}},bits=[{3,1}]},
-     #fmt { field=len,base=16,type=unsigned,bits=[{2,4}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
-    }.
-
-default_fd_format(IDFmt) ->
     {
      #fmt { field=hide, type=undefined },
      IDFmt,
@@ -1468,34 +1643,57 @@ default_fd_format(IDFmt) ->
      #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
      #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
      #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
-     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]},
-     %% FD data
-     #fmt { field=data, base=c, type=unsigned, bits=[{64,32}], ci=2},
-     #fmt { field=data, base=c, type=unsigned, bits=[{96,32}], ci=3},
-     #fmt { field=data, base=c, type=unsigned, bits=[{128,32}], ci=4},
-     #fmt { field=data, base=c, type=unsigned, bits=[{160,32}], ci=5},
-     #fmt { field=data, base=c, type=unsigned, bits=[{192,32}], ci=6},
-     #fmt { field=data, base=c, type=unsigned, bits=[{224,32}], ci=7},
-
-     #fmt { field=data, base=c, type=unsigned, bits=[{256,64}], ci=8},
-     #fmt { field=data, base=c, type=unsigned, bits=[{320,64}], ci=9},
-     #fmt { field=data, base=c, type=unsigned, bits=[{384,64}], ci=10},
-     #fmt { field=data, base=c, type=unsigned, bits=[{448,64}], ci=11}
+     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
     }.
 
-%% bits_int8(Pos)  -> [{Pos,8}].
-%% bits_int16(Pos) -> [{Pos,16}].
-%% bits_int32(Pos) -> [{Pos,32}].
+default_fd_format(IDFmt) ->
+    {
+     #fmt { field=hide, type=undefined },
+     IDFmt,
+     #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
+     #fmt { field=id,   base=0,type={enum,{"-","F"}},bits=[{0,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","X"}},bits=[{1,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","R"}},bits=[{2,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","E"}},bits=[{3,1}]},
+     #fmt { field=len,  base=16,type=unsigned,bits=[{0,7}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]},
+     %% FD data
+     #fmt { dpos=1,field=data, base=16, type=unsigned, bits=[{64,32}], ci=2},
+     #fmt { dpos=1,field=data, base=16, type=unsigned, bits=[{96,32}], ci=3},
 
-%% bits_int16_LE(Pos) -> [{Pos+8,8},{Pos,8}].
-%% bits_int32_LE(Pos) -> [{Pos+24,8},{Pos+16},{Pos+8},{Pos,8}].
+     #fmt { dpos=2,field=data, base=16, type=unsigned, bits=[{128,32}], ci=4},
+     #fmt { dpos=2,field=data, base=16, type=unsigned, bits=[{160,32}], ci=5},
 
+     #fmt { dpos=3,field=data, base=16, type=unsigned, bits=[{192,32}], ci=6},
+     #fmt { dpos=3,field=data, base=16, type=unsigned, bits=[{224,32}], ci=7},
+
+     #fmt { dpos=4,field=data, base=16, type=unsigned, bits=[{256,32}], ci=8},
+     #fmt { dpos=4,field=data, base=16, type=unsigned, bits=[{288,32}], ci=8},
+
+     #fmt { dpos=5,field=data, base=16, type=unsigned, bits=[{320,32}], ci=9},
+     #fmt { dpos=5,field=data, base=16, type=unsigned, bits=[{352,32}], ci=9},
+
+     #fmt { dpos=6,field=data, base=16, type=unsigned, bits=[{384,32}], ci=10},
+     #fmt { dpos=6,field=data, base=16, type=unsigned, bits=[{416,32}], ci=10},
+
+     #fmt { dpos=7,field=data, base=16, type=unsigned, bits=[{448,32}], ci=11},
+     #fmt { dpos=7,field=data, base=16, type=unsigned, bits=[{480,32}], ci=11}
+    }.
+
+%%
 diff_frames(FID, New, Old, State) ->
     #layout{format=Format} = Layout = lookup_layout(FID, State),
     if Layout#layout.style =:= deleted ->
 	    [];
        true ->
-	    case diff_frames_(1,Format,FID,New,Old,[],State) of
+	    case diff_frames_(1,Format,New,Old,[],State) of
 		[] -> [];
 		_Diff when Layout#layout.style =:= collapsed -> 
 		    %% flash only the ID field
@@ -1504,24 +1702,57 @@ diff_frames(FID, New, Old, State) ->
 	    end
     end.
 
-diff_frames_(Pos,Format,FID,New,Old,Acc,State) when Pos =< tuple_size(Format) ->
-    Fmt = element(Pos, Format),
+diff_frames_(I,Format,New,Old,Acc,State) when I =< tuple_size(Format) ->
+    Fmt = element(I, Format),
     BitsDataNew = get_bits(Fmt,New),
     BitsDataOld = get_bits(Fmt,Old),
     if BitsDataNew =:= BitsDataOld ->
-	    diff_frames_(Pos+1,Format,FID,New,Old,Acc,State);
+	    diff_frames_(I+1,Format,New,Old,Acc,State);
        true ->
-	    diff_frames_(Pos+1,Format,FID,New,Old,[Pos|Acc],State)
+	    diff_frames_(I+1,Format,New,Old,[I|Acc],State)
     end;
-diff_frames_(_Pos,_Format,_FID,_New,_Old,Acc,_State) ->
+diff_frames_(_I,_Format,_New,_Old,Acc,_State) ->
     Acc.
+
+diff_bits(#can_frame{len=L,data=OldBits}, #can_frame{len=L,data=OldBits}) ->
+    [];
+diff_bits(#can_frame{len=L,data=NewBits}, #can_frame{len=L,data=OldBits}) ->
+    Bits = crypto:exor(NewBits, OldBits),
+    flipped(Bits);
+diff_bits(#can_frame{len=L1,data=NewBits}, #can_frame{len=L2,data=OldBits}) ->
+    D = L1 - L2,
+    Bits = if D > 0 -> 
+		   crypto:exor(NewBits, <<OldBits/binary, 0:D/unit:8>>);
+	      D < 0 ->
+		   crypto:exor(<<NewBits/binary, 0:(-D)/unit:8>>, OldBits)
+	   end,
+    flipped(Bits).
+
+%% flipped_bits. return a list of bit offsets to flipped bits
+flipped(Flipped) ->
+    flipped_bits64(0, Flipped).
+
+flipped_bits64(I, <<0:64,Rest/binary>>) -> flipped_bits64(I+64,Rest);
+flipped_bits64(I, Rest) -> flipped_bits32(I,Rest).
+
+flipped_bits32(I, <<0:32,Rest/binary>>) -> flipped_bits32(I+32,Rest);
+flipped_bits32(I, Rest) -> flipped_bits8(I,Rest).
+
+flipped_bits8(I,<<0:8,Rest/binary>>) -> flipped_bits8(I+8,Rest);
+flipped_bits8(I,<<B:8/bitstring,Rest/binary>>) -> flipped_bits1(I,B,Rest);
+flipped_bits8(_I, <<>>) -> [].
+
+flipped_bits1(I,<<1:1,B/bitstring>>,Rest) -> [I|flipped_bits1(I+1,B,Rest)];
+flipped_bits1(I,<<0:1,B/bitstring>>,Rest) -> flipped_bits1(I+1,B,Rest);
+flipped_bits1(I,<<>>,Rest) -> flipped_bits64(I,Rest).
+
 
 redraw_anim(Pixels,Area,State={S,_}) ->
     case ets:first(S#s.frame_anim) of
 	'$end_of_table' ->
 	    false;
 	First ->
-	    {Remove,Update} = redraw_anim_(Pixels,Area,First, [], [], State),
+	    {Remove,Update} = redraw_anim_(Pixels,Area,First,[],[],State),
 	    ets:delete(S#s.frame_anim, Remove),
 	    lists:foreach(
 	      fun(Key) ->
@@ -1536,18 +1767,18 @@ redraw_anim(Pixels,Area,State={S,_}) ->
 	    Update =/= []
     end.
 
-redraw_anim_(Pixels,Area,Key={_FID,0}, Remove, Update, State={S,_}) ->
+redraw_anim_(Pixels,Area,Iter={_Key,0}, Remove, Update, State={S,_}) ->
     %% redraw the entire layout using position interpolation
-    Next = ets:next(S#s.frame_anim, Key),
-    redraw_anim_(Pixels,Area,Next, Remove, Update, State);
-redraw_anim_(Pixels,Area,Key={FID,Pos}, Remove, Update, State={S,_}) ->
-    [Frame] = ets:lookup(S#s.frame, FID),
-    Next = ets:next(S#s.frame_anim, Key),
-    case redraw_pos(Pixels,Area,FID,Pos,Frame,State) of
+    Next = ets:next(S#s.frame_anim, Iter),
+    redraw_anim_(Pixels,Area,Next,Remove,Update,State);
+redraw_anim_(Pixels,Area,Iter={Key,Pos}, Remove, Update, State={S,_}) ->
+    [{_,Frame}] = ets:lookup(S#s.frame, Key),
+    Next = ets:next(S#s.frame_anim, Iter),
+    case redraw_pos(Pixels,Area,Key,Pos,Frame,State) of
 	true -> %% remove
-	    redraw_anim_(Pixels,Area,Next, [Key|Remove], Update, State);
+	    redraw_anim_(Pixels,Area,Next, [Iter|Remove], Update, State);
 	false ->
-	    redraw_anim_(Pixels,Area,Next, Remove, [Key|Update], State)
+	    redraw_anim_(Pixels,Area,Next, Remove, [Iter|Update], State)
     end;
 redraw_anim_(_Pixels,_Area,'$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
@@ -1598,26 +1829,47 @@ set_status(_State={S,_D}) ->
 format_error(ErrorList) ->
     string:join([atom_to_list(E) || E <- ErrorList], ",").
 
+intersect_layout(Layout, Area) ->
+    R = {_,_,W,H} = epx_rect:intersect(Area,layout_rect(Layout)),
+    if W =:= 0; H =:= 0 ->
+	    false;
+       true ->
+	    R
+    end.
+
 %% redraw all Layouts 
-redraw_all(Pixels, _Area, State) ->
+redraw_all(Pixels, Area, State) ->
     each_layout(fun(Layout, State1) ->
-			%% FIXME: check intersection with _Area
-			redraw_layout_(Pixels, Layout, State1)
+			case intersect_layout(Layout, Area) of
+			    false ->
+				State1;
+			    _Intersection ->
+				redraw_layout_(Pixels, Layout, State1)
+			end
 		end, State).
 
-redraw_(Pixels, _Area, FID, State) ->
+-ifdef(not_used).
+redraw_(Pixels, Area, FID, State) ->
     Layout = lookup_layout(FID, State),
-    %% Fixme check intersection with Area
-    redraw_layout_(Pixels, Layout, State).
+    case intersect_layout(Layout, Area) of
+	false ->
+	    State;
+	_Intersection ->
+	    redraw_layout_(Pixels, Layout, State)
+    end.
+-endif.
 
-redraw_fid(FID, State={_S,_D}) ->
+redraw_by_key(Key, State={_S,_D}) ->
     epxw:draw(
-      fun(Pixels, _Area) ->
-	      Layout = lookup_layout(FID, State),
-	      %% Fixme check intersection with Area
-	      redraw_layout_(Pixels, Layout, State)
+      fun(Pixels, Area) ->
+	      Layout = lookup_layout(Key, State),
+	      case intersect_layout(Layout, Area) of
+		  false ->
+		      State;
+		  _Intersection ->
+		      redraw_layout_(Pixels, Layout, State)
+	      end
       end).
-
 
 each_layout(Fun, State={S,_D}) ->
     Tab = S#s.frame_layout,
@@ -1625,10 +1877,10 @@ each_layout(Fun, State={S,_D}) ->
 
 each_layout_(_Fun, _Tab, '$end_of_table', State) ->
     State;
-each_layout_(Fun, Tab, FID, State) ->
-    Layout = lookup_layout(FID, State),
+each_layout_(Fun, Tab, Key, State) ->
+    Layout = lookup_layout(Key, State),
     State1 = Fun(Layout, State),
-    each_layout_(Fun, Tab, ets:next(Tab, FID), State1).
+    each_layout_(Fun, Tab, ets:next(Tab, Key), State1).
 
 fold_layout(Fun, Acc, State={S,_D}) ->
     Tab = S#s.frame_layout,
@@ -1636,66 +1888,46 @@ fold_layout(Fun, Acc, State={S,_D}) ->
 
 fold_layout_(_Fun, Acc, _Tab, '$end_of_table', _State) ->
     Acc;
-fold_layout_(Fun, Acc, Tab, FID, State) ->
-    Layout = lookup_layout(FID, State),
+fold_layout_(Fun, Acc, Tab, Key, State) ->
+    Layout = lookup_layout(Key, State),
     Acc1 = Fun(Layout, Acc, State),
-    fold_layout_(Fun, Acc1, Tab, ets:next(Tab, FID), State).
+    fold_layout_(Fun, Acc1, Tab, ets:next(Tab, Key), State).
     
-redraw_layout_(Pixels, Layout, State={S,_D}) ->
-    #layout{ id=FID, color=Color,format=FmtTuple} = Layout,
-    %% Count = ets:lookup_element(S#s.frame_counter, FID, 2),
-    draw_layout_background(Pixels, Layout),
-    [Frame] = ets:lookup(S#s.frame, FID),
+redraw_layout_(Pixels, Layout, State={S,D}) ->
+    #layout{ key=Key, color=Color,format=FmtTuple} = Layout,
+    %% Count = ets:lookup_element(S#s.frame_counter, key, 2),
+    draw_layout_background(Pixels, Layout, D#d.screen_color),
+    [{_,Frame}] = ets:lookup(S#s.frame, Key),
     case Layout#layout.style of
 	deleted ->
 	    State;
 	collapsed ->
 	    _Remove = redraw_cell(Pixels,
 				  Layout#layout.x,Layout#layout.y,
-				  FID,?ID_FMT_POSITION,Color,
+				  Key,?ID_FMT_POSITION,Color,
 				  element(?ID_FMT_POSITION,FmtTuple),
 				  Frame,State),
 	    State;
 	_ ->
 	    redraw_cells(Pixels,
 			 Layout#layout.x,Layout#layout.y,
-			 FID,1,Color,FmtTuple,Frame,State)
+			 Key,1,Color,FmtTuple,Frame,State)
     end.
 
-redraw_cells(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) when 
-      Pos =< tuple_size(FmtTuple) ->
-    Fmt = element(Pos, FmtTuple),
-    _Remove = redraw_cell(Pixels, Lx,Ly,FID,Pos,Color,Fmt,Frame,State),
-    redraw_cells(Pixels,Lx,Ly,FID,Pos+1,Color,FmtTuple,Frame,State);
-redraw_cells(_Pixels,_Lx,_Ly,_FID,_Pos,_Color,_FmtTuple,_Frame,State) ->
+redraw_cells(Pixels,Lx,Ly,Key,I,Color,FmtTuple,Frame,State) when 
+      I =< tuple_size(FmtTuple) ->
+    Fmt = element(I, FmtTuple),
+    _Remove = redraw_cell(Pixels,Lx,Ly,Key,I,Color,Fmt,Frame,State),
+    redraw_cells(Pixels,Lx,Ly,Key,I+1,Color,FmtTuple,Frame,State);
+redraw_cells(_Pixels,_Lx,_Ly,_Key,_I,_Color,_FmtTuple,_Frame,State) ->
     State.
 
-redraw_pos(Pixels,Area,FID,Pos,Frame,State) ->
-    Layout = lookup_layout(FID, State),
-    %% FIXME: filter using Area!
-    #layout{ x=Lx, y=Ly, color=Color, format=FmtTuple} = Layout,
-    case Layout#layout.style of
-	collapsed ->
-	    redraw_pos(Pixels,Lx,Ly,FID,?ID_FMT_POSITION,Color,FmtTuple,Frame,State);
-	deleted ->
-	    true;
-	_ ->
-	    redraw_pos(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State)
-    end.
 
-redraw_pos(Pixels,Lx,Ly,FID,Pos,Color,FmtTuple,Frame,State) ->
-    if Pos > tuple_size(FmtTuple) ->
-	    true;
-       true ->
-	    Fmt = element(Pos,FmtTuple),
-	    redraw_cell(Pixels,Lx,Ly,FID,Pos,Color,Fmt,Frame,State)
-    end.
-
-redraw_cell(Pixels,Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
+redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,Frame,State={S,D}) ->
     #fmt {dx=Dx,dy=Dy,width=W,height=H,ci=Ci} = Fmt,
     Color = cell_color(Ci),
     X = Lx+Dx, Y = Ly+Dy,
-    Anim = get_anim(FID,Pos,State),
+    Anim = get_anim(Key,I,State),
     {Remove,TextColor} = highlight(Pixels,Anim,Color,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
     %% draw shape
@@ -1704,7 +1936,7 @@ redraw_cell(Pixels,Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	    epx_gc:set_foreground_color(Color#color.border),
 	    epx_gc:set_border_color(Color#color.border),
 	    epx_gc:set_border_style(inside),
-	    case lists:member({FID,Pos}, D#d.selected) of
+	    case lists:member({Key,I}, D#d.selected) of
 		true -> epx_gc:set_border_width(2);
 		_ -> epx_gc:set_border_width(0)
 	    end,
@@ -1748,20 +1980,20 @@ redraw_cell(Pixels,Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	frequency -> %% frequency in K frames/s
 	    Time1 = erlang:system_time(millisecond),
 	    [{_,Time0,Count0,String0}] = 
-		ets:lookup(S#s.frame_freq, FID),
+		ets:lookup(S#s.frame_freq,Key),
 	    Td = Time1 - Time0,
 	    String =
 		if Td > 1000 ->
 			[{_,Count1}] = 
-			    ets:lookup(S#s.frame_counter,FID),
+			    ets:lookup(S#s.frame_counter,Key),
 			N = Count1 - Count0,
 			Ffmt = case Fmt#fmt.type of
 				   {float,Fw,Fp} -> [$~,(Fw+$0),$.,(Fp+$0),$f];
 				   {float,Fp} -> [$~,$.,(Fp+$0),$f]
 			       end,
-			String1 = lists:flatten(io_lib:format(Ffmt, [(1000*N)/Td])),
-			ets:insert(S#s.frame_freq,
-				   {FID,Time1,Count1,String1}),
+			String1 = lists:flatten(io_lib:format(Ffmt,
+							      [(1000*N)/Td])),
+			ets:insert(S#s.frame_freq,{Key,Time1,Count1,String1}),
 			String1;
 		   true ->
 			String0
@@ -1784,6 +2016,50 @@ redraw_cell(Pixels,Lx,Ly,FID,Pos,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	    epx:draw_string(Pixels, X+Offs, Ya, String)
     end,
     Remove.
+
+
+%% draw layout return true if 'deleted' or false otherwise
+redraw_pos(Pixels,Area,Key,I,Frame,State) ->
+    Layout = lookup_layout(Key, State),
+    #layout{ x=Lx, y=Ly, color=Color, format=FmtTuple} = Layout,
+    case intersect_layout(Layout, Area) of
+	false ->
+	    case Layout#layout.style of
+		collapsed ->
+		    step_pos(Key,?ID_FMT_POSITION,State);
+		deleted ->
+		    true;
+		_ ->
+		    step_pos(Key,I,State)
+	    end;
+	_Intersection ->
+	    case Layout#layout.style of
+		collapsed ->
+		    redraw_pos_(Pixels,Lx,Ly,Key,?ID_FMT_POSITION,
+				Color,FmtTuple,Frame,State);
+		deleted ->
+		    true;
+		_ ->
+		    redraw_pos_(Pixels,Lx,Ly,Key,I,Color,FmtTuple,Frame,State)
+	    end
+    end.
+
+%% step non-visible cells
+step_pos(Key,I,State) ->
+    Anim = get_anim(Key,I,State),
+    if Anim =< 0 -> true;
+       true -> false
+    end.
+
+redraw_pos_(Pixels,Lx,Ly,Key,I,Color,FmtTuple,Frame,State) ->
+    if I > tuple_size(FmtTuple) ->
+	    true;
+       true ->
+	    Fmt = element(I,FmtTuple),
+	    redraw_cell(Pixels,Lx,Ly,Key,I,Color,Fmt,Frame,State)
+    end.
+
+
 
 -define(COLOR(H),
 	       #color {
@@ -1811,14 +2087,13 @@ cell_color(I) ->
 	      ?COLOR(?HIGHLIGHT_COLOR13)  }).
 
 %% "delete" the layout by drawing layout background color
-draw_layout_background(Pixels, Layout) ->
-    Color = Layout#layout.color,
-    draw_layout_rectangle(Pixels, Layout, Color#color.background,
+draw_layout_background(Pixels, Layout, Color) ->
+    draw_layout_rectangle(Pixels, Layout, Color, 
 			  Layout#layout.width).
 
 %% prepare layout by painting the layout background color
-clear_layout_background(Pixels, Layout, State={S,_D}) ->
-    Color = ?LAYOUT_BACKGROUND_COLOR,
+clear_layout_background(Pixels, Layout, _State={_S,D}) ->
+    Color = D#d.screen_color,
     draw_layout_rectangle(Pixels, Layout, Color, epxw:width()).
 
 draw_layout_rectangle(Pixels, Layout, Color, Width) ->
@@ -1833,8 +2108,8 @@ glyph_width(S) -> S#s.glyph_width.
 %%glyph_height(S) -> S#s.glyph_height.
 glyph_ascent(S) -> S#s.glyph_ascent.
 
-get_anim(FID,Pos,{S,_}) ->
-    case ets:lookup(S#s.frame_anim, {FID,Pos}) of
+get_anim(Key,I,{S,_}) ->
+    case ets:lookup(S#s.frame_anim, {Key,I}) of
 	[] -> -1;
 	[{_,Val}] -> Val
     end.
@@ -1859,7 +2134,6 @@ highlight(Pixels,Anim, Color, Rect, _State) ->
     T  = blend(Anim, T1, T0),
     {false, T}.
 
-
 blend(Val, {Rh,Gh,Bh}, {Rb,Gb,Bb}) ->
     F1 = Val/255,
     F0 = 1-F1,
@@ -1876,12 +2150,14 @@ blend(Val, {Ah,Rh,Gh,Bh}, {Ab,Rb,Gb,Bb}) ->
     B = trunc(F1*Bh + F0*Bb),
     {A,R,G,B}.
 
+-ifdef(not_used).
 interp_coord(Val, {X1,Y1}, {X0,Y0}) ->
     F1 = Val/255,
     F0 = 1-F1,
     X = trunc(F1*X1 + F0*X0),
     Y = trunc(F1*Y1 + F0*Y0),
     {X,Y}.
+-endif.
 
 get_bits(#fmt { type={string,NameBits} }, _Frame) ->
     NameBits;
@@ -1904,8 +2180,8 @@ extend_bits(Data, MinSize) ->
     Pad = MinSize - Size,
     <<Data/bitstring, 0:Pad>>.
 
-layout_rect(#layout { x=X0, y=Y0, width=W0, height=H0 }) ->
-    {X0,Y0,W0,H0}.
+layout_rect(#layout { x=X, y=Y, width=W, height=H }) ->
+    {X,Y,W,H}.
 
 invalidate_layout(Layout, State) ->
     #layout { x=X0, y=Y0, width=W0, height=H0 } = Layout,
@@ -1916,7 +2192,31 @@ invalidate_layout(Layout, State) ->
 %% reposition layouts below the Layout, update next_pos
 %% update view_height / view_width
 
-remove_layout(Layout, State) ->
+remove_layout(Layout, State={S,_D}) ->
+    Pos = Layout#layout.pos,  %% number of rows deleted
+    N = Layout#layout.npos,  %% number of rows deleted
+    State1 = remove_layout_(ets:first(S#s.frame_layout), Pos, N, State),
+    {S1,D1} = State1,
+    S2 = S1#s{ next_pos = S1#s.next_pos-N },
+    State2 = {S2, D1},
+    {Layout#layout { style=deleted,pos0=0,pos=0,x=0,y=0},State2}.
+
+remove_layout_('$end_of_table', _Pos, _N, State) ->
+    State;
+remove_layout_(Key, Pos, N, State={S,_D}) ->
+    L1 = lookup_layout(Key, State),
+    Pos1 = L1#layout.pos,
+    if Pos1 > Pos ->
+	    L2 = L1#layout { pos = Pos1-N },  %% move N steps backwards
+	    L3 = position_normal(L2, State),
+	    State1 = insert_layout(L3, State),
+	    remove_layout_(ets:next(S#s.frame_layout, Key), Pos, N, State1);
+       true ->
+	    remove_layout_(ets:next(S#s.frame_layout, Key), Pos, N, State)
+    end.
+
+-ifdef(not_used).
+remove_layout_orig(Layout, State) ->
     State1 =
 	each_layout(fun(L1, Si) ->
 			    Pi = L1#layout.pos,
@@ -1933,6 +2233,7 @@ remove_layout(Layout, State) ->
     {Layout#layout { style = deleted,
 		     pos=0, x=0,y=0,width=0,height=0
 		   }, {S2,D1}}.
+-endif.
 
 %% calculate new view rect
 view_rect(State) ->
@@ -1945,7 +2246,10 @@ view_rect(State) ->
 			Ri
 		end, {0,0,0,0}, State).
 
-%% recalulate Layout
+position_to_coord(Pos, {S,_D}) when is_integer(Pos), Pos > 0 ->
+    {0, (Pos-1)*(S#s.row_height+?FMT_VERTICAL_PAD)}.
+
+%% recalulate Layout (calculate rows and coordinates)
 position_layout(Layout, State) ->
     case Layout#layout.style of
 	normal    -> position_normal(Layout,State);
@@ -1955,18 +2259,16 @@ position_layout(Layout, State) ->
     end.
 
 position_deleted(Layout, _State) ->
-    Layout#layout { x=0,y=0,width=0,height=0 }.
+    Layout#layout { x=0,y=0,npos=0,width=0,height=0 }.
 
-position_to_coord(Pos, {S,_D}) when is_integer(Pos), Pos > 0 ->
-    {0, (Pos-1)*(S#s.row_height+S#s.row_pad)}.
+reposition_normal(Pos, L, State={_S,_D}) ->
+    {X,Y} = position_to_coord(Pos, State),
+    L#layout { style=normal, pos=Pos, pos0=Pos, x=X,y=Y }.
 
-position_normal(Layout, State={S,_D}) ->
+position_normal(Layout, State={_S,_D}) ->
     {X,Y} = position_to_coord(Layout#layout.pos, State),
-    {Dx,FmtTuple} = 
-	position_cells(0, 1, Layout#layout.format, [], State),
-    Width = Dx-1,
-    Height = S#s.row_height,
-    Layout#layout { x=X,y=Y,width=Width,height=Height,format=FmtTuple }.
+    {Width,Height,FmtTuple,Dp} = position_cells(Layout#layout.format, State),
+    Layout#layout { x=X,y=Y,npos=Dp,width=Width,height=Height,format=FmtTuple }.
 
 position_collapsed(Layout, _State={S,_D}) ->
     J = Layout#layout.pos-1,
@@ -1974,32 +2276,59 @@ position_collapsed(Layout, _State={S,_D}) ->
     Row = 1,  %% calculate row from bottom left to right
     Height = S#s.row_height,
     Num    = num_glyphs(Fmt),
-    GW = glyph_width(S),
+    GW     = glyph_width(S),
     Wide   = 8*GW + 4,
     Width  = Num*GW + 4,
-    X = J*Wide,
-    Y = epxw:height() - Row*Height,
+    X      = J*Wide,
+    Y      = epxw:height() - Row*Height,
     Fmt1 = Fmt#fmt { dx=0, dy=0, width=Width, height=Height },
     FmtTuple = setelement(?ID_FMT_POSITION, Layout#layout.format, Fmt1),
-    Layout#layout { x=X,y=Y,width=Wide+2,height=Height,format=FmtTuple}.
+    Layout#layout { x=X,y=Y,npos=1,width=Wide+2,height=Height,format=FmtTuple}.
 
-position_cells(Dx,I,FmtTuple,Acc,State={S,_D}) when I =< tuple_size(FmtTuple) ->
+position_cells(FmtTuple, State) ->
+    Dx=0, Dy=0, Dpos=0,
+    position_cells(1,Dx,Dy,Dpos,0,FmtTuple,[],State).
+
+position_cells(I,Dx,Dy,Dpos,MaxW,FmtTuple,Acc,State={S,_D}) 
+  when I =< tuple_size(FmtTuple) ->
     Fmt = element(I, FmtTuple),
-    Num = num_glyphs(Fmt),
-    GW = glyph_width(S),
-    Width0 = Num*GW,
-    Wind = if Fmt#fmt.field =:= data -> 6; %% what was this?
+    Width = fmt_width(Fmt, S), 
+    Height = S#s.row_height,
+    if Dpos =:= Fmt#fmt.dpos ->
+	    Fmt1 = Fmt#fmt { dx=Dx, dy=Dy, width=Width, height=Height },
+	    position_cells(I+1,Dx+Width+2,Dy,Dpos,MaxW,FmtTuple,
+			   [Fmt1|Acc],State);
+       true ->
+	    MaxW1 = max(MaxW,Dx-2),
+	    Dy1 = Dy + Height + ?FMT_VERTICAL_PAD,
+	    %% FIXME: calc once! assumes fmt 2-8 are on same row!
+	    Dx1 = fmt_width(element(1,FmtTuple),S) + 
+		       fmt_width(element(2,FmtTuple),S) + 
+		       fmt_width(element(3,FmtTuple),S) + 
+		       fmt_width(element(4,FmtTuple),S) + 
+		       fmt_width(element(5,FmtTuple),S) + 
+		       fmt_width(element(6,FmtTuple),S) + 
+		       fmt_width(element(7,FmtTuple),S) + 
+		       fmt_width(element(8,FmtTuple),S) + 2*8,
+	    Fmt1 = Fmt#fmt { dx=Dx1, dy=Dy1, width=Width, height=Height },
+	    position_cells(I+1,Dx1+Width+2,Dy1,Fmt#fmt.dpos,MaxW1,
+			   FmtTuple,[Fmt1|Acc],
+			   State)
+    end;
+position_cells(I,Dx,Dy,Dpos,MaxW,_FmtTuple,Acc,_State={S,_D}) ->
+    FmtTuple1 = list_to_tuple(lists:reverse(Acc)),
+    if I =:= 1 -> {0,0,FmtTuple1,0};
+       true -> {max(MaxW,Dx-2),Dy+S#s.row_height,FmtTuple1,Dpos+1}
+    end.
+
+fmt_width(Fmt,S) ->
+    %% size of base indication text width (for data entries)
+    Wind = if Fmt#fmt.field =:= data -> 6;
 	      true -> 0
 	   end,
-    Width = Wind + Width0 + 4,
-    Height = S#s.row_height,
-    Fmt1 = Fmt#fmt { dx=Dx, dy=0, width=Width, height=Height },
-    position_cells(Dx+Width+2, I+1, FmtTuple, [Fmt1|Acc], State);
-position_cells(Dx, I, _FmtTuple, Acc, _State) ->
-    FmtTuple1 = list_to_tuple(lists:reverse(Acc)),
-    if I =:= 1 -> {0,FmtTuple1};
-       true -> {Dx-2,FmtTuple1}
-    end.
+    GW = glyph_width(S),
+    Num = num_glyphs(Fmt),
+    Wind + Num*GW +?FMT_HORIZONTAL_PAD.
 
 num_glyphs(Fmt) ->
     case Fmt#fmt.type of
@@ -2111,32 +2440,38 @@ collect_bits_([{P,L}|Ps], Data, Acc) ->
 collect_bits_([], _Data, Acc) ->
     Acc.
 
+%% FID maybe can_frame id or internal key (where fd/err is stripped)
 lookup_layout(FID, _State={S,_D}) ->
-    [L] = ets:lookup(S#s.frame_layout, FID),  %% lookup element
+    [{_,L}] = ets:lookup(S#s.frame_layout, frame_key(FID)),
     L.
 
 update_layout(OldLayout, NewLayout, State={_S,_D}) ->
-    Pixels = epxw:pixels(),
-    clear_layout_background(Pixels, OldLayout, State),
-    Layout = position_layout(NewLayout, State),
-    State1 = insert_layout(Layout, State),
-    State2 = redraw_layout_(Pixels, Layout, State1),
-    if OldLayout#layout.x =/= Layout#layout.x;
-       OldLayout#layout.y =/= Layout#layout.y;
-       OldLayout#layout.width =/= Layout#layout.width;
-       OldLayout#layout.height =/= Layout#layout.height ->
-	    %% if layout changed repaint old area
-	    invalidate_layout(OldLayout, State2);
-       true ->
-	    ok
-    end,
-    invalidate_layout(Layout, State2).
+    %% Pixels = epxw:pixels(),
+    epxw:draw(
+      fun(Pixels, _Area) ->
+	      clear_layout_background(Pixels, OldLayout, State),
+	      Layout = position_layout(NewLayout, State),
+	      State1 = insert_layout(Layout, State),
+	      State2 = redraw_layout_(Pixels, Layout, State1),
+	      if OldLayout#layout.x =/= Layout#layout.x;
+		 OldLayout#layout.y =/= Layout#layout.y;
+		 OldLayout#layout.width =/= Layout#layout.width;
+		 OldLayout#layout.height =/= Layout#layout.height ->
+		      %% if layout changed repaint old area
+		      invalidate_layout(OldLayout, State2);
+		 true ->
+		      ok
+	      end,
+	      invalidate_layout(Layout, State2)
+      end).
 
 
 insert_layout(Layout, State={S,_D}) ->
-    ets:insert(S#s.frame_layout, Layout),
-    epxw:set_view_size(Layout#layout.x+Layout#layout.width,
-		       Layout#layout.y+Layout#layout.height),
+    ets:insert(S#s.frame_layout, {Layout#layout.key,Layout}),
+    %% FIXME: use smarter calculation!
+    {_,_,W,H} = epxw:view_rect(),
+    epxw:set_view_size(max(W,Layout#layout.x+Layout#layout.width),
+		       max(H,Layout#layout.y+Layout#layout.height)),
     State.
 
 
@@ -2147,16 +2482,16 @@ layout_from_coord(XY, _State={S,_D}) ->
 
 layout_from_coord_(_XY, _Tab, '$end_of_table') ->
     false;
-layout_from_coord_(XY, Tab, FID) ->
-    case ets:lookup(Tab, FID) of
+layout_from_coord_(XY, Tab, Key) ->
+    case ets:lookup(Tab, Key) of
 	[] ->
-	    layout_from_coord_(XY, Tab, ets:next(Tab, FID));
-	[Layout=#layout{x=X1,y=Y1,width=W,height=H}] ->
+	    layout_from_coord_(XY, Tab, ets:next(Tab, Key));
+	[{_,Layout=#layout{x=X1,y=Y1,width=W,height=H}}] ->
 	    {X,Y} = XY,
 	    if X >= X1, Y >= Y1, X < X1+W, Y < Y1+H ->
 		    Layout;
 	       true ->
-		    layout_from_coord_(XY, Tab, ets:next(Tab, FID))
+		    layout_from_coord_(XY, Tab, ets:next(Tab, Key))
 	    end
     end.
 

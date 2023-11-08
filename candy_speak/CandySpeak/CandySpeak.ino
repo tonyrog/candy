@@ -22,6 +22,7 @@ char linebuf[MIN_LINE_LENGTH];
 int  pos = 0;
 
 void loop() {
+  tick_t t;
   if (Serial.available() > 0) {
     linebuf[pos++] = Serial.read();
         if ((pos == sizeof(linebuf)-1) || (linebuf[pos-1] == '\n')) {
@@ -30,7 +31,8 @@ void loop() {
       pos = 0;
     }
   }
-  candy_read_input();  
+  t = time_tick();
+  candy_read_input(t);  
   if (nevents) {
     candy_run_event(&event);
     nevents = 0;
@@ -39,6 +41,6 @@ void loop() {
       candy_run_rules();
   } while(fixpoint && nupdates);
   
-  candy_emit_frames();
-  candy_write_output();
+  // candy_emit_frames(t);
+  candy_write_output(t);
 }

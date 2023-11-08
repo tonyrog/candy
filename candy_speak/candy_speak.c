@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <memory.h>
 #include <ctype.h>
+#define DEBUG
 
 #include "CandySpeak/CandySpeak.h"
 
@@ -18,20 +19,24 @@ int main(int argc, char** argv)
     int fixpoint = 0;
 
     candy_init();
-    
-    if (strcmp(argv[i], "-v") == 0) {
-	verbose = 1;
-	i++;
-    }
-    if (strcmp(argv[i], "-f") == 0) {
-	if ((fin = fopen(argv[i+1], "r")) == NULL) {
-	    fprintf(stderr, "unable to open file %s\n", argv[i+1]);
-	    exit(1);
+
+    if (argc > 1) {
+	if (strcmp(argv[i], "-v") == 0) {
+	    verbose = 1;
+	    i++;
 	}
-	i += 2;
+	if (strcmp(argv[i], "-f") == 0) {
+	    if ((fin = fopen(argv[i+1], "r")) == NULL) {
+		fprintf(stderr, "unable to open file %s\n", argv[i+1]);
+		exit(1);
+	    }
+	    i += 2;
+	}
     }
 
     while(1) {
+	tick_t t;
+	
 	if (i < argc) {
 	    candy_parse_line(argv[i]);
 	    i++;
@@ -40,7 +45,9 @@ int main(int argc, char** argv)
 	    if (fgets(linebuf, sizeof(linebuf), fin))
 		candy_parse_line(linebuf);
 	}
-	candy_read_input();
+	t = time_tick();
+	candy_read_can_frames(t);
+	candy_read_input(t);
 	if (nevents) {
 	    candy_run_event(&event);
 	    nevents = 0;
@@ -50,8 +57,8 @@ int main(int argc, char** argv)
 	    candy_run_rules();
 	} while(fixpoint && nupdates);
 
-	candy_emit_frames();	
-	candy_write_output();
+	candy_write_can_frames(t);	
+	candy_write_output(t);
     }
     exit(0);
 }
