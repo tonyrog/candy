@@ -382,10 +382,12 @@ static char* candy_tok(char* p, token_t* tp)
 }
 
 
-int candy_scan_line(token_t* ts, char* ptr)
+int candy_scan_line(token_t* ts, size_t max_tokens, char* ptr)
 {
     int i = 0;
 next:
+    if (i >= max_tokens)
+	return -1;
     while(isblank(*ptr))
 	ptr++;
     if ((ptr[0]=='/') && (ptr[1]=='/')) {

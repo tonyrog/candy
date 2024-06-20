@@ -1477,7 +1477,7 @@ static int candy_parse()
 	case T_TIMER:
 	    return candy_parse_timer(2); 		
 	case T_CAN:
-	    return candy_parse_can(2); 			
+	    return candy_parse_can(2);
 	case T_VARIABLE:
 	    return candy_parse_variable(2);
 	case T_CONSTANT:
@@ -1905,7 +1905,7 @@ static void candy_parse_line(char* buf)
 {
     int n;
 
-    if ((n = candy_scan_line(ts, buf)) <= 0)
+    if ((n = candy_scan_line(ts, MAX_NUM_TOKENS, buf)) <= 0)
 	return;
 #ifdef DEBUG
     print_tokens(ts, n);

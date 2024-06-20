@@ -1,13 +1,18 @@
 %%% @author Tony Rogvall <tony@rogvall.se>
 %%% @copyright (C) 2019, Tony Rogvall
 %%% @doc
-%%%    Play CANUSB log file (with filestamp)
+%%%    Play CAN logfile (with filestamp)
 %%% @end
 %%% Created :  9 Mar 2019 by Tony Rogvall <tony@rogvall.se>
 
 -module(candy_play).
 
 -export([file/1, file/2, file/3]).
+-export([fold_file/3, fold_fd/5]).
+-export([current_time/0]).
+-export([sleep/3]).
+-export([split_pid_data/1]).
+-export([mersa/1]).
 
 -include_lib("can/include/can.hrl").
 
@@ -20,12 +25,14 @@ file(File,Repeat,TimeScale) when is_integer(Repeat), Repeat >= -1,
 				 is_number(TimeScale), 
 				 TimeScale > 0 ->
     (catch error_logger:tty(false)),
-    %% application:start(lager),
-    can_udp:start(0, [{ttl,0}]),
+    %% can_udp:start(0, [{ttl,0}]),
+    fold_file(File, fun play/6, #{repeat => Repeat, time_scale => TimeScale}).
+
+
+fold_file(File, Play, Params) ->	      
     case file:open(File,[read,binary,raw]) of
 	{ok,Fd} ->
-	    try replay(Fd, current_time(),
-		       #{repeat=>Repeat, timescale=>TimeScale}) of
+	    try fold_fd(Fd, Play, [], current_time(), Params) of
 		Result -> Result
 	    after
 		file:close(Fd)
@@ -34,71 +41,187 @@ file(File,Repeat,TimeScale) when is_integer(Repeat), Repeat >= -1,
 	    Error
     end.
 
+%% callback to playback a rx frame followed by a delay
+play(Frame, rx, _Hw, Params, Time0, Acc) -> 
+    %% _Vsn = maps:get(vsn, Params, {0,0}),
+    %% io:format("~s/~w: ~s ~s\n",
+    %%    [_Hw,_Vsn,rx,can_probe:format_frame(Frame)]),
+    TimeScale = maps:get(time_scale, Params, 1),
+    sleep(Frame#can_frame.ts, Time0, TimeScale),
+    can:sync_send(Frame#can_frame{intf=0,ts=0}),
+    Acc;
+play(_Frame, _Dir, _Hw, _Params, _Time0, Acc) -> 
+    Acc.
+
+sleep(TimeStamp, StartTime, Scale) ->
+    TimeOffsUs = max(0, (current_time() - StartTime)),
+    Delta = 
+	if TimeStamp =:= 0 ->
+		0;
+	   true ->
+		trunc((1000*TimeStamp*Scale - TimeOffsUs)/1000)
+	end,
+    if Delta > 0 ->
+	    %% io:format("  td = ~w\n", [Delta]),
+	    timer:sleep(Delta);
+       true ->
+	    ok
+    end.
+    
+
+mersa(File) ->
+    mersa(File, #{}).
+
+mersa(File, Params) ->
+    fold_file(File, fun mersa_print/6, Params#{repeat => 0}).
+
+mersa_print(Frame, rx, _Hw, Params, _Time0, _Acc) ->
+    Data = Frame#can_frame.data,
+    ID = Frame#can_frame.id band ?CAN_EFF_MASK,
+    if Frame#can_frame.id band ?CAN_FD_FLAG =/= 0 ->
+	    case match_id(ID, Params) of
+		true ->
+		    try split_pid_data(Data) of
+			PidData ->
+			    case match_pid(PidData, Params) of
+				true ->
+				    io:format("~06w: ID  : ~s [~w]\n", 
+					      [ms(Frame#can_frame.ts), 
+					       integer_to_list(ID, 16),
+					       Frame#can_frame.len]),
+				    format_pid_data(PidData,16);
+				{true,PidData1} ->
+				    io:format("~06w: ID  : ~s [~w]\n", 
+					      [ms(Frame#can_frame.ts), 
+					       integer_to_list(ID, 16),
+					       Frame#can_frame.len]),
+				    format_pid_data(PidData1,2);
+				false ->
+				    ok
+			    end
+		    catch
+			_:_ ->
+			    io:format("~06w: ID  : ~s [~w]\n", 
+				      [ms(Frame#can_frame.ts), 
+				       integer_to_list(ID, 16),
+				       Frame#can_frame.len]),
+			    io:format("****| ~s\n", [binary:encode_hex(Data)])
+		    end;
+		false ->
+		    ok
+	    end;
+       true ->
+	    case match_id(ID, Params) of
+		true ->
+		    io:format("~06w: ID  : ~s [~w]\n", 
+			      [ms(Frame#can_frame.ts), 
+			       integer_to_list(ID, 16),
+			       Frame#can_frame.len]),
+		    io:format("    | ~s\n", [binary:encode_hex(Data)]);
+		false ->
+		    ok
+	    end
+    end;
+mersa_print(_Frame, _Dir, _Hw, _Params, _Time0, Acc) ->
+    Acc.
+
+ms(Ts) -> 
+    trunc(Ts).
+    
+
+match_id(ID, Params) ->
+    case maps:get(id, Params, undefined) of
+	undefined -> true;
+	ID -> true;
+	IDList when is_list(IDList) -> lists:member(ID, IDList);
+	_ -> false
+    end.
+
+match_pid([PD={Pid,_Data}|PDs],Params) ->
+    case maps:get(pid, Params, undefined) of
+	undefined -> true;
+	Pid -> {true,[PD]};
+	PidList when is_list(PidList) -> 
+	    case lists:member(Pid, PidList) of
+		true -> {true,[PD]};
+		false -> match_pid(PDs, Params)
+	    end;
+	_ -> match_pid(PDs, Params)
+    end;
+match_pid([],_Params) ->
+    false.
+
+
+format_pid_data([{PID,Data}|Rest],Base) ->
+    <<I3,I2,I1>> = <<PID:24>>,
+    %% J1939-21 PDU format ???
+    %% TOS=Type of service, TL=Trailer length, DP=Data page,
+    %% PDUF/PF=PDU format, PDUS/PS=PDU specific
+    %% <<TOS:3,TL:3,DP:2,PF:8,PS:8>> = <<PID:24>>,
+    %% PIDFmt=io_lib:format("tos=~3.2.0B,tl=~w,dp=~w,pf=~w,ps=~2.16.0B",
+    %%   [TOS,TL,DP,PF,PS]),
+    DataFormat = case Base of
+		     16 -> encode_hex(Data);
+		     2 -> encode_bin(Data)
+		 end,
+    io:format("    | ~2.16.0B~2.16.0B~2.16.0B [~w] ~s\n", 
+	      [I3,I2,I1,byte_size(Data),DataFormat]),
+    format_pid_data(Rest,Base);
+format_pid_data([],_Base) ->
+    ok.
+
+encode_bin(Data) ->
+    [(I+$0) || <<I:1>> <= Data].
+
+encode_hex(Data) ->
+    [tl(integer_to_list(I+16#100)) || <<I>> <= Data].
+
+
+split_pid_data(<<0:24,_/binary>>) ->
+    [];
+split_pid_data(<<PID:24,DLC,Data:DLC/binary,Rest/binary>>) ->
+    [{PID,Data}|split_pid_data(Rest)];
+split_pid_data(<<>>) -> [];
+split_pid_data(<<0>>) -> [];
+split_pid_data(<<0,0>>) ->  [].
+
 current_time() ->
     erlang:system_time(microsecond).
 
-replay(Fd, Time0, State) ->
+fold_fd(Fd, Fun, Acc, Time0, Params) ->
     case file:read_line(Fd) of
 	eof ->
-	    R = maps:get(repeat, State),
+	    R = maps:get(repeat, Params, 0),
 	    if R =:= -1 ->
 		    file:position(Fd, 0),
-		    replay(Fd, current_time(), State);
+		    fold_fd(Fd, Fun, Acc, current_time(), Params);
 	       R =:= 0 ->
-		    ok;
+		    Acc;
 	       R > 0 ->
 		    file:position(Fd, 0),
-		    replay(Fd, current_time(), State#{ repeat => R-1 })
+		    fold_fd(Fd, Fun, Acc, current_time(),
+			    Params#{ repeat => R-1 })
 	    end;
-	%% T    8     1      -- Len=8 --        Tstamp (16bit)
-	%% T 0240162A 8 E0 10 00 40 07 00 19 00 4337
 	{ok,Line} ->
-	    case decode(Line,State) of
+	    case decode(Line,Params) of
 		ignore ->
-		    replay(Fd, Time0, State);
+		    fold_fd(Fd, Fun, Acc, Time0, Params);
 		{set,KVs} ->
-		    State2 = lists:foldl(fun({K,V}, State1) ->
-						 State1#{ K => V }
-					 end, State, KVs),
-		    %% io:format("set: ~p\n", [State2]),
-		    replay(Fd, Time0, State2);
-		{ok,Hw,rx,Frame=#can_frame {ts=TimeOffset}} ->
-		    Vsn = maps:get(vsn, State, {0,0}),
-		    io:format("~s/~w: ~s ~s\n", 
-			      [Hw,Vsn,rx,can_probe:format_frame(Frame)]),
-		    TimeScale = maps:get(timescale, State, 1),
-		    
-		    %% the time to remove from wait time to catch up
-		    TimeOffsUs = max(0, (current_time() - Time0)),
-		    Delta = if TimeOffset =:= 0 ->
-				    0;
-			       true ->
-				    trunc((1000*TimeOffset*TimeScale - 
-					       TimeOffsUs)/1000)
-			    end,
-		    if Delta > 0 ->
-			    io:format("  td = ~w\n", [Delta]),
-			    timer:sleep(Delta);
-		       true ->
-			    ok
-		    end,
-
-		    can:sync_send(Frame#can_frame{intf=0}),
-
-		    replay(Fd, Time0, State);
-
+		    Params2 = lists:foldl(fun({K,V}, Params1) ->
+						  Params1#{ K => V }
+					  end, Params, KVs),
+		    %% io:format("set: ~p\n", [Params2]),
+		    fold_fd(Fd, Fun, Acc, Time0, Params2);
 		{ok,Hw,Dir,Frame=#can_frame {}} ->
-		    Vsn = maps:get(vsn, State, {0,0}),
-		    io:format("~s/~w: ~s ~s\n", 
-			      [Hw,Vsn,Dir,can_probe:format_frame(Frame)]),
-		    replay(Fd, Time0, State);
-
+		    Acc1 = Fun(Frame, Dir, Hw, Params, Time0, Acc),
+		    fold_fd(Fd, Fun, Acc1, Time0, Params);
 		{error,Reason} ->
 		    io:format("error: ~p, line ~p\n", [Reason,Line]),
 		    timer:sleep(2000),
-		    replay(Fd, Time0, State)
+		    fold_fd(Fd, Fun, Acc, Time0, Params)
 	    end
     end.
+
 
 %% return wait time in millis seconds
 %% timestamps are in range 0 - 16#EA5F (59999)
@@ -208,17 +331,24 @@ pcan_cols([$O|Cols], [Time|Es], Dir, Frame) ->
     pcan_cols(Cols, Es, Dir, Frame#can_frame{ts=TOffs});
 pcan_cols([$T|Cols], [Type|Es], Dir, Frame) ->
     case Type of
-	<<"DT">> -> pcan_cols(Cols, Es, Dir, Frame);
-	<<"RR">> ->
-	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_RTR_FLAG });
-	<<"ER">> -> %% I column is not present
-	    pcan_cols(tl(Cols),Es,Dir,Frame#can_frame { id = ?CAN_ERR_FLAG });
-	<<"EC">> -> %% I column is not present
-	    pcan_cols(tl(Cols),Es,Dir,Frame);
-	<<"ST">> -> %% I column is not present
-	    pcan_cols(tl(Cols),Es,Dir,Frame);
+	<<"DT">> ->
+	    pcan_cols(Cols, Es, Dir, Frame);
 	<<"FD">> ->
 	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_FD_FLAG });
+	<<"FB">> -> %% FD, bitrate switch
+	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_FD_FLAG });
+	<<"FE">> -> %% FD with error bit
+	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_FD_FLAG bor ?CAN_ERR_FLAG });
+	<<"BI">> -> %% FD, bitrate switch and error
+	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_FD_FLAG bor ?CAN_ERR_FLAG });	    
+	<<"RR">> ->
+	    pcan_cols(Cols,Es,Dir,Frame#can_frame { id = ?CAN_RTR_FLAG });
+	<<"ST">> -> %% Hardware status change
+	    pcan_cols(tl(Cols),Es,Dir,Frame);
+	<<"EC">> -> %% Error counter changed, error frame? (warning)
+	    pcan_cols(tl(Cols),Es,Dir,Frame);
+	<<"ER">> -> %% Error frame
+	    pcan_cols(tl(Cols),Es,Dir,Frame#can_frame { id = ?CAN_ERR_FLAG });
 	_ -> 
 	    pcan_cols(tl(Cols),Es,Dir,Frame)
     end;

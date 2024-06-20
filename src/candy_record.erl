@@ -121,6 +121,7 @@ format_ts(Time, Offset) ->
 
 format_type(ID) ->
     if ID band ?CAN_FD_FLAG  =/= 0 -> "FD";
+       ID band ?CAN_FD_FLAG  =/= 0,  ID band ?CAN_ERR_FLAG =/= 0 -> "FE";
        ID band ?CAN_RTR_FLAG =/= 0 -> "RR";
        ID band ?CAN_ERR_FLAG =/= 0 -> "ER";
        true -> "DT"

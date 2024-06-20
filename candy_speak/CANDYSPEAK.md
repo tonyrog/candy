@@ -96,8 +96,8 @@ the case for multiple bit selection.
 		  <name> '=' <bit> '?' <condition>
 		  
 	<immediate> :=
-        | '>' <name> '=' <bit>    // set value
-        | '>' <name>              // print value
+	        | '>' <name> '=' <bit>    // set value
+        	| '>' <name>              // print value
 		| '>' reset               // reset all variable/rules ...
 		| '>' push                // push current variables/rule-set
 		| '>' pop                 // pop to previous variables/rule-set
@@ -204,8 +204,8 @@ FIXME: add signed/unsigned/little/big
 	<a-declaration> := 
 		  <declaration>
 		| '#' 'analog' <name> [':'<size>] [<iodir>] [<port>':'] <pin>
-        | '#' 'variable' <name>[':'<size>] ['=' <a-expr>]
-        | '#' 'constant' <name>[':'<size>] '=' <a-expr>
+		| '#' 'variable' <name>[':'<size>] ['=' <a-expr>]
+		| '#' 'constant' <name>[':'<size>] '=' <a-expr>
 		| '#' 'can' <name> <can-range>
 
 	<a-condition> := 
