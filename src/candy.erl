@@ -110,7 +110,6 @@
 -define(FONT_NAME, "Courier New").
 -define(FONT_SIZE, 14).
 
-
 -define(APP, ?MODULE).
 -define(APPSTR, ?MODULE_STRING).
 -define(DOTAPP, [$.|?APPSTR]).
@@ -173,6 +172,14 @@
 -define(WIDTH, 640).
 -define(HEIGHT, 480).
 
+-record(frame,
+	{
+	 id,          %% integer 11 | 29 bit (ide=true) + EXT_BIT|RTR_BIT|FD
+	 pid,         %% undefined or 24 bit pid
+	 len=0,       %% length of data 0..8 (..60 for PID24 mode)
+	 data=(<<>>)  %% binary with data bytes
+	}).
+
 -record(if_can,
 	{
 	 if_mod :: atom(),
@@ -189,6 +196,7 @@
 	 bitrates = list_to_tuple(?DEFAULT_BITRATES),
 	 datarate = undefined,
 	 datarates =  list_to_tuple(?DEFAULT_DATARATES),
+	 pidmode = off,  %% off|pid24
 
 	 if_state  = down,            %% up | down
 	 if_param  = #{},             %% current interface params (when up)
@@ -201,12 +209,12 @@
 	 glyph_height,
 	 glyph_ascent,
 	 %%
-	 frame,          %% ets: {frame_key(ID),#can_frame{}}
-	 frame_diff,     %% ets: {frame_key(ID),[BitOffset]}
-	 frame_layout,   %% ets: {frame_key(ID),#layout{}}
-	 frame_counter,  %% ets: {frame_key(ID),Counter}
-	 frame_freq,     %% ets: {frame_key(ID),Time,OldCounter,String}
-	 frame_anim,     %% ets: {{frame_key(ID),FmtPos},Counter}
+	 frame,          %% ets: {frame_key(ID,PID),#frame{}}
+	 frame_diff,     %% ets: {frame_key(ID,PID),[BitOffset]}
+	 frame_layout,   %% ets: {frame_key(ID,PID),#layout{}}
+	 frame_counter,  %% ets: {frame_key(ID,PID),Counter}
+	 frame_freq,     %% ets: {frame_key(ID,PID),Time,OldCounter,String}
+	 frame_anim,     %% ets: {{frame_key(ID,PID),FmtPos},Counter}
 	 %% background_color :: epx:epx_color(),
 	 menu_profile,
 	 row_height    = 0,
@@ -432,6 +440,7 @@ init(Options) ->
     RowHeight = H + 2,
 
     BitRates0 = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
+    PidMode = proplists:get_value(pidmode, Env, off),
 
     {IF,
      [{listen_only,LISTEN},{fd,FD},
@@ -459,6 +468,7 @@ init(Options) ->
 	   bitrates = sort_rates(BitRates),
 	   datarate = DataRate,
 	   datarates = sort_rates(DataRates),
+	   pidmode = PidMode,
 	   if_can = IF,
 	   font   = Font,
 	   glyph_width  = W,
@@ -621,7 +631,7 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 
 %%
 %% Commands on Selected elements:
-%%   X              Hexa decimal format
+%%   X              Hexadecimal format
 %%   D              Decimal format
 %%   B              Binary format
 %%   O              Octal format
@@ -633,6 +643,7 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   Ctrl+S         Save information to /home/$USER/candy.txt
 %%
 %% Frames
+%%   P              Toggle Pid mode off / pid24
 %%   H              Sort Low -> High frames by frame id
 %%   Ctrl+H         Sort High -> Low frames by frame id
 %%
@@ -734,30 +745,36 @@ command($h, _Selected, Mod, State) ->
 	  end, State),
     epxw:invalidate(),
     State1;
-command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
-    Keys = lists:usort([Key || {Key,_} <- Selected]),
+%% Toggle pid mode
+command($p, _Selected, _Mod, {S,D}) ->
+    %% toggle pidmode
+    NewMode = case S#s.pidmode of
+		  off ->  pid24;
+		  pid24 -> off
+	      end,
+    io:format("Toggle pid mode, new mode = ~p\n", [NewMode]),
+    State1 = {S#s { pidmode = NewMode, next_pos = 1 }, D},
+    set_status(State1),
+    epxw:invalidate(),
+    clear_frames(State1);
+command($s, Selected, Mod, State={S,_D}) when Mod#keymod.ctrl ->
     Bytes = 
-	lists:foldr(
-	  fun(Key,Acc) ->
-		  Sel = lists:filter(fun({F,_}) -> F =:= Key end, Selected),
-		  PosList = lists:sort([Pos || {_,Pos} <- Sel]),
-		  L = lookup_layout(Key, State),
-		  Format = L#layout.format,
-		  FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
-		  Bs = [Fmt#fmt.bits || Fmt <- FmtList],
-		  %% ?verbose("SAVE FID=0x~s Bits=~w\n", [integer_to_list(FID,16), Bs]),
-		  ["0x",integer_to_list(Key,16),
-		   [[ %% byte index in decimal
-		     [" ", integer_to_list(B div 8),  
-		      %% byte mask
-		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
-		      %% byte match value HIGH
-		      " 0x", integer_to_list((1 bsl (7-(B rem 8))), 16),
-		      %% byte match value LOW
-		      " 0x00" ] || {B,_Len} <- G]
-		    || G <- Bs],
-		   "\n" | Acc]
-	  end, [], Keys),
+	case lists:usort([Key || {Key,_} <- Selected]) of
+	    [Key|_] ->
+		Sel = lists:filter(fun({F,_}) -> F =:= Key end, Selected),
+		PosList = lists:sort([Pos || {_,Pos} <- Sel]),
+		L = lookup_layout(Key, State),
+		Format = L#layout.format,
+		FmtList = select_fmts(1, tuple_to_list(Format), [], PosList),
+		{ID,PID} = Key,
+		Bs = [Fmt#fmt.bits || Fmt <- FmtList],
+		io:format("SAVE KEY=0x~s PID=~p, Bits=~w\n",
+			  [integer_to_list(ID,16), PID, Bs]),
+		[[{BitPos,_Len}|_]|_] = Bs,
+		format_candy(ID, PID, BitPos,
+			     S#s.fd, S#s.bitrate, S#s.datarate);
+	    _ -> []
+	end,
     %% User =  os:getenv("USER"),
     Home = case os:getenv("HOME") of
 	       false -> "/tmp";
@@ -852,28 +869,67 @@ command($t, _Selected, _Mod, State={S,_}) ->
 		      hidden -> Acc;
 		      collapsed -> Acc;
 		      _ ->
-			  case ets:lookup(S#s.frame_diff, L#layout.key) of
-			      [] -> Acc; %% maybe delete?
-			      [{_,[]}] -> [{delete, L}|Acc];
-			      [{_,Bs}] -> [{select, L, Bs}|Acc]
+			  Key = L#layout.key,
+			  case ets:lookup(S#s.frame_diff, Key) of
+			      [] -> [{delete,Key}|Acc]; 
+			      [{_,[]}] -> [{delete,Key}|Acc];
+			      [{_,Bs}] -> [{select,Key,Bs}|Acc]
 			  end
 		  end
 	  end, [], State),
     {Selected,{S1,D1}} =
 	lists:foldl(
-	  fun({delete,L}, {Sel,St0}) ->
+	  fun({delete,Key}, {Sel,St0}) ->
+		  L = lookup_layout(Key, St0),
 		  {L1, St1} = remove_layout(L, St0),
 		  St2 = insert_layout(L1, St1),
 		  {Sel,St2};
-	     ({select,L,_Bs}, {Sel,S0}) ->
+	     ({select,K,_Bs}, {Sel,St0}) ->
 		  %% FIXME: find fields matching bits in Bs?
-		  {[{L#layout.key,[?ID_FMT_POSITION]}|Sel], S0}
+		  {[{K,[?ID_FMT_POSITION]}|Sel], St0}
 	  end, {[],State}, Ls),
     epxw:invalidate(),
     {S1,D1#d{ selected = Selected }};
 command(Symbol, _Selected, Mod, State) ->
     io:format("unhandled command ~p\n", [Symbol]),
     {reply,{Symbol,Mod},State}.
+
+format_candy(ID, undefined, BitPos, Fd, Bitrate, Datarate) ->
+    ["0x",integer_to_list(ID,16),
+     " ", integer_to_list(BitPos div 8),
+     %% byte mask
+     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     %% byte match value HIGH
+     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     %% byte match value LOW
+     " 0x00", "\n",
+     "> canmode=0\n",
+     "> canfd=", if Fd -> "1"; true -> "0" end, "\n",
+     "> bitrate=", integer_to_list(Bitrate), "\n",
+     if Fd ->
+	     ["> datarate=", integer_to_list(Datarate), "\n"];
+	true ->
+	     ""
+     end,
+     "> pidmode=0\n"
+    ];
+format_candy(ID, PID, BitPos, _Fd, Bitrate, Datarate) ->
+    ["0x",integer_to_list(ID,16),
+     " ", integer_to_list(BitPos div 8),
+     %% byte mask
+     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     %% byte match value HIGH
+     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     %% byte match value LOW
+     " 0x00", "\n",
+     "> canmode=0\n",
+     "> canfd=1\n",
+     "> bitrate=", integer_to_list(Bitrate), "\n",
+     "> datarate=", integer_to_list(Datarate), "\n",
+     "> pidmode=1\n",
+     "> pid=0x", tl(integer_to_list(16#1000000+PID,16)), "\n"
+    ].
+
 
 %% form [ {NumberOfRows, LayoutKey} ] create new positions form 1...
 layout_pos_map(NK) ->
@@ -917,7 +973,7 @@ load_pid_list([], State) ->
 load_pid(FID, Name, FormList, _State={S,D}) ->
     NameBits = iolist_to_binary(Name),
     Pos = S#s.next_pos,
-    Key = frame_key(FID),
+    Key = frame_key(FID,undefined),
     Format = 
 	list_to_tuple(
 	  [
@@ -941,7 +997,7 @@ load_pid(FID, Name, FormList, _State={S,D}) ->
     NPos2 = NPos1+L1#layout.npos,
     State2 = insert_layout(L1, {S#s{next_pos=NPos2},D}),
     ets:insert(S#s.frame_counter, {Key, 0}),
-    Frame =  #can_frame{id=FID,len=8, data=(<<0,0,0,0,0,0,0,0>>) },
+    Frame =  #frame{id=FID,len=8, data=(<<0,0,0,0,0,0,0,0>>) },
     ets:insert(S#s.frame, {Key,Frame}),
     redraw_by_key(Key, State2).
 
@@ -989,7 +1045,7 @@ handle_cast(_Msg, State) ->
 %%--------------------------------------------------------------------
 
 handle_info(Frame=#can_frame{}, State) ->
-    State1 = handle_can_frames([Frame], State),
+    State1 = handle_can_frames(insert_frame(Frame,[],State), State),
     {noreply, State1};
 
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
@@ -1105,23 +1161,58 @@ sort_rates(Rates) ->
     lists:sort(Rates).
 
 %% batch collect all frames in one go then redraw if needed
-handle_can_frames(CanFrames, S) ->
+%% FIXME: check if the number of frames we collect is growing
+%%  then start randomly through away some frames until stable
+handle_can_frames(Frames, S) ->
     receive
 	Frame = #can_frame {} ->
-	    handle_can_frames([Frame|CanFrames], S)
+	    handle_can_frames(insert_frame(Frame,Frames,S), S)
     after 0 -> %% or a short time?
-	    process_can_frames(lists:reverse(CanFrames),S,
+	    process_frames(lists:reverse(Frames),S,
 			       false, #{})
     end.
+
+insert_frame(#can_frame{id=ID,len=L,data=D}, Fs, _S) when
+      ID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
+    [#frame{id=ID,len=L,data=D}|Fs];
+insert_frame(#can_frame{id=ID,len=L,data=D}, Fs, {S,_D}) ->
+    if S#s.pidmode =:= off; S#s.fd =:= false ->
+	    [#frame{id=ID,len=L,data=D}|Fs];
+       S#s.pidmode =:= pid24 ->
+	    case insert_pid24_frames(#frame{id=ID},D,Fs) of
+		error ->
+		    if L =:= 8 ->
+			    [#frame{id=ID,len=L,data=D}|Fs];
+		       true ->
+			    Fs
+		    end;
+		Fs1 -> Fs1
+	    end
+    end.
+
+insert_pid24_frames(_F,<<0:24,_/binary>>,Fs) ->
+    Fs;
+insert_pid24_frames(F,<<Pid:24,L:8,Data/binary>>,Fs) ->
+    if L > byte_size(Data) ->
+	    error;  %% not a pid frame
+       true ->
+	    <<D:L/binary,Data1/binary>> = Data,
+	    insert_pid24_frames(F,Data1,[F#frame{pid=Pid,len=L,data=D}|Fs])
+    end;
+insert_pid24_frames(_F,<<>>,Fs) -> Fs;
+insert_pid24_frames(_F,<<0>>,Fs) -> Fs;
+insert_pid24_frames(_F,<<0,0>>,Fs) -> Fs;
+insert_pid24_frames(_F,<<0,0,0>>,Fs) -> Fs;
+insert_pid24_frames(_F,_Bin,_Fs) -> error.
 
 %% keep EFF/RTR flags, strip FD/ERR
 -define(CAN_KEY_MASK, (?CAN_EFF_MASK bor ?CAN_EFF_FLAG bor ?CAN_RTR_FLAG)).
 
-frame_key(FID) ->
-    FID band ?CAN_KEY_MASK.
+frame_key(FID,PID) ->
+    {FID band ?CAN_KEY_MASK,PID}.
 
-process_can_frames([#can_frame{id=FID}|Fs], {S,D},
-		   _Redraw, RedrawSet) when
+process_frames([#frame{id=FID}|Fs], {S,D},
+	       _Redraw, RedrawSet) when
       FID band ?CAN_ERR_FLAG =:= ?CAN_ERR_FLAG ->
     Err = lists:foldl(
 	    fun({Bit,Flag}, Acc) ->
@@ -1138,30 +1229,30 @@ process_can_frames([#can_frame{id=FID}|Fs], {S,D},
 		      {?CAN_ERR_BUSERROR,    buserror},
 		      {?CAN_ERR_RESTARTED,   restarted}]),
     %% ?verbose(" status = ~w\n", [Fs]),
-    process_can_frames(Fs, {S#s { if_error = Err }, D},
+    process_frames(Fs, {S#s { if_error = Err }, D},
 		       true, RedrawSet);
-process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
+process_frames([Frame=#frame{id=FID,pid=PID}|Fs], State={S,D},
 		   Redraw, RedrawSet) ->
     %% filter out extra flags err/fd ...
-    Key = frame_key(FID),
+    Key = frame_key(FID,PID),
     case ets:lookup(S#s.frame, Key) of
 	[{_,Frame}] -> %% no change
 	    ets:update_counter(S#s.frame_counter, Key, 1),
-	    process_can_frames(Fs, State, Redraw, RedrawSet);
+	    process_frames(Fs, State, Redraw, RedrawSet);
 	[{_,OldFrame}] ->
 	    ets:insert(S#s.frame, {Key,Frame}),
 	    ets:update_counter(S#s.frame_counter, Key, 1),
-	    case diff_frames(FID,Frame,OldFrame,State) of
+	    case diff_frames(FID,PID,Frame,OldFrame,State) of
 		[] ->
-		    process_can_frames(Fs, tick_restart(State),
+		    process_frames(Fs, tick_restart(State),
 				       Redraw, RedrawSet);
 		Diff -> %% [LayoutPosList]
 		    State1 = auto_detect_bits(Key, Frame, OldFrame, State),
 		    KLi = [{Key,Li} || Li <- Diff],
 		    [ ets:insert(S#s.frame_anim,{Ki,255})|| Ki <- KLi],
-		    process_can_frames(Fs, tick_restart(State1),
-				       Redraw,
-				       RedrawSet#{ Key => true })
+		    process_frames(Fs, tick_restart(State1),
+				   Redraw,
+				   RedrawSet#{ Key => true })
 	    end;
 	[] ->
 	    ets:insert(S#s.frame, {Key,Frame}),
@@ -1171,9 +1262,15 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
 		   true ->
 			#fmt {field=id,base=16,type=unsigned,bits=[{22,11}]}
 		end,
+	    PidFmt =
+		if PID =:= undefined ->
+			undefined;
+		   true ->
+			#fmt {field=pid,base=16,type=unsigned,bits=[{0,24}]}
+		end,
 	    Format =
 		if FID band ?CAN_FD_FLAG =/= 0 ->
-			default_fd_format(IDFmt);
+			default_fd_format(IDFmt,PidFmt);
 		   true ->
 			default_format(IDFmt)
 		end,
@@ -1189,10 +1286,10 @@ process_can_frames([Frame=#can_frame{id=FID}|Fs], State={S,D},
 	    
 	    ets:insert(S#s.frame_counter, {Key, 1}),
 	    ets:insert(S#s.frame_freq, {Key,erlang:system_time(millisecond),1,""}),
-	    process_can_frames(Fs, tick_restart(State2),
-			       true, RedrawSet)
+	    process_frames(Fs, tick_restart(State2),
+			   true, RedrawSet)
     end;
-process_can_frames([], State, Redraw, RedrawSet) ->
+process_frames([], State, Redraw, RedrawSet) ->
     if Redraw ->
 	    epxw:invalidate(),
 	    State;
@@ -1229,7 +1326,7 @@ auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
 			    %% remove switched from 
 			    B2 = B0--(B0--B1),
 			    ets:insert(S#s.frame_diff, {Key,B2}),
-			    io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			    %% io:format("~.16.0B: bits=~w\n", [Key,B2]),
 			    State
 		    end;
 		false -> %% NewFrame was received outside detection "window"
@@ -1243,7 +1340,7 @@ auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
 			    %% remove switch bits in B1 (switched)
 			    B2 = B0 -- B1,
 			    ets:insert(S#s.frame_diff, {Key,B2}),
-			    io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			    %% io:format("~.16.0B: bits=~w\n", [Key,B2]),
 			    State
 		    end
 	    end
@@ -1646,7 +1743,7 @@ default_format(IDFmt) ->
      #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
     }.
 
-default_fd_format(IDFmt) ->
+default_fd_format(IDFmt,undefined) ->
     {
      #fmt { field=hide, type=undefined },
      IDFmt,
@@ -1685,11 +1782,32 @@ default_fd_format(IDFmt) ->
 
      #fmt { dpos=7,field=data, base=16, type=unsigned, bits=[{448,32}], ci=11},
      #fmt { dpos=7,field=data, base=16, type=unsigned, bits=[{480,32}], ci=11}
+    };
+default_fd_format(IDFmt,PIDFmt) ->
+    {
+     #fmt { field=hide, type=undefined },
+     IDFmt,
+     PIDFmt,
+     #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
+     #fmt { field=id,   base=0,type={enum,{"-","F"}},bits=[{0,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","X"}},bits=[{1,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","R"}},bits=[{2,1}]},
+     #fmt { field=id,   base=0,type={enum,{"-","E"}},bits=[{3,1}]},
+     #fmt { field=len,  base=16,type=unsigned,bits=[{0,7}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{0,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{8,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{16,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{24,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{32,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{40,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{48,8}]},
+     #fmt { field=data, base=16, type=unsigned, bits=[{56,8}]}
     }.
 
 %%
-diff_frames(FID, New, Old, State) ->
-    #layout{format=Format} = Layout = lookup_layout(FID, State),
+diff_frames(FID, PID, New, Old, State) ->
+    Key = frame_key(FID, PID),
+    #layout{format=Format} = Layout = lookup_layout(Key, State),
     if Layout#layout.style =:= deleted ->
 	    [];
        true ->
@@ -1714,12 +1832,12 @@ diff_frames_(I,Format,New,Old,Acc,State) when I =< tuple_size(Format) ->
 diff_frames_(_I,_Format,_New,_Old,Acc,_State) ->
     Acc.
 
-diff_bits(#can_frame{len=L,data=OldBits}, #can_frame{len=L,data=OldBits}) ->
+diff_bits(#frame{len=L,data=OldBits}, #frame{len=L,data=OldBits}) ->
     [];
-diff_bits(#can_frame{len=L,data=NewBits}, #can_frame{len=L,data=OldBits}) ->
+diff_bits(#frame{len=L,data=NewBits}, #frame{len=L,data=OldBits}) ->
     Bits = crypto:exor(NewBits, OldBits),
     flipped(Bits);
-diff_bits(#can_frame{len=L1,data=NewBits}, #can_frame{len=L2,data=OldBits}) ->
+diff_bits(#frame{len=L1,data=NewBits}, #frame{len=L2,data=OldBits}) ->
     D = L1 - L2,
     Bits = if D > 0 -> 
 		   crypto:exor(NewBits, <<OldBits/binary, 0:D/unit:8>>);
@@ -1805,7 +1923,11 @@ set_status(_State={S,_D}) ->
 				    _ -> []
 				end,
 				case S#s.fd of 
-				    true -> ["FD"];
+				    true ->
+					case S#s.pidmode of
+					    off -> ["FD"];
+					    pid24 -> ["PID"]
+					end;
 				    _ -> []
 				end)),
     LinkError =
@@ -1847,17 +1969,6 @@ redraw_all(Pixels, Area, State) ->
 				redraw_layout_(Pixels, Layout, State1)
 			end
 		end, State).
-
--ifdef(not_used).
-redraw_(Pixels, Area, FID, State) ->
-    Layout = lookup_layout(FID, State),
-    case intersect_layout(Layout, Area) of
-	false ->
-	    State;
-	_Intersection ->
-	    redraw_layout_(Pixels, Layout, State)
-    end.
--endif.
 
 redraw_by_key(Key, State={_S,_D}) ->
     epxw:draw(
@@ -2167,9 +2278,10 @@ get_bits(#fmt { field=hide }, _Frame) ->
     <<>>;
 get_bits(Fmt, Frame) ->
     Data = case Fmt#fmt.field of
-	       data -> extend_bits(Frame#can_frame.data, 64);
-	       id   -> <<(Frame#can_frame.id):33>>;  %% 33 bits!!! FD support
-	       len  -> <<(Frame#can_frame.len):7>>
+	       data -> extend_bits(Frame#frame.data, 64);
+	       id   -> <<(Frame#frame.id):33>>;  %% 33 bits!!! FD support
+	       pid  -> <<(Frame#frame.pid):24>>;
+	       len  -> <<(Frame#frame.len):7>>
 	   end,
     collect_bits(Fmt#fmt.bits, Data).
 
@@ -2193,47 +2305,45 @@ invalidate_layout(Layout, State) ->
 %% update view_height / view_width
 
 remove_layout(Layout, State={S,_D}) ->
-    Pos = Layout#layout.pos,  %% number of rows deleted
-    N = Layout#layout.npos,  %% number of rows deleted
-    State1 = remove_layout_(ets:first(S#s.frame_layout), Pos, N, State),
+    Pos = Layout#layout.pos,  %% row to deleted
+    N = Layout#layout.npos,   %% number of rows deleted
+    io:format("remove: pos=~w, n=~w\n", [Pos,N]),
+    State1 = move_layout_up(Pos, N, State),
+    Key = Layout#layout.key,
+    lists:foreach(fun(I) ->
+			  ets:delete(S#s.frame_anim, {Key,I})
+		  end, lists:seq(1, tuple_size(Layout#layout.format))),
     {S1,D1} = State1,
     S2 = S1#s{ next_pos = S1#s.next_pos-N },
     State2 = {S2, D1},
     {Layout#layout { style=deleted,pos0=0,pos=0,x=0,y=0},State2}.
 
-remove_layout_('$end_of_table', _Pos, _N, State) ->
-    State;
-remove_layout_(Key, Pos, N, State={S,_D}) ->
-    L1 = lookup_layout(Key, State),
-    Pos1 = L1#layout.pos,
-    if Pos1 > Pos ->
-	    L2 = L1#layout { pos = Pos1-N },  %% move N steps backwards
-	    L3 = position_normal(L2, State),
-	    State1 = insert_layout(L3, State),
-	    remove_layout_(ets:next(S#s.frame_layout, Key), Pos, N, State1);
-       true ->
-	    remove_layout_(ets:next(S#s.frame_layout, Key), Pos, N, State)
-    end.
-
--ifdef(not_used).
-remove_layout_orig(Layout, State) ->
-    State1 =
-	each_layout(fun(L1, Si) ->
-			    Pi = L1#layout.pos,
-			    if Pi > Layout#layout.pos ->
-				    L2 = L1#layout { pos = Pi-1 },
-				    L3 = position_normal(L2, Si),
-				    insert_layout(L3, Si);
-			       true ->
-				    Si
-			    end
-		    end, State),
-    {S1,D1} = State1,
-    S2 = S1#s{ next_pos = S1#s.next_pos-1 },
-    {Layout#layout { style = deleted,
-		     pos=0, x=0,y=0,width=0,height=0
-		   }, {S2,D1}}.
--endif.
+%% Move all layouts below layout at Pos with N rows
+%% upwards N steps
+move_layout_up(Pos, N, State) ->
+    %% first collect Frame layouts below Pos
+    Ls = fold_layout(
+	   fun(L, Acc, _Si) ->
+		   if L#layout.style =:= deleted ->
+			   Acc;
+		      L#layout.pos > Pos ->
+			   [{L#layout.pos,L#layout.key}|Acc];
+		      true ->
+			   Acc
+		   end
+	   end, [], State),
+    %% Now move the frames N rows up
+    lists:foldl(
+      fun({_Pos,Key}, Si) ->
+	      L = lookup_layout(Key, Si),
+	      Pos1 = L#layout.pos,
+	      NPos = Pos1 - N,
+	      io:format("move ~w to ~w\n", [Pos1, NPos]),
+	      L1 = L#layout { pos0 = NPos, pos = NPos },  
+	      L2 = reposition_normal(Pos1, L1, Si),
+	      insert_layout(L2, Si)
+      end, State, lists:sort(Ls)).
+	      
 
 %% calculate new view rect
 view_rect(State) ->
@@ -2259,7 +2369,7 @@ position_layout(Layout, State) ->
     end.
 
 position_deleted(Layout, _State) ->
-    Layout#layout { x=0,y=0,npos=0,width=0,height=0 }.
+    Layout#layout { x=0,y=0,npos=0 }.
 
 reposition_normal(Pos, L, State={_S,_D}) ->
     {X,Y} = position_to_coord(Pos, State),
@@ -2440,9 +2550,18 @@ collect_bits_([{P,L}|Ps], Data, Acc) ->
 collect_bits_([], _Data, Acc) ->
     Acc.
 
-%% FID maybe can_frame id or internal key (where fd/err is stripped)
-lookup_layout(FID, _State={S,_D}) ->
-    [{_,L}] = ets:lookup(S#s.frame_layout, frame_key(FID)),
+%% remove all frames
+clear_frames(State={S,_D}) ->
+    ets:delete_all_objects(S#s.frame),
+    ets:delete_all_objects(S#s.frame_layout),
+    ets:delete_all_objects(S#s.frame_anim),
+    ets:delete_all_objects(S#s.frame_freq),
+    ets:delete_all_objects(S#s.frame_counter),
+    State.
+
+%% FID maybe frame id or internal key (where fd/err is stripped)
+lookup_layout(Key,_State={S,_D}) ->
+    [{_,L}] = ets:lookup(S#s.frame_layout,Key),
     L.
 
 update_layout(OldLayout, NewLayout, State={_S,_D}) ->
