@@ -58,6 +58,7 @@ enum {
     T_SAVE     = 281,   // save
     T_LIST     = 282,   // list
     T_CLEAR    = 283,   // clear
+    T_HELP     = 284,   // help
 };
 
 typedef struct {
@@ -345,39 +346,69 @@ static char* candy_tok(char* p, token_t* tp)
     p = candy_tok0(p, tp);
     tp->len = p - tp->ptr;
     if (tp->tval==T_WORD) {
-	if (tokeq("digital", tp))
-	    tp->tval = T_DIGITAL;
-	else if (tokeq("can", tp))
-	    tp->tval = T_CAN;
-	else if (tokeq("analog", tp))
-	    tp->tval = T_ANALOG;
-	else if (tokeq("timer", tp))
-	    tp->tval = T_TIMER;
-	else if (tokeq("variable", tp))
-	    tp->tval = T_VARIABLE;
-	else if (tokeq("constant", tp))
-	    tp->tval = T_CONSTANT;
-	else if (tokeq("in", tp))
-	    tp->tval = T_IN;
-	else if (tokeq("out", tp))
-	    tp->tval = T_OUT;
-	else if (tokeq("inout", tp))
-	    tp->tval = T_INOUT;
-	else if (tokeq("timeout", tp))
-	    tp->tval = T_TIMEOUT;	
-	else if (tokeq("reset", tp))
-	    tp->tval = T_RESET;
-	else if (tokeq("push", tp))
-	    tp->tval = T_PUSH;
-	else if (tokeq("pop", tp))
-	    tp->tval = T_POP;
-	else if (tokeq("save", tp))
-	    tp->tval = T_SAVE;
-	else if (tokeq("list", tp))
-	    tp->tval = T_LIST;
-	else if (tokeq("clear", tp))
-	    tp->tval = T_CLEAR;
-    }    
+	switch(*tp->ptr) {
+	case 'a':
+	    if (tokeq("analog", tp))
+		tp->tval = T_ANALOG;
+	    break;
+	case 'c':
+	    if (tokeq("can", tp))
+		tp->tval = T_CAN;	    
+	    else if (tokeq("constant", tp))
+		tp->tval = T_CONSTANT;
+	    else if (tokeq("clear", tp))
+		tp->tval = T_CLEAR;
+	    break;
+	case 'd':
+	    if (tokeq("digital", tp))
+		tp->tval = T_DIGITAL;
+	    break;
+	case 'h':
+	    if (tokeq("help", tp))
+		tp->tval = T_HELP;
+	    break;	    
+	case 'i':
+	    if (tokeq("in", tp))
+		tp->tval = T_IN;
+	    else if (tokeq("inout", tp))
+		tp->tval = T_INOUT;
+	    break;
+	case 'l':
+	    if (tokeq("list", tp))
+		tp->tval = T_LIST;
+	    break;
+	case 'o':
+	    if (tokeq("out", tp))
+		tp->tval = T_OUT;
+	    break;
+	case 'p':
+	    if (tokeq("push", tp))
+		tp->tval = T_PUSH;
+	    else if (tokeq("pop", tp))
+		tp->tval = T_POP;
+	    break;
+	case 'r':
+	    if (tokeq("reset", tp))
+		tp->tval = T_RESET;
+	    break;
+	case 's':
+	    if (tokeq("save", tp))
+		tp->tval = T_SAVE;	    
+	    break;
+	case 't':
+	    if (tokeq("timer", tp))
+		tp->tval = T_TIMER;
+	    else if (tokeq("timeout", tp))
+		tp->tval = T_TIMEOUT;
+	    break;
+	case 'v':
+	    if (tokeq("variable", tp))
+		tp->tval = T_VARIABLE;
+	    break;
+	default:
+	    break;
+	}
+    }
     return p;
 }
 
@@ -472,6 +503,7 @@ void print_tokens(token_t* ts, int n)
 	case T_SAVE: candy_print_str(" SAVE "); break;
 	case T_LIST: candy_print_str(" LIST "); break;
 	case T_CLEAR: candy_print_str(" CLEAR "); break;
+	case T_HELP: candy_print_str(" HELP "); break;
 	default:
 	    candy_print_str(";CHAR:'");
 	    candy_print_char(*ts[i].ptr);
