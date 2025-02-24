@@ -8,6 +8,7 @@
 -module(candy_record).
 
 -export([file/1]).
+-export([format_ts/2, format_type/1, format_id/1, format_data/1]).
 -compile(export_all).
 
 -include_lib("can/include/can.hrl").

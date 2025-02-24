@@ -30,7 +30,8 @@
 -export([status/0]).
 -export([install/0, install_cmds/0]).
 
-%% -export([start_link/0, start_link/1]).
+%% debug
+-export([select_rate/2]).
 
 -export([init/1,
 	 configure/2,
@@ -58,8 +59,6 @@
 -include_lib("epx/include/epx_menu.hrl").
 -include_lib("epx/include/epx_window_content.hrl").
 
-%% -compile(export_all).
-
 -ifdef(OTP_RELEASE). %% this implies 21 or higher
 -define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
 -define(GET_STACK(Stacktrace), Stacktrace).
@@ -83,7 +82,7 @@
 	 menu_font_size                = 14,
 	 menu_font_color               = grey5,   %% light
 	 menu_background_color         = grey10,  %% dark
-	 menu_border_color             = green
+	 menu_border_color             = grey1
 	}).
 
 -define(SCREEN_COLOR,            {0,255,255}). %% {192,192,192}).
@@ -118,6 +117,7 @@
 
 -define(verbose(F,A), ok).
 %% -define(verbose(F,A), io:format((F),(A))).
+
 -define(FMT_HORIZONTAL_PAD, 4).
 -define(FMT_VERTICAL_PAD,   3).
 
@@ -165,9 +165,9 @@
 
 -define(ID_FMT_POSITION, 2).
 
--define(DEFAULT_BITRATES, [1000000, 500000, 250000, 125000]).
--define(DEFAULT_DATARATES, [5000000,4000000,3000000,2000000,
-			    1000000,500000,250000,125000]).
+%% keep sorted
+-define(DEFAULT_BITRATES, [125000, 250000, 500000, 1000000]).
+-define(DEFAULT_DATARATES, [500000, 1000000, 5000000, 10000000]).
 
 -define(WIDTH, 640).
 -define(HEIGHT, 480).
@@ -193,11 +193,13 @@
 	 fd = undefined,                  %% fd mode
 	 listen_only = undefined,         %% listen only mode
 	 bitrate = undefined,
-	 bitrates = list_to_tuple(?DEFAULT_BITRATES),
+	 bitrates = ?DEFAULT_BITRATES,
 	 datarate = undefined,
-	 datarates =  list_to_tuple(?DEFAULT_DATARATES),
+	 datarates =  ?DEFAULT_DATARATES,
+	 conf_bitrates = ?DEFAULT_BITRATES,
+	 conf_datarates = ?DEFAULT_DATARATES,
 	 pidmode = off,  %% off|pid24
-
+	 pause = false :: boolean(),  %% pause frame reception
 	 if_state  = down,            %% up | down
 	 if_param  = #{},             %% current interface params (when up)
 	 if_error  = [],              %% interface error code list
@@ -217,6 +219,7 @@
 	 frame_anim,     %% ets: {{frame_key(ID,PID),FmtPos},Counter}
 	 %% background_color :: epx:epx_color(),
 	 menu_profile,
+	 help_menu,
 	 row_height    = 0,
 	 next_pos = 1,
 	 hide :: epx:epx_pixmap()
@@ -230,8 +233,10 @@
 	 selected = [],             %% selected frames [{FID,Pos}]
 	 screen_color = ?SCREEN_COLOR,
 	 content :: #window_content{},
+	 auto_key = released :: pressed | released,
 	 auto_detect = undefined :: undefined | high | low,
-	 auto_detect_tmr = undefined :: undefined | reference()
+	 auto_detect_tmr = undefined :: undefined | reference(),
+	 help = false :: boolean()
 	}).
 
 -define(TICK_INTERVAL, 100).
@@ -363,6 +368,59 @@ start(Options) ->
     application:ensure_all_started(?APP),
     start_it(Options, start).
 
+
+help_menu() ->
+    [
+     {"Pause",             "Space"},
+     {"AutoKey",           "Tab"},
+     {"Group bits",        "G"},
+     {"Ungroup bits",      "Shift+G"},
+     {"Ungroup 1-bit",     "1"},
+     {"Ungroup 2-bit",     "2"},
+     {"Ungroup 4-bit",     "4"},
+     {"Ungroup 8-bit",     "8"},
+     {"---"},     
+
+     {"Hexadecimal",       "X"},
+     {"Decimal",           "D"},
+     {"Binay",             "B"},
+     {"Octal",             "O"},
+     {"Color",             "C"},
+     {"---"},
+     %% 
+     {"Toggle Pid mode",   "P"},
+     {"Sort Low to High",  "H"},
+     {"Sort High to Low",  "Ctrl+H"},
+     {"---"},
+     {"Auto Detect",       "A"},
+     {"Select Detected",   "T"},
+     {"Undelete",          "U"},
+     {"Clear",             "Ctrl+K"},
+     {"---"},
+     {"Toggle Listen mode", "Ctrl+L"},
+     {"Toggle FD mode",     "Ctrl+F"},
+     {"---"},
+     %% Save information to /home/$USER/candy.txt
+     {"Save",               "Ctrl+S"},
+     {"Quit",               "Ctrl+Q"}
+    ].
+%%
+%%   up             Arrow up, scroll up
+%%   down           Arrow down, scroll down
+%%   pageup         Page up, scroll one page up
+%%   pagedown       Page down, scroll one page down
+%%
+%% Global commands
+%%   SPACE          Pause can frame reception / (drop frames)
+%%   TAB            Auto key, detect frames the falls during key press
+%%   R              Refresh screen
+%%
+%%   Alt+up         Bitrate up
+%%   Alt+down       Bitrate down
+%%   Ctrl+up        Datarate up
+%%   Ctrl+down      Datarate down
+%%
+
 %%--------------------------------------------------------------------
 %% @doc
 %% Starts the server
@@ -433,41 +491,50 @@ init(Options) ->
 
     Profile = #profile{},
     MProfile = create_menu_profile(Profile),
+    HelpMenu = epx_menu:create(MProfile, help_menu()),
 
     Window = epxw:window(),
     epx:window_enable_events(Window, no_auto_repeat),
 
     RowHeight = H + 2,
 
-    BitRates0 = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
+    Conf_BitRates = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
+    Conf_DataRates = proplists:get_value(datarates, Env, ?DEFAULT_DATARATES),
     PidMode = proplists:get_value(pidmode, Env, off),
 
     {IF,
      [{listen_only,LISTEN},{fd,FD},
-      {bitrate,BitRate}, {bitrates, BitRates},
-      {datarate,DataRate}, {datarates,DataRates}]} =
+      {bitrate,BitRate0}, {bitrates, BitRates0},
+      {datarate,DataRate0}, {datarates, DataRates0}]} =
 	case get_can_if() of
 	    {ok,IFCan=#if_can{if_mod=Mod,if_pid=Pid}} when is_pid(Pid) ->
-		{IFCan, Mod:getopts(Pid, [listen_only, fd, 
+		{IFCan, Mod:getopts(Pid, [listen_only, fd,
 					  bitrate, bitrates, 
 					  datarate, datarates])};
 	    {error,_} ->
 		{#if_can{if_mod=undefined,if_id=0,if_pid=undefined},
 		 [{listen_only, false},
 		  {fd, false},
-		  {bitrate, hd(BitRates0)},
-		  {bitrates, BitRates0},
+		  {bitrate, hd(Conf_BitRates)},
+		  {bitrates, Conf_BitRates},
 		  {datarate, undefined},
-		  {datarates, ?DEFAULT_DATARATES}]}
+		  {datarates, Conf_DataRates}]}
 	end,
+    
+    {BitRate, BitRates} = 
+	make_rates(BitRate0, BitRates0, Conf_BitRates),
+    {DataRate, DataRates} = 
+	make_rates(DataRate0, DataRates0, Conf_DataRates),
 
     S1 = S0#s {
 	   listen_only = LISTEN,
 	   fd = FD,
 	   bitrate = BitRate,
-	   bitrates = sort_rates(BitRates),
+	   bitrates = BitRates,
 	   datarate = DataRate,
-	   datarates = sort_rates(DataRates),
+	   datarates = DataRates,
+	   conf_bitrates = Conf_BitRates,
+	   conf_datarates = Conf_DataRates,
 	   pidmode = PidMode,
 	   if_can = IF,
 	   font   = Font,
@@ -481,6 +548,7 @@ init(Options) ->
 	   frame_anim    = ets:new(frame_anim, []),
 	   frame_freq    = ets:new(frame_freq, []),
 	   menu_profile  = MProfile,
+	   help_menu     = HelpMenu,
 	   row_height    = RowHeight,
 	   hide = hide_pixels()
 	  },
@@ -505,10 +573,27 @@ configure(_Rect,State) ->
     ?verbose("CONFIGURE: ~w\n", [_Rect]),
     State.
 
+key_press(_Event={_, $\t, _Mod, _Code}, _State={S,D}) ->
+    D1 = D#d{auto_key = pressed},
+    ?verbose("KEY_PRESS: AutoKey pressed\n", []),
+    {S,D1};
+
+key_press(_Event={_, $?, _Mod, _Code}, _State={S,D}) ->
+    epxw:set_menu(S#s.help_menu),
+    ?verbose("KEY_PRESS: help activated\n", []),
+    epxw:invalidate(),
+    {S, D#d{ help = true }};
 key_press(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
     ?verbose("KEY_PRESS: ~w, mod=~p\n", [_Event, _Mod]),
     State.
 
+key_release(_Event={_, $\e, _Mod, _Code}, _State={S,D}) ->
+    ?verbose("KEY_RELEASE: help deactivated\n", []),
+    {S, D#d{ help = false }};
+key_release(_Event={_, $\t, _Mod, _Code}, _State={S,D}) ->
+    D1 = D#d{auto_key = released },
+    ?verbose("KEY_RLEASE: AutoKey released\n", []),
+    auto_key_detect({S,D1});
 key_release(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
     ?verbose("KEY_RELEASE: ~w\n", [_Event]),
     State.
@@ -527,9 +612,14 @@ button_press(_Event={button_press, Buttons,XY={_X,_Y}}, State) ->
 	    State
     end.
 
-button_release(_Event={_,_Buttons,{_X,_Y}},State) ->
+button_release(_Event={_,_Buttons,{_X,_Y}}, State={S,D}) ->
     ?verbose("BUTTON_RELEASE: ~w\n", [_Event]),
-    State.
+    if D#d.help ->
+	    ?verbose("KEY_RELEASE: help deactivated\n", []),
+	    {S, D#d{ help = false }};
+       true ->
+	    State
+    end.
 
 enter(_Event, State) ->
     ?verbose("ENTER: ~w\n", [_Event]),
@@ -558,54 +648,53 @@ draw(Pixels, Area, State) ->
     State.
 
 
-menu({menu,_Pos}, State={S,_D}) ->
-    ?verbose("MENU: Pos = ~p\n", [_Pos]),
-    MProfile = S#s.menu_profile,
-    Menu =
-	case S#s.if_can of
-	    #if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid) ->
-		[{listen_only,LISTEN},{fd,FD},
-		 {bitrate,BitRate}, {bitrates, BitRates},
-		 {datarate,DataRate}, {datarates,DataRates}] =
-		    Mod:getopts(Pid, [listen_only, fd, 
-				      bitrate, bitrates, 
-				      datarate, datarates]),
-		LISTEN_ON = if LISTEN -> "ON";
-			       not LISTEN -> "OFF";
-			       true -> "N/A"
-			    end,
-		FD_ON = if FD -> "ON";
-			   not FD -> "OFF";
-			   true -> "N/A"
-			end,
-		BitRates1 = sort_rates(BitRates),
-		DataRates1 = sort_rates(DataRates),
-		[{"Listen="++LISTEN_ON, "Ctrl+L"},
-		 {"Fd="++FD_ON, "Ctrl+F"}] ++
-		    [{rate_to_list(R,BitRate), "Alt+"++
-			  integer_to_list(I,16)} ||
-			{R,I} <- lists:zip(BitRates1,
-					   lists:seq(1, length(BitRates1)))]++
-		    if FD ->
-			    [{rate_to_list(R,DataRate), "Ctrl+"
+menu({menu,_Pos}, State={S,D}) ->
+    if D#d.help ->
+	    ?verbose("MENU: help active\n", []),
+	    {noreply, State};
+       true ->
+	    ?verbose("MENU: Pos = ~p\n", [_Pos]),
+	    MProfile = S#s.menu_profile,
+	    Menu = make_rate_menu(S),
+	    CanMenu = epx_menu:create(
+			MProfile#menu_profile{background_color=blue},
+			Menu),
+	    {reply, CanMenu, State}
+    end.
+
+make_rate_menu(S) ->
+    case S#s.if_can of
+	#if_can{if_mod=Mod,if_pid=Pid} when is_pid(Pid) ->
+	    [{fd,FD},
+	     {bitrate,BitRate}, {bitrates, BitRates0},
+	     {datarate,DataRate}, {datarates,DataRates0}] =
+		Mod:getopts(Pid, [fd,
+				  bitrate, bitrates, 
+				  datarate, datarates]),
+	    {BitRate1,BitRates1} = 
+		make_rates(BitRate, BitRates0, S#s.conf_bitrates),
+	    {DataRate1,DataRates1} = 
+		make_rates(DataRate, DataRates0, S#s.conf_bitrates),
+
+	    [{rate_to_list(R,BitRate1), "Alt+"++ integer_to_list(I,16)} ||
+		{R,I} <- lists:zip(BitRates1,
+				   lists:seq(1, length(BitRates1)))] ++
+		if FD ->
+			[{"---"}] ++
+			    [{rate_to_list(R,DataRate1), "Ctrl+"
 			      ++integer_to_list(I,16)} ||
 				{R,I} <- lists:zip(DataRates1, 
-						   lists:seq(1, length(DataRates1)))];
-		       true -> []
-		    end;
-	    _ ->
-		[{"Listen=N/A", "Ctrl+L"},
-		 {"Fd=N/A",     "Ctrl+F"},
-		 {" 1000k",      "Alt+1"},
-		 {" 500k",       "Alt+2"},
-		 {" 250k",       "Alt+3"},
-		 {" 125k",       "Alt+4"}
-		]
-	end,
-    CanMenu = epx_menu:create(MProfile#menu_profile{background_color=green},
-			      Menu),
-    {reply, CanMenu, State}.
-
+						   lists:seq(1,
+							     length(DataRates1)))];
+		   true -> []
+		end;
+	_ ->
+	    [{" 1000k",      "Alt+1"},
+	     {" 500k",       "Alt+2"},
+	     {" 250k",       "Alt+3"},
+	     {" 125k",       "Alt+4"}
+	    ]
+    end.
 		
 rate_to_list(Rate,CurrentRate) ->
     RateK = Rate div 1000,
@@ -622,7 +711,6 @@ rate_to_list(Rate,CurrentRate) ->
 
 select({_Phase,Rect}, {S,D}) ->
     ?verbose("SELECT: ~w\n", [Rect]),
-    ?verbose("State = S=~p, D=~p\n", [S, D]),
     {S, D#d { selection = Rect }}.
 
 motion(_Event={motion,_Button,_Pos}, State) ->
@@ -653,11 +741,15 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   pagedown       Page down, scroll one page down
 %%
 %%   A              Start/Stop auto detect
-%%   T              Filter frames not used
+%%   T              Select detected frames and filter out frames with no diff.
 %%   U              Undelete deleted frames
 %%   
 %% Global commands
+%%   SPACE          Pause can frame reception / (drop frames)
+%%   TAB            Auto key, detect frames the falls during key press
 %%   Q              Quit application
+%%   R              Refresh screen
+%%   Ctrl+K	    Clear/Kill all frames
 %%
 %%   Ctrl+L         Listen mode toggle
 %%   Ctrl+F         FD allow toggle
@@ -676,7 +768,14 @@ command(Key, Mod, State={_,D}) ->
 	State1 ->
 	    {noreply, State1}
     end.
-	     
+
+
+command($r, _Selected, _Mod, State) ->
+    epxw:invalidate(),
+    State;
+command($k, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    epxw:invalidate(),
+    clear_frames(State);
 command($x, Selected, _Mod, State) ->
     set_base(Selected, 16, State);
 command($d, Selected, _Mod, State) ->
@@ -771,8 +870,7 @@ command($s, Selected, Mod, State={S,_D}) when Mod#keymod.ctrl ->
 		io:format("SAVE KEY=0x~s PID=~p, Bits=~w\n",
 			  [integer_to_list(ID,16), PID, Bs]),
 		[[{BitPos,_Len}|_]|_] = Bs,
-		format_candy(ID, PID, BitPos,
-			     S#s.fd, S#s.bitrate, S#s.datarate);
+		format_candy(ID, PID, BitPos, S);
 	    _ -> []
 	end,
     %% User =  os:getenv("USER"),
@@ -786,7 +884,7 @@ command($s, Selected, Mod, State={S,_D}) when Mod#keymod.ctrl ->
 		     " This line and the following lines are comments\n"
 		    ]),
     State;
-command($q, _Selected, _Mod, State) ->
+command($q, _Selected, Mod, State) when Mod#keymod.ctrl ->
     erlang:halt(0),
     State;
 
@@ -873,28 +971,28 @@ command($t, _Selected, _Mod, State={S,_}) ->
 			  case ets:lookup(S#s.frame_diff, Key) of
 			      [] -> [{delete,Key}|Acc]; 
 			      [{_,[]}] -> [{delete,Key}|Acc];
-			      [{_,Bs}] -> [{select,Key,Bs}|Acc]
+			      [{_,D}] -> [{select,Key,D}|Acc]
 			  end
 		  end
 	  end, [], State),
-    {Selected,{S1,D1}} =
-	lists:foldl(
-	  fun({delete,Key}, {Sel,St0}) ->
-		  L = lookup_layout(Key, St0),
-		  {L1, St1} = remove_layout(L, St0),
-		  St2 = insert_layout(L1, St1),
-		  {Sel,St2};
-	     ({select,K,_Bs}, {Sel,St0}) ->
-		  %% FIXME: find fields matching bits in Bs?
-		  {[{K,[?ID_FMT_POSITION]}|Sel], St0}
-	  end, {[],State}, Ls),
+    {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
     epxw:invalidate(),
     {S1,D1#d{ selected = Selected }};
+command($\s, _Selected, _Mod, {S,D}) ->
+    Pause = not S#s.pause,
+    State1 = {S#s { pause = Pause }, D},
+    set_status(State1),
+    epxw:invalidate(),
+    State1;
+
 command(Symbol, _Selected, Mod, State) ->
     io:format("unhandled command ~p\n", [Symbol]),
     {reply,{Symbol,Mod},State}.
 
-format_candy(ID, undefined, BitPos, Fd, Bitrate, Datarate) ->
+format_candy(ID, undefined, BitPos, S) ->
+    Fd = S#s.fd,
+    Bitrate = S#s.bitrate,
+    Datarate = S#s.datarate,
     ["0x",integer_to_list(ID,16),
      " ", integer_to_list(BitPos div 8),
      %% byte mask
@@ -913,7 +1011,11 @@ format_candy(ID, undefined, BitPos, Fd, Bitrate, Datarate) ->
      end,
      "> pidmode=0\n"
     ];
-format_candy(ID, PID, BitPos, _Fd, Bitrate, Datarate) ->
+format_candy(ID, PID, BitPos, S) ->
+    _FD = S#s.fd,  %% in pid mode FD is always on
+    Bitrate = S#s.bitrate,
+    Datarate = S#s.datarate,
+    %% PidMode = S#s.pidmode,  only one mode for now
     ["0x",integer_to_list(ID,16),
      " ", integer_to_list(BitPos div 8),
      %% byte mask
@@ -1044,20 +1146,22 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
+handle_info(_Frame=#can_frame{}, State={S,_D}) when S#s.pause ->
+    {noreply, State};    
 handle_info(Frame=#can_frame{}, State) ->
     State1 = handle_can_frames(insert_frame(Frame,[],State), State),
     {noreply, State1};
-
 handle_info({timeout,Ref, tick}, State={S,D}) when D#d.tick =:= Ref ->
     case epxw:draw(fun(Pixels,Area) ->
-			   redraw_anim(Pixels,Area,State)
+			   State1 = redraw_anim(Pixels,Area,State),
+			   epxw:draw_menu_pixels(Pixels),
+			   State1
 		   end) of
 	false ->
 	    {noreply, {S, D#d { tick = undefined }}};
 	true ->
 	    {noreply, tick_start(State)}
-    end;
-
+    end;   
 %% toggle auto_detect to high
 handle_info({timeout,Ref,high}, {S,D}) when Ref =:= D#d.auto_detect_tmr ->
     epxw:profile_set(screen_color, ?HIGH_COLOR),
@@ -1100,10 +1204,14 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		%% new interface
 		LISTEN = maps:get(listen_only, IfParam),
 		FD = maps:get(fd, IfParam),
-		BitRate = maps:get(bitrate, IfParam),
-		BitRates = maps:get(bitrates, IfParam),
-		DataRate = maps:get(datarate, IfParam),
-		DataRates = maps:get(datarates, IfParam),
+		{BitRate, BitRates} = 
+		    make_rates(maps:get(bitrate, IfParam),
+			       maps:get(bitrates, IfParam),
+			       S#s.conf_bitrates),
+		{DataRate,DataRates} = 
+		    make_rates(maps:get(datarate, IfParam),
+			       maps:get(datarates, IfParam),
+			       S#s.conf_datarates),
 		Mod = maps:get(mod, IfParam),
 		Pid = maps:get(pid, IfParam),
 		IFCan = #if_can{if_mod=Mod, if_id = ID, if_pid=Pid},
@@ -1113,9 +1221,9 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		      listen_only =LISTEN,
 		      fd=FD,
 		      bitrate=BitRate, 
-		      bitrates=sort_rates(BitRates),
+		      bitrates=BitRates,
 		      datarate=DataRate,
-		      datarates=sort_rates(DataRates) };
+		      datarates=DataRates };
 	   true ->
 		S
 	end,
@@ -1157,8 +1265,26 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+make_rates(Rate, Rates, ConfRates) ->
+    %% io:format("Make rates: ~w ~w ~w\n", [Rate, Rates, ConfRates]),
+    Rates1 = ordsets:intersection(sort_rates(Rates), ConfRates),
+    Rate1 = select_rate(Rate, Rates1),
+    %% io:format("  rate = ~w, rates = ~w\n", [Rate1, Rates1]),
+    {Rate1, Rates1}.
+
 sort_rates(Rates) ->
     lists:sort(Rates).
+
+%% select Rate if present or next larger
+select_rate(undefined, _) -> undefined;
+select_rate(Rate, [Rate1|_]) when Rate =< Rate1 -> Rate1;
+%%select_rate(Rate, [Rate0,Rate1|_]) when Rate > Rate0, Rate < Rate1 ->
+%%    if abs(Rate0-Rate) < abs(Rate1-Rate) -> Rate0;
+%%       true -> Rate1
+%%    end;
+select_rate(_Rate, [Rate1]) ->  Rate1;
+select_rate(Rate, [_|Rates]) -> select_rate(Rate, Rates);
+select_rate(_Rate, []) -> undefined.
 
 %% batch collect all frames in one go then redraw if needed
 %% FIXME: check if the number of frames we collect is growing
@@ -1298,14 +1424,17 @@ process_frames([], State, Redraw, RedrawSet) ->
 		0 ->
 		    State;
 		_Count ->
-		    maps:fold(
-		      fun(Key,_,Statei) ->
-			      redraw_by_key(Key, Statei)
-		      end, State, RedrawSet)
+		    State1 = 
+			maps:fold(
+			  fun(Key,_,Statei) ->
+				  redraw_by_key(Key, Statei)
+			  end, State, RedrawSet),
+		    State1
 	    end
     end.
 
-is_auto_detect({_,#d { auto_detect = Auto }}) -> Auto =/= undefined.
+is_auto_detect({_,#d { auto_detect = Detect, auto_key = Key }}) -> 
+    (Detect =/= undefined) orelse (Key =:= pressed).
 
 auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
     case is_auto_detect(State) of
@@ -1316,49 +1445,46 @@ auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
 		true -> %% Frame was received inside detection "window"
 		    case ets:lookup(S#s.frame_diff,Key) of
 			[] -> %% no bits yet, regard all switched bits
-			    B1 = diff_bits(Frame,OldFrame),
-			    ets:insert(S#s.frame_diff, {Key,B1}),
+			    X1 = diff_bits(Frame,OldFrame),
+			    D2 = X1,
+			    ets:insert(S#s.frame_diff, {Key,D2}),
 			    State;
-			[{_,[]}] -> %% disabled
+			[{_,0}] -> %% disabled
 			    State;
-			[{_,B0}] ->
-			    B1 = diff_bits(Frame,OldFrame),
-			    %% remove switched from 
-			    B2 = B0--(B0--B1),
-			    ets:insert(S#s.frame_diff, {Key,B2}),
-			    %% io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			[{_,D2}] ->
+			    X2 = diff_bits(Frame,OldFrame),
+			    D3 = subtract_bits(D2, X2),
+			    ets:insert(S#s.frame_diff, {Key,D3}),
 			    State
 		    end;
 		false -> %% NewFrame was received outside detection "window"
 		    case ets:lookup(S#s.frame_diff,Key) of
 			[] -> %% no bits detected sofar
 			    State;
-			[{_,[]}] -> %% all bits are discarded already
+			[{_,0}] -> %% all bits are discarded already
 			    State;
-			[{_,B0}] -> %% current bits
-			    B1 = diff_bits(Frame,OldFrame),
-			    %% remove switch bits in B1 (switched)
-			    B2 = B0 -- B1,
-			    ets:insert(S#s.frame_diff, {Key,B2}),
-			    %% io:format("~.16.0B: bits=~w\n", [Key,B2]),
+			[{_,D2}] ->
+			    X2 = diff_bits(Frame,OldFrame),
+			    D3 = subtract_bits(D2, X2),
+			    ets:insert(S#s.frame_diff, {Key,D3}),
 			    State
 		    end
 	    end
-		
     end.
     
-
 %% return true if auto_detect was switched within edge interval!
-is_auto_edge(_State={_,#d{ auto_detect = Auto, auto_detect_tmr = Tmr}}) 
-  when is_reference(Tmr), Auto =/= undefined ->
+is_auto_edge(_State={_,#d{ auto_key = Key }}) when Key =:= pressed ->
+    true;
+is_auto_edge(_State={_,#d{ auto_detect = Detect, auto_detect_tmr = Tmr}}) 
+  when is_reference(Tmr), Detect =/= undefined ->
     case erlang:read_timer(Tmr) of
 	false -> false;
-	Remain when Auto =:= high -> 
+	Remain when Detect =:= high -> 
 	    T = ?AUTO_DETECT_HIGH_INTERVAL-Remain,
 	    (((T < 0) andalso (-T < ?AUTO_DETECT_EDGE_GUESSING)) 
 	     orelse
 	       ((T >= 0) andalso (T =< ?AUTO_DETECT_EDGE_INTERVAL)));
-	Remain when Auto =:= low -> 
+	Remain when Detect =:= low -> 
 	    T = ?AUTO_DETECT_LOW_INTERVAL-Remain,
 	    (((T < 0) andalso (-T < ?AUTO_DETECT_EDGE_GUESSING)) 
 	     orelse
@@ -1366,6 +1492,38 @@ is_auto_edge(_State={_,#d{ auto_detect = Auto, auto_detect_tmr = Tmr}})
     end;
 is_auto_edge(_) ->
     false.
+
+clear_and_select([{delete,Key}|Ls],Sel,St0) ->
+    L = lookup_layout(Key, St0),
+    {L1, St1} = remove_layout(L, St0),
+    St2 = insert_layout(L1, St1),
+    clear_and_select(Ls,Sel,St2);
+clear_and_select([{select,K,_Bs}|Ls],Sel,St0) ->
+    %% FIXME: find fields matching bits in Bs?
+    clear_and_select(Ls,[{K,[?ID_FMT_POSITION]}|Sel], St0);
+clear_and_select([],Sel,St0) ->
+    {Sel,St0}.
+
+%% Filter frames not flipped during key press
+auto_key_detect(State = {S,_D}) ->
+    Ls = auto_key_detect(ets:first(S#s.frame_diff), S#s.frame_diff, []),
+    ets:delete_all_objects(S#s.frame_diff),
+    {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
+    %% io:format("Selected=~p\n", [Selected]),
+    epxw:invalidate(),
+    {S1,D1#d{ selected = Selected }}.
+
+auto_key_detect('$end_of_table', _Tab, Ls) -> 
+    Ls;
+auto_key_detect(Key, Tab, Ls) -> 
+    case ets:lookup(Tab, Key) of
+	[] -> %% never flipped
+	    auto_key_detect(ets:next(Tab, Key),Tab,[{delete,Key}|Ls]);
+	[{_,0}] -> %% flipped
+	    auto_key_detect(ets:next(Tab, Key),Tab,[{delete,Key}|Ls]);
+	[{_,D2}] -> %% bits flipped (once) during key press
+	    auto_key_detect(ets:next(Tab, Key),Tab,[{select,Key,D2}|Ls])
+    end.
 
 cell_hit(Xy, Layout, State={S,D}) ->
     case fmt_from_coord(Xy, Layout) of
@@ -1832,37 +1990,39 @@ diff_frames_(I,Format,New,Old,Acc,State) when I =< tuple_size(Format) ->
 diff_frames_(_I,_Format,_New,_Old,Acc,_State) ->
     Acc.
 
-diff_bits(#frame{len=L,data=OldBits}, #frame{len=L,data=OldBits}) ->
-    [];
-diff_bits(#frame{len=L,data=NewBits}, #frame{len=L,data=OldBits}) ->
-    Bits = crypto:exor(NewBits, OldBits),
-    flipped(Bits);
-diff_bits(#frame{len=L1,data=NewBits}, #frame{len=L2,data=OldBits}) ->
-    D = L1 - L2,
-    Bits = if D > 0 -> 
-		   crypto:exor(NewBits, <<OldBits/binary, 0:D/unit:8>>);
-	      D < 0 ->
-		   crypto:exor(<<NewBits/binary, 0:(-D)/unit:8>>, OldBits)
-	   end,
-    flipped(Bits).
+%% return the flipped bits between two frames
+diff_bits(#frame{data=Data1}, #frame{data=Data2}) ->
+    L1 = byte_size(Data1),
+    L2 = byte_size(Data2),
+    <<D1:L1/little-unit:8>> = Data1,
+    <<D2:L2/little-unit:8>> = Data2,
+    D1 bxor D2.
 
-%% flipped_bits. return a list of bit offsets to flipped bits
-flipped(Flipped) ->
-    flipped_bits64(0, Flipped).
+%% remove bits from A that are set in B
+subtract_bits(A, B) ->
+    A band (bnot B).
 
-flipped_bits64(I, <<0:64,Rest/binary>>) -> flipped_bits64(I+64,Rest);
-flipped_bits64(I, Rest) -> flipped_bits32(I,Rest).
+%% return bit position list
+%% bit 0 is the right most bit in the first frame byte
+%% 16#1234 -> 16#3412
+%% 89AB CDEF 0123 4567
+%% 0011 0100 0001 0010
+%% [3,6,10,11,13]
+-ifdef(not_used).
 
-flipped_bits32(I, <<0:32,Rest/binary>>) -> flipped_bits32(I+32,Rest);
-flipped_bits32(I, Rest) -> flipped_bits8(I,Rest).
+bit_list(A) -> 
+    bit_list(A, 0, 0).
 
-flipped_bits8(I,<<0:8,Rest/binary>>) -> flipped_bits8(I+8,Rest);
-flipped_bits8(I,<<B:8/bitstring,Rest/binary>>) -> flipped_bits1(I,B,Rest);
-flipped_bits8(_I, <<>>) -> [].
-
-flipped_bits1(I,<<1:1,B/bitstring>>,Rest) -> [I|flipped_bits1(I+1,B,Rest)];
-flipped_bits1(I,<<0:1,B/bitstring>>,Rest) -> flipped_bits1(I+1,B,Rest);
-flipped_bits1(I,<<>>,Rest) -> flipped_bits64(I,Rest).
+bit_list(0, _, _) -> [];
+bit_list(A, I, Pos) when I < 8 ->
+    if A band 16#80 =:= 0 ->
+	    bit_list(A bsl 1, I+1, Pos+1);
+       true ->
+	    [Pos|bit_list(A bsl 1, I+1, Pos+1)]
+    end;
+bit_list(A, 8, Pos) -> 
+    bit_list(A bsr 16, 0, Pos).
+-endif.
 
 
 redraw_anim(Pixels,Area,State={S,_}) ->
@@ -1905,9 +2065,13 @@ redraw_anim_(_Pixels,_Area,'$end_of_table', Remove, Update, _State) ->
 %% | Link: up  | BitRate: 250k | Status: busoff |
 %% +-----------+---------------+----------------+
 set_status(_State={S,_D}) ->
-    LinkState = case S#s.if_state of
-		    up -> "Link: up";
-		    down -> "Link: down"
+    LinkState = if S#s.pause ->
+			"Link: pause";
+		   true ->
+			case S#s.if_state of
+			    up -> "Link: up";
+			    down -> "Link: down"
+			end
 		end,
     LinkBitRate =
 	case S#s.bitrate of
@@ -1974,12 +2138,16 @@ redraw_by_key(Key, State={_S,_D}) ->
     epxw:draw(
       fun(Pixels, Area) ->
 	      Layout = lookup_layout(Key, State),
-	      case intersect_layout(Layout, Area) of
-		  false ->
-		      State;
-		  _Intersection ->
-		      redraw_layout_(Pixels, Layout, State)
-	      end
+	      State1 =
+		  case intersect_layout(Layout, Area) of
+		      false ->
+			  State;
+		      _Intersection ->
+			  redraw_layout_(Pixels, Layout, State)
+		  end,
+	      %% io:format("MENU FROM redraw_by_key\n"),
+	      epxw:draw_menu_pixels(Pixels),
+	      State1
       end).
 
 each_layout(Fun, State={S,_D}) ->
@@ -2226,9 +2394,9 @@ get_anim(Key,I,{S,_}) ->
     end.
 
 %% draw hightlight background return text color and flag to signal remove
-highlight(_Pixels,-1, Color, _Rect, _State) ->
-    {true, Color#color.foreground};
-highlight(Pixels,0, Color, Rect, _State) ->
+%% highlight(_Pixels,-1, Color, _Rect, _State) ->
+%%    {true, Color#color.foreground};
+highlight(Pixels,Anim, Color, Rect, _State) when Anim =< 0 ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color#color.background),
     epx:draw_rectangle(Pixels,Rect),
@@ -2307,7 +2475,7 @@ invalidate_layout(Layout, State) ->
 remove_layout(Layout, State={S,_D}) ->
     Pos = Layout#layout.pos,  %% row to deleted
     N = Layout#layout.npos,   %% number of rows deleted
-    io:format("remove: pos=~w, n=~w\n", [Pos,N]),
+    %% io:format("remove: pos=~w, n=~w\n", [Pos,N]),
     State1 = move_layout_up(Pos, N, State),
     Key = Layout#layout.key,
     lists:foreach(fun(I) ->
@@ -2338,7 +2506,7 @@ move_layout_up(Pos, N, State) ->
 	      L = lookup_layout(Key, Si),
 	      Pos1 = L#layout.pos,
 	      NPos = Pos1 - N,
-	      io:format("move ~w to ~w\n", [Pos1, NPos]),
+	      %% io:format("move ~w to ~w\n", [Pos1, NPos]),
 	      L1 = L#layout { pos0 = NPos, pos = NPos },  
 	      L2 = reposition_normal(Pos1, L1, Si),
 	      insert_layout(L2, Si)
@@ -2551,13 +2719,13 @@ collect_bits_([], _Data, Acc) ->
     Acc.
 
 %% remove all frames
-clear_frames(State={S,_D}) ->
+clear_frames(_State={S,D}) ->
     ets:delete_all_objects(S#s.frame),
     ets:delete_all_objects(S#s.frame_layout),
     ets:delete_all_objects(S#s.frame_anim),
     ets:delete_all_objects(S#s.frame_freq),
     ets:delete_all_objects(S#s.frame_counter),
-    State.
+    {S#s{next_pos = 1}, D}.
 
 %% FID maybe frame id or internal key (where fd/err is stripped)
 lookup_layout(Key,_State={S,_D}) ->
@@ -2565,7 +2733,7 @@ lookup_layout(Key,_State={S,_D}) ->
     L.
 
 update_layout(OldLayout, NewLayout, State={_S,_D}) ->
-    %% Pixels = epxw:pixels(),
+    %% wrap with epxw to be able to redraw old layout
     epxw:draw(
       fun(Pixels, _Area) ->
 	      clear_layout_background(Pixels, OldLayout, State),
