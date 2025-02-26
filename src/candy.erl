@@ -32,6 +32,7 @@
 
 %% debug
 -export([select_rate/2]).
+-export([rate_to_list/1]).
 
 -export([init/1,
 	 configure/2,
@@ -415,10 +416,10 @@ help_menu() ->
 %%   TAB            Auto key, detect frames the falls during key press
 %%   R              Refresh screen
 %%
-%%   Alt+up         Bitrate up
-%%   Alt+down       Bitrate down
-%%   Ctrl+up        Datarate up
-%%   Ctrl+down      Datarate down
+%%   Alt+up         next bitrate
+%%   Alt+down       prev bitrate
+%%   Ctrl+up        next datarate
+%%   Ctrl+down      prev datarate
 %%
 
 %%--------------------------------------------------------------------
@@ -674,7 +675,7 @@ make_rate_menu(S) ->
 	    {BitRate1,BitRates1} = 
 		make_rates(BitRate, BitRates0, S#s.conf_bitrates),
 	    {DataRate1,DataRates1} = 
-		make_rates(DataRate, DataRates0, S#s.conf_bitrates),
+		make_rates(DataRate, DataRates0, S#s.conf_datarates),
 
 	    [{rate_to_list(R,BitRate1), "Alt+"++ integer_to_list(I,16)} ||
 		{R,I} <- lists:zip(BitRates1,
@@ -689,24 +690,41 @@ make_rate_menu(S) ->
 		   true -> []
 		end;
 	_ ->
-	    [{" 1000k",      "Alt+1"},
-	     {" 500k",       "Alt+2"},
-	     {" 250k",       "Alt+3"},
-	     {" 125k",       "Alt+4"}
+	    [{" 125k",    "Alt+1"},
+	     {" 500k",    "Alt+2"},
+	     {" 250k",    "Alt+3"},
+	     {" 1M",      "Alt+4"}
 	    ]
+    end.
+
+rate_to_list(Rate) ->
+    if Rate >= 1000000 ->
+	    RateM = Rate div 1000000,
+	    RateD = (Rate rem 1000000) div 1000,
+	    if RateD =:= 0 ->
+		    integer_to_list(RateM)++"M";
+	       true ->
+		    integer_to_list(RateM)++"."++
+			[hd(tl(integer_to_list(1000+RateD))),$M]
+	    end;
+       Rate >= 1000 ->
+	    RateK = Rate div 1000,
+	    RateD = Rate rem 1000,
+	    if RateD =:= 0 ->
+		    integer_to_list(RateK)++"k";
+	       true ->
+		    integer_to_list(RateK) ++ "." ++
+			[hd(tl(integer_to_list(1000+RateD))),$k]
+	    end;
+       true ->
+	    "0"
     end.
 		
 rate_to_list(Rate,CurrentRate) ->
-    RateK = Rate div 1000,
-    RateM = Rate rem 1000,
-    Mark = if Rate =:= CurrentRate -> ">";
-	      true -> " "
-	   end,
-    if RateM =:= 0 ->
-	    Mark++integer_to_list(RateK)++"k";
+    if Rate =:= CurrentRate ->
+	    ">" ++ rate_to_list(Rate);
        true ->
-	    Mark++integer_to_list(RateK) ++ "." ++
-		hd(integer_to_list(RateM)) ++ "k"
+	    " " ++ rate_to_list(Rate)
     end.
 
 select({_Phase,Rect}, {S,D}) ->
@@ -1561,7 +1579,7 @@ cell_hit(Xy, Layout, State={S,D}) ->
 	    end
     end.
 
-bitrate_next(State0={S,D}) ->
+bitrate_next(State0={S,D}) when S#s.if_state =:= up ->
     I = bitrate_index(State0)-1,
     BitRates = S#s.bitrates,
     N = length(BitRates),
@@ -1572,9 +1590,12 @@ bitrate_next(State0={S,D}) ->
     State = {S#s { bitrate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+bitrate_next(State) ->
     State.
 
-bitrate_prev(State0={S,D}) ->
+
+bitrate_prev(State0={S,D}) when S#s.if_state =:= up ->
     I = bitrate_index(State0)-1,
     BitRates = S#s.bitrates,
     N = length(BitRates),
@@ -1585,9 +1606,11 @@ bitrate_prev(State0={S,D}) ->
     State = {S#s { bitrate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+bitrate_prev(State) ->
     State.
 
-bitrate_select(I, _State0={S,D}) ->
+bitrate_select(I, _State0={S,D}) when S#s.if_state =:= up ->
     BitRates = S#s.bitrates,
     N = length(BitRates),
     J = ((I-1) rem N) + 1,
@@ -1598,7 +1621,10 @@ bitrate_select(I, _State0={S,D}) ->
     State = {S#s { bitrate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+bitrate_select(_I, State) ->
     State.
+
 
 bitrate_index({S,_D}) ->
     if S#s.bitrate =:= undefined, S#s.bitrates =:= [] -> 0;
@@ -1606,7 +1632,7 @@ bitrate_index({S,_D}) ->
        true -> index(S#s.bitrate, S#s.bitrates)
     end.
 
-datarate_next(State0={S,D}) ->
+datarate_next(State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
     I = datarate_index(State0)-1,
     DataRates = S#s.datarates,
     N = length(DataRates),
@@ -1617,9 +1643,11 @@ datarate_next(State0={S,D}) ->
     State = {S#s { datarate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+datarate_next(State) ->
     State.
 
-datarate_prev(State0={S,D}) ->
+datarate_prev(State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
     I = datarate_index(State0)-1,
     DataRates = S#s.datarates,
     N = length(DataRates),
@@ -1630,9 +1658,11 @@ datarate_prev(State0={S,D}) ->
     State = {S#s { datarate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+datarate_prev(State) ->
     State.
 
-datarate_select(I, _State0={S,D}) ->
+datarate_select(I, _State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
     DataRates = S#s.datarates,
     N = length(DataRates),
     J = ((I-1) rem N) + 1,
@@ -1643,6 +1673,8 @@ datarate_select(I, _State0={S,D}) ->
     State = {S#s { datarate = Rate1 }, D},
     set_status(State),
     epxw:invalidate(),
+    State;
+datarate_select(_I, State) ->
     State.
 
 datarate_index({S,_D}) ->
@@ -2075,9 +2107,15 @@ set_status(_State={S,_D}) ->
 		end,
     LinkBitRate =
 	case S#s.bitrate of
-	    error ->   "BitRate: error";
-	    undefined ->   "BitRate: undef";
-	    BitRate -> "BitRate: " ++ integer_to_list(BitRate div 1000)++"k"
+	    error ->   "Rate: error";
+	    undefined ->   "Rate: undef";
+	    BitRate -> "Rate: " ++ 
+			   rate_to_list(BitRate) ++
+			   if S#s.fd, is_integer(S#s.datarate) ->
+				   "/"++rate_to_list(S#s.datarate);
+			      true ->
+				   ""
+			   end
 	end,
     LinkFlags =
 	"Flags: " ++ 

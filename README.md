@@ -50,21 +50,24 @@ Key commands used on selected elements:
     Shift+G        un-group selected bits
     1-8            Split in groups of 1 to 8 bits
     Ctrl+S         Save information to $HOME/candy.txt
+    Ctrl+Q         Quit application (or close window)
 
 Other key commands
-
     A              Start/Stop auto detect
     P              Toggle PID24 mode
     R		   Refresh screen    
-    Q              Quit application
     U		   Undelete delete frames
     T              Filter frames not used
     Up             Arrow up, scroll up
     Down           Arrow down, scroll down
     PageUp         Page up, scroll one page up
     PageDown       Page down, scroll one page down
-    Alt-Up         circulate bitrate up  (125K,250K,500K)
-    Alt-Down       circulate bitrate down (500K,250K,125K)
+    
+    Alt-Up         prev bitrate (500K,250K,125K)    
+    Alt-Down       next bitrate (125K,250K,500K)
+
+    Ctrl-Up        prev datarate (500K,1000K,5000K,10000K)
+    Ctrl-Down      next datarate (10000K,5000K,1000K,500K)
 
     SPACE          toggle pause/resume of frames (drops frames while in pause)
     TAB		   Auto key, detect frames the falls during key press
@@ -75,7 +78,6 @@ Other key commands
     Ctrl+H         Sort High -> Low frames by frame id
     Alt+H          Restore to original order (frames as arrived)
     
-
 # candy.txt format
 
 The candy.txt file is generate with hitting Ctrl-S, if

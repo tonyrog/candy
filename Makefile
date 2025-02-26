@@ -17,7 +17,11 @@ clean:
 	@if [ -d "c_src" -a -f "c_src/Makefile" ]; then (cd c_src && $(MAKE) clean); fi
 	@if [ -d "test" -a -f "test/Makefile" ]; then (cd test && $(MAKE) clean); fi
 
-appimage:
+update_vsn:
+	rm ebin/$(APP).app
+	(cd src; make ../ebin/$(APP).app)
+
+appimage:	update_vsn
 	erl -epx -noshell -s $(APP) start0 $(CONFIG) -s servator make_appimage $(APP) -s erlang halt
 	(cd $(APP).AppDir; ../../servator/priv/make_desktop_icons $(APP).png)
 	strip $(APP).AppDir/bin/beam.smp
@@ -31,7 +35,7 @@ appimage:
 	appimagetool -n $(APP).AppDir
 	mv $(APPL)-$(MACHINE).AppImage $(APPL)-$(VSN)-$(MACHINE).AppImage
 
-osxapp:
+osxapp:	update_vsn
 	erl -sname candy -epx -noshell -s $(APP) $(CONFIG) -s servator make_osxapp $(APP) -s erlang halt
 	mkdir -p tmpdist
 	mv $(APPL).app tmpdist/
