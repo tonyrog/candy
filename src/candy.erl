@@ -69,8 +69,7 @@
 -endif.
 
 -define(ld(K, E, D), proplists:get_value((K), (E), (D)#profile.K)).
--define(ldc(S, K, E, D), epx_profile:color_number((S), ?ld(K,(E),(D)))).
-
+-define(ldc(S, K, E, D), epx_profile:color((S), ?ld(K,(E),(D)))).
 
 -define(RATE_MENU_COLOR, blue).
 
@@ -580,7 +579,6 @@ init(Options) ->
     D1 = #d{ orig_screen_color = Profile#profile.screen_color,
 	     screen_color = Profile#profile.screen_color },
     State = {S1, D1},
-
     Model = proplists:get_value(model, Options, any),
     State1 = load_frame_layout(Model, State),
     set_status(State1),
@@ -590,6 +588,7 @@ init(Options) ->
 load_profile(E) ->
     D = #profile{},  %% defaults
     S = ?ld(scheme, E, D),
+
     #profile {
        scheme = S,
        screen_color = ?ldc(S,screen_color, E, D),
@@ -990,14 +989,12 @@ command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
 command($a, _Selected, _Mod, _State = {S,D}) ->
     case D#d.auto_detect_tmr of
 	undefined -> %% start auto detect mode
-	    OrigScreenColor = epxw:profile_get(screen_color),
 	    epxw:profile_set(screen_color, ?LOW_COLOR),
 	    epxw:invalidate(),
 	    ets:delete_all_objects(S#s.frame_diff),
 	    Tmr = erlang:start_timer(?AUTO_DETECT_INIT_INTERVAL,self(),high),
 	    %% set auto_detect to undefined to dissallow detection until high
 	    {S, D#d { auto_detect = undefined, auto_detect_tmr = Tmr,
-		      orig_screen_color = OrigScreenColor,
 		      screen_color = ?SCREEN_COLOR
 		    } };
 	TRef ->
@@ -2465,7 +2462,7 @@ cell_color(I) ->
 
 %% "delete" the layout by drawing layout background color
 draw_layout_background(Pixels, Layout, Color) ->
-    draw_layout_rectangle(Pixels, Layout, Color, 
+    draw_layout_rectangle(Pixels, Layout, Color,
 			  Layout#layout.width).
 
 %% prepare layout by painting the layout background color
