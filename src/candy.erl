@@ -68,25 +68,13 @@
 -define(GET_STACK(_), erlang:get_stacktrace()).
 -endif.
 
--define(ld(Key, Env, Default),
-	proplists:get_value(Key, Env, Default#profile.Key)).
+-define(ld(K, E, D), proplists:get_value((K), (E), (D)#profile.K)).
+-define(ldc(S, K, E, D), epx_profile:color_number((S), ?ld(K,(E),(D)))).
 
--define(ldc(Scheme, Key, Env, Default),
-	epx_profile:color_number(Scheme, ?ld(Key,Env,Default))).
 
-%% profile with default values
--record(profile,
-	{
-	 scheme                        = logo, %% xterm,
-	 %% menu_info
-	 menu_font_name                = "Arial",
-	 menu_font_size                = 14,
-	 menu_font_color               = grey5,   %% light
-	 menu_background_color         = grey10,  %% dark
-	 menu_border_color             = grey1
-	}).
+-define(RATE_MENU_COLOR, blue).
 
--define(SCREEN_COLOR,            {0,255,255}). %% {192,192,192}).
+-define(SCREEN_COLOR,            {0,255,255}).
 -define(HIGH_COLOR,              {0,255,0}).
 -define(LOW_COLOR,               {200,200,200}).   %% light gray
 -define(LAYOUT_BACKGROUND_COLOR, {255,255,255}).   %% white
@@ -109,6 +97,28 @@
 
 -define(FONT_NAME, "Courier New").
 -define(FONT_SIZE, 14).
+
+%% profile with default values
+-record(profile,
+	{
+	 scheme                        = logo, %% xterm,
+	 %%
+	 screen_color                  = ?SCREEN_COLOR,
+	 %% menu_info
+	 menu_font_name                = "Arial",
+	 menu_font_size                = 14,
+	 menu_font_color               = grey5,   %% light
+	 menu_background_color         = grey10,  %% dark
+	 menu_border_color             = grey1,
+	 menu_border_width             = 2,
+
+	 frame_background_color = ?LAYOUT_BACKGROUND_COLOR,
+	 frame_foreground_color = ?TEXT_COLOR,
+	 frame_border_color     = ?FRAME_BORDER_COLOR,
+	 frame_background1_color = ?HIGHLIGHT_COLOR1,
+	 frame_foreground1_color = ?TEXT_HIGHLIGHT_COLOR
+	}).
+
 
 -define(APP, ?MODULE).
 -define(APPSTR, ?MODULE_STRING).
@@ -191,6 +201,7 @@
 %% kind of constant elements
 -record(s,
 	{
+	 app_name = "Candy",
 	 fd = undefined,                  %% fd mode
 	 listen_only = undefined,         %% listen only mode
 	 bitrate = undefined,
@@ -220,6 +231,7 @@
 	 frame_anim,     %% ets: {{frame_key(ID,PID),FmtPos},Counter}
 	 %% background_color :: epx:epx_color(),
 	 menu_profile,
+	 color_profile = #color{} :: #color{},
 	 help_menu,
 	 row_height    = 0,
 	 next_pos = 1,
@@ -232,7 +244,8 @@
 	 tick :: undefined | reference(),
 	 selection,                 %% current selection rect
 	 selected = [],             %% selected frames [{FID,Pos}]
-	 screen_color = ?SCREEN_COLOR,
+	 orig_screen_color = ?SCREEN_COLOR,  %% original sceen mode (auto)
+	 screen_color = ?SCREEN_COLOR,       %% current screen color
 	 content :: #window_content{},
 	 auto_key = released :: pressed | released,
 	 auto_detect = undefined :: undefined | high | low,
@@ -437,9 +450,12 @@ help_menu() ->
 %%     application:ensure_all_started(?MODULE),
 %%     start_it(Options, start_link).
 
-start_it(Options, Start) ->
+start_it(Options0, Start) ->
+    Options = Options0 ++ application:get_all_env(candy),
+    Profile = proplists:get_value(profile, Options, []),
     epxw:Start(?MODULE,
 	       Options,
+	       Profile ++
 	       [{title, "Candy"},
 		{scroll_horizontal, bottom},  %% none|top|bottom
 		{scroll_vertical,   right},   %% none|left|right
@@ -447,14 +463,15 @@ start_it(Options, Start) ->
 		{scroll_hndl_color, blue},
 		{scroll_bar_size,   14},
 		{scroll_hndl_size,  10},
-		{screen_color,      ?SCREEN_COLOR},
+		{screen_color, ?SCREEN_COLOR},
 		{left_bar, 0},
 		{right_bar, 0},
 		{top_bar, 20},
 		{width,  ?WIDTH},
 		{height, ?HEIGHT},
 		{view_width,?WIDTH},
-		{view_height,?HEIGHT-(20+18)}]).
+		{view_height,?HEIGHT-(20+18)}
+	       ]).
     
 %% make sure CANUSB is on full speed (+ other FTDI serial devices)
 low_latency() ->
@@ -481,7 +498,6 @@ low_latency() ->
 %%--------------------------------------------------------------------
 init(Options) ->
     process_flag(trap_exit, true),
-    Env = Options ++ application:get_all_env(candy),
     can_router:attach(),
     can_router:error_reception(on),
     can_router:if_state_supervision(on),
@@ -490,18 +506,23 @@ init(Options) ->
     epx_gc:set_font(Font),
     {W,H}  = epx_font:dimension(Font,"0"),
 
-    Profile = #profile{},
-    MProfile = create_menu_profile(Profile),
+    Conf_BitRates = proplists:get_value(bitrates, Options,
+					?DEFAULT_BITRATES),
+    Conf_DataRates = proplists:get_value(datarates, Options,
+					 ?DEFAULT_DATARATES),
+    PidMode = proplists:get_value(pidmode, Options, off),
+
+    Env = proplists:get_value(profile, Options, []),
+    Profile = load_profile(Env),
+    MProfile = load_menu_profile(Profile),
+    CProfile = load_color_profile(Profile),
+    AppName = proplists:get_value(title, Env, "Candy"),
     HelpMenu = epx_menu:create(MProfile, help_menu()),
 
     Window = epxw:window(),
     epx:window_enable_events(Window, no_auto_repeat),
 
     RowHeight = H + 2,
-
-    Conf_BitRates = proplists:get_value(bitrates, Env, ?DEFAULT_BITRATES),
-    Conf_DataRates = proplists:get_value(datarates, Env, ?DEFAULT_DATARATES),
-    PidMode = proplists:get_value(pidmode, Env, off),
 
     {IF,
      [{listen_only,LISTEN},{fd,FD},
@@ -528,6 +549,7 @@ init(Options) ->
 	make_rates(DataRate0, DataRates0, Conf_DataRates),
 
     S1 = S0#s {
+	   app_name = AppName,
 	   listen_only = LISTEN,
 	   fd = FD,
 	   bitrate = BitRate,
@@ -549,25 +571,60 @@ init(Options) ->
 	   frame_anim    = ets:new(frame_anim, []),
 	   frame_freq    = ets:new(frame_freq, []),
 	   menu_profile  = MProfile,
+	   color_profile = CProfile,
 	   help_menu     = HelpMenu,
 	   row_height    = RowHeight,
 	   hide = hide_pixels()
 	  },
 
-    State = {S1, #d{ } },
-    Model = proplists:get_value(model, Env, any),
+    D1 = #d{ orig_screen_color = Profile#profile.screen_color,
+	     screen_color = Profile#profile.screen_color },
+    State = {S1, D1},
+
+    Model = proplists:get_value(model, Options, any),
     State1 = load_frame_layout(Model, State),
     set_status(State1),
     {ok, State1}.
 
-create_menu_profile(Profile) ->
+%% load "local" epxw options from options+environment
+load_profile(E) ->
+    D = #profile{},  %% defaults
+    S = ?ld(scheme, E, D),
+    #profile {
+       scheme = S,
+       screen_color = ?ldc(S,screen_color, E, D),
+       menu_font_name = ?ld(menu_font_name, E, D),
+       menu_font_size = ?ld(menu_font_size, E, D),
+       menu_font_color = ?ldc(S,menu_font_color, E, D),
+       menu_background_color = ?ldc(S,menu_background_color, E, D),
+       menu_border_color = ?ldc(S,menu_border_color, E, D),
+       menu_border_width = ?ld(menu_border_width, E, D),
+       %% frames
+       frame_background_color = ?ldc(S, frame_background_color, E, D),
+       frame_foreground_color = ?ldc(S, frame_foreground_color, E, D),
+       frame_border_color     = ?ldc(S, frame_border_color, E, D),
+       frame_background1_color = ?ldc(S, frame_background1_color, E, D),
+       frame_foreground1_color = ?ldc(S, frame_foreground1_color, E, D)
+      }.
+
+load_menu_profile(Profile) ->
     #menu_profile {
        scheme           = Profile#profile.scheme,
        font_name        = Profile#profile.menu_font_name,
        font_size        = Profile#profile.menu_font_size,
        font_color       = Profile#profile.menu_font_color,
        background_color = Profile#profile.menu_background_color,
-       border_color     = Profile#profile.menu_border_color
+       border_color     = Profile#profile.menu_border_color,
+       border_width     = Profile#profile.menu_border_width
+      }.
+
+load_color_profile(Profile) ->
+    #color {
+       background = Profile#profile.frame_background_color,
+       foreground = Profile#profile.frame_foreground_color,
+       border     = Profile#profile.frame_border_color,
+       background1 =Profile#profile.frame_background1_color,
+       foreground1 =Profile#profile.frame_foreground1_color
       }.
 
 configure(_Rect,State) ->
@@ -658,7 +715,8 @@ menu({menu,_Pos}, State={S,D}) ->
 	    MProfile = S#s.menu_profile,
 	    Menu = make_rate_menu(S),
 	    CanMenu = epx_menu:create(
-			MProfile#menu_profile{background_color=blue},
+			MProfile#menu_profile{background_color=
+						  ?RATE_MENU_COLOR},
 			Menu),
 	    {reply, CanMenu, State}
     end.
@@ -869,7 +927,6 @@ command($p, _Selected, _Mod, {S,D}) ->
 		  off ->  pid24;
 		  pid24 -> off
 	      end,
-    io:format("Toggle pid mode, new mode = ~p\n", [NewMode]),
     State1 = {S#s { pidmode = NewMode, next_pos = 1 }, D},
     set_status(State1),
     epxw:invalidate(),
@@ -933,16 +990,18 @@ command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
 command($a, _Selected, _Mod, _State = {S,D}) ->
     case D#d.auto_detect_tmr of
 	undefined -> %% start auto detect mode
+	    OrigScreenColor = epxw:profile_get(screen_color),
 	    epxw:profile_set(screen_color, ?LOW_COLOR),
 	    epxw:invalidate(),
 	    ets:delete_all_objects(S#s.frame_diff),
 	    Tmr = erlang:start_timer(?AUTO_DETECT_INIT_INTERVAL,self(),high),
 	    %% set auto_detect to undefined to dissallow detection until high
 	    {S, D#d { auto_detect = undefined, auto_detect_tmr = Tmr,
+		      orig_screen_color = OrigScreenColor,
 		      screen_color = ?SCREEN_COLOR
 		    } };
 	TRef ->
-	    epxw:profile_set(screen_color, ?SCREEN_COLOR),
+	    epxw:profile_set(screen_color, D#d.orig_screen_color),
 	    epxw:invalidate(),
 	    erlang:cancel_timer(TRef),
 	    receive
@@ -1284,10 +1343,8 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 make_rates(Rate, Rates, ConfRates) ->
-    %% io:format("Make rates: ~w ~w ~w\n", [Rate, Rates, ConfRates]),
     Rates1 = ordsets:intersection(sort_rates(Rates), ConfRates),
     Rate1 = select_rate(Rate, Rates1),
-    %% io:format("  rate = ~w, rates = ~w\n", [Rate1, Rates1]),
     {Rate1, Rates1}.
 
 sort_rates(Rates) ->
@@ -1421,7 +1478,8 @@ process_frames([Frame=#frame{id=FID,pid=PID}|Fs], State={S,D},
 	    [ ets:insert(S#s.frame_anim,{{Key,Pos},255}) ||
 		Pos <- lists:seq(1,tuple_size(Format))  ],
 	    LPos = S#s.next_pos,
-	    L1 = #layout { key=Key, pos=LPos, pos0=LPos, format=Format },
+	    L1 = #layout { key=Key, pos=LPos, pos0=LPos, 
+			   format=Format, color=S#s.color_profile},
 	    L2 = position_layout(L1, State),
 
 	    NextPos = LPos+L2#layout.npos,
@@ -1527,7 +1585,6 @@ auto_key_detect(State = {S,_D}) ->
     Ls = auto_key_detect(ets:first(S#s.frame_diff), S#s.frame_diff, []),
     ets:delete_all_objects(S#s.frame_diff),
     {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
-    %% io:format("Selected=~p\n", [Selected]),
     epxw:invalidate(),
     {S1,D1#d{ selected = Selected }}.
 
@@ -2141,11 +2198,14 @@ set_status(_State={S,_D}) ->
 			   [LinkState,LinkFlags,LinkBitRate,LinkError]),
     epxw:set_status_text(Status),
 
+    AppName = S#s.app_name,
     WindowTitle = case maps:get(device_name, S#s.if_param, "") of
 		      "/dev/serial/by-id/usb-LAWICEL_CANUSB_" ++ _ ->
-			  "Candy@CANUSB";
-		      "" -> "Candy";
-		      DeviceName -> "Candy@"++DeviceName
+			  AppName++"@CANUSB";
+		      "" -> 
+			  AppName;
+		      DeviceName -> 
+			  AppName++"@"++DeviceName
 		  end,
     Window = epxw:window(),
     epx:window_adjust(Window, [{name, WindowTitle}]).
@@ -2513,7 +2573,6 @@ invalidate_layout(Layout, State) ->
 remove_layout(Layout, State={S,_D}) ->
     Pos = Layout#layout.pos,  %% row to deleted
     N = Layout#layout.npos,   %% number of rows deleted
-    %% io:format("remove: pos=~w, n=~w\n", [Pos,N]),
     State1 = move_layout_up(Pos, N, State),
     Key = Layout#layout.key,
     lists:foreach(fun(I) ->
@@ -2544,7 +2603,6 @@ move_layout_up(Pos, N, State) ->
 	      L = lookup_layout(Key, Si),
 	      Pos1 = L#layout.pos,
 	      NPos = Pos1 - N,
-	      %% io:format("move ~w to ~w\n", [Pos1, NPos]),
 	      L1 = L#layout { pos0 = NPos, pos = NPos },  
 	      L2 = reposition_normal(Pos1, L1, Si),
 	      insert_layout(L2, Si)
