@@ -1068,7 +1068,7 @@ format_candy(ID, undefined, BitPos, S) ->
     Bitrate = S#s.bitrate,
     Datarate = S#s.datarate,
     ["0x",integer_to_list(ID,16),
-     " ", integer_to_list(BitPos div 8),
+     " ", integer_to_list(BitPos div 8, 16),  %% hex without 0x (old version)
      %% byte mask
      " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
      %% byte match value HIGH
@@ -1091,7 +1091,7 @@ format_candy(ID, PID, BitPos, S) ->
     Datarate = S#s.datarate,
     %% PidMode = S#s.pidmode,  only one mode for now
     ["0x",integer_to_list(ID,16),
-     " ", integer_to_list(BitPos div 8),
+     " ", integer_to_list(BitPos div 8, 16), %% hex without 0x (old version)
      %% byte mask
      " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
      %% byte match value HIGH
