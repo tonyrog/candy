@@ -18,15 +18,35 @@
 
 -compile(export_all).
 
-file(File) -> file(File,0,1).
-file(File,Repeat) -> file(File,Repeat,1).
+-type candy_play_options() :: #{ repeat => -1..100, 
+				 time_scale => number() }.
 
-file(File,Repeat,TimeScale) when is_integer(Repeat), Repeat >= -1,
-				 is_number(TimeScale), 
-				 TimeScale > 0 ->
+-spec file(Filename::string()) -> 
+	  ok.
+file(Filename) -> file_(Filename, #{ repeat => 0,
+				     timescale => 1 }).
+
+-spec file(Filename::string(), Repeat::number()) -> 
+	  ok;
+	  (Filename::string(), Options::candy_play_options()) ->
+	  ok.
+file(Filename,Repeat) when
+      is_number(Repeat), Repeat >= -1 ->
+    file_(Filename,#{repeat => Repeat,
+		     timescale => 1 });
+file(Filename,Options) when is_map(Options) ->
+    file_(Filename,Options).
+
+file(Filename,Repeat,TimeScale) when is_integer(Repeat), Repeat >= -1,
+				     is_number(TimeScale), 
+				     TimeScale > 0 ->
+    file_(Filename, #{repeat => Repeat, time_scale => TimeScale}).
+
+
+file_(File,Options) ->
     (catch error_logger:tty(false)),
     %% can_udp:start(0, [{ttl,0}]),
-    fold_file(File, fun play/6, #{repeat => Repeat, time_scale => TimeScale}).
+    fold_file(File, fun play/6, Options).
 
 
 fold_file(File, Play, Params) ->	      

@@ -55,9 +55,10 @@ Key commands used on selected elements:
 Other key commands
     A              Start/Stop auto detect
     P              Toggle PID24 mode
-    R		   Refresh screen    
+    R		   Refresh screen
     U		   Undelete delete frames
-    T              Filter frames not used
+    T              Remove frames not "detected"
+    F              Use Selected Frame(s) only (apply canfilter)
     Up             Arrow up, scroll up
     Down           Arrow down, scroll down
     PageUp         Page up, scroll one page up
