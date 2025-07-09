@@ -24,6 +24,7 @@
 -module(candy).
 -behaviour(epxw).
 
+-compile(export_all).
 %% API
 -export([start0/0]).  %% make app image target
 -export([start/0, start/1]).
@@ -65,6 +66,17 @@
 -define(ld(K, E, D), proplists:get_value((K), (E), (D)#profile.K)).
 -define(ldc(S, K, E, D), epx_profile:color((S), ?ld(K,(E),(D)))).
 
+%% some text colors
+-define(TEXT_BLACK,   {0,0,0,0}).
+-define(TEXT_BLUE,    {0,0,0,255}).
+-define(TEXT_GREEN,   {0,0,255,0}).
+-define(TEXT_CYAN,    {0,0,255,255}).
+-define(TEXT_RED,     {0,255,0,0}).
+-define(TEXT_MAGENTA, {0,255,0,255}).
+-define(TEXT_YELLOW,  {0,255,255,0}).
+-define(TEXT_WHITE,   {0,255,255,255}).
+
+
 -define(RATE_MENU_COLOR, blue).
 
 -define(SCREEN_COLOR,            {0,255,255}).
@@ -86,8 +98,8 @@
 -define(LAYOUT_BORDER_COLOR,     {150,150,150}).      %%
 -define(TEXT_BACKGROUND_COLOR,   {255,255,255}).   %% white
 -define(FRAME_BORDER_COLOR,      {0,0,0}).         %% black border
--define(TEXT_COLOR,              {0,0,0,0}).       %% black text
--define(TEXT_HIGHLIGHT_COLOR,    {0,255,255,255}). %% white hight light
+-define(TEXT_COLOR,              ?TEXT_BLACK).       %% black text
+-define(TEXT_HIGHLIGHT_COLOR,    ?TEXT_WHITE). %% white hight light
 -define(HIGHLIGHT_COLOR1,   {215,48,39}).
 -define(HIGHLIGHT_COLOR2,  {240,101,14}).
 -define(HIGHLIGHT_COLOR3,  {176,122,78}).
@@ -104,6 +116,10 @@
 
 -define(FONT_NAME, "Courier New").
 -define(FONT_SIZE, 14).
+
+-define(TOP_FONT_NAME, "Arial").
+-define(TOP_FONT_SIZE, 12).
+
 
 %% profile with default values
 -record(profile,
@@ -148,10 +164,10 @@
 	 row = 0 :: integer(),   %% row position in layout (0=first)
 	 width :: non_neg_integer(),
 	 height :: non_neg_integer(),
-	 hidden = false :: boolean(),
+	 %% hidden = false :: boolean(),
 	 type = unsigned :: unsigned | signed | undefined |
 			    {enum,tuple()} | {string,string()},
-	 field = none :: none | id | len | data | frequency | hide,
+	 field = none :: none | id | len | data | frequency | select,
 	 base = 16 :: 0 | 2 | 8 | 16 | 10,
 	 signed = false :: boolean(),
 	 ci = 1 :: 1..13,               %% color index in cell_color(I)
@@ -194,6 +210,15 @@
 -define(DEFAULT_BITRATES, [125000, 250000, 500000, 1000000]).
 -define(DEFAULT_DATARATES, [500000, 1000000, 5000000, 10000000]).
 
+-define(DEFAULT_SAMPLE_POINT, undefined).  %% driver default value
+-define(MIN_SAMPLE_POINT, 500).
+-define(MAX_SAMPLE_POINT, 900).
+-define(SAMPLE_POINT_STEP, 5).
+
+-define(DEFAULT_DATA_SAMPLE_POINT, undefined).  %% driver default value
+-define(MIN_DATA_SAMPLE_POINT, 500).
+-define(MAX_DATA_SAMPLE_POINT, 900).
+
 -define(WIDTH, 640).
 -define(HEIGHT, 480).
 
@@ -222,6 +247,8 @@
 	 bitrates = ?DEFAULT_BITRATES,
 	 datarate = undefined,
 	 datarates =  ?DEFAULT_DATARATES,
+	 sample_point = undefined,        %% in percent (integer 50..90)
+	 data_sample_point = undefined,   %% in percent (integer 50..90)
 	 conf_bitrates = ?DEFAULT_BITRATES,
 	 conf_datarates = ?DEFAULT_DATARATES,
 	 pidmode = off,  %% off|pid24
@@ -233,10 +260,14 @@
 	 if_can :: #if_can{},
 	 nrows = 30 :: integer(),     %% number or rows shown
 	 font   :: epx:epx_font(),
-	 %%
 	 glyph_width,
 	 glyph_height,
 	 glyph_ascent,
+	 %%
+	 top_font   :: epx:epx_font(),
+	 top_glyph_width,
+	 top_glyph_height,
+	 top_glyph_ascent,
 	 %%
 	 frame,          %% ets: {framekey(),#frame{}}
 	 frame_diff,     %% ets: {framekey(),[BitOffset]}
@@ -248,8 +279,7 @@
 	 menu_profile,
 	 color_profile = #color{} :: #color{},
 	 help_menu,
-	 row_height = 0,
-	 hide :: epx:epx_pixmap()
+	 row_height = 0
 	}).
 
 %% dynamic state elements
@@ -268,7 +298,9 @@
 	 help = false :: boolean(),
 	 active = #{} :: #{ framekey() => #layout{}},
 	 hidden = #{} :: #{ framekey() => #layout{}},
-	 active_order = [] :: [ Key::framekey() ]  %% current display order
+	 active_order = [] :: [ Key::framekey() ],  %% current display order
+	 frame_count  :: integer(),  %% previous frame count
+	 frame_time   :: integer()   %% previous frame time
 	}).
 -type state() :: {#s{},#d{}}.
 
@@ -414,11 +446,9 @@ help_menu() ->
      {"Ungroup 4-bit",     "4"},
      {"Ungroup 8-bit",     "8"},
      {"---"},     
-
+     {"Binay",             "B"},
      {"Hexadecimal",       "X"},
      {"Decimal",           "D"},
-     {"Binay",             "B"},
-     {"Octal",             "O"},
      {"Color",             "C"},
      {"---"},
      %% 
@@ -431,6 +461,7 @@ help_menu() ->
      {"Undelete",          "U"},
      {"Filter selected",   "F"},
      {"Clear",             "Ctrl+K"},
+     {"Delete",            "Delete"},  %% or backspace?
      {"---"},
      {"Toggle Listen mode", "Ctrl+L"},
      {"Toggle FD mode",     "Ctrl+F"},
@@ -452,8 +483,13 @@ help_menu() ->
 %%
 %%   Alt+up         next bitrate
 %%   Alt+down       prev bitrate
+%%   Shift+Alt+up   next sample point + 5  [500..900]
+%%   Shift+Alt+down prev sample point - 5  [500..900]
+%%
 %%   Ctrl+up        next datarate
 %%   Ctrl+down      prev datarate
+%%   Shift+Ctrl+up  next data sample point + 5  [500...900]
+%%   Shift+Ctrl+down prev data sample point - 5 [500...900]
 %%
 
 %%--------------------------------------------------------------------
@@ -487,7 +523,7 @@ start_it(Options0, Start) ->
 		{screen_color, ?SCREEN_COLOR},
 		{left_bar, 0},
 		{right_bar, 0},
-		{top_bar, 20},
+		{top_bar, 28},
 		{width,  ?WIDTH},
 		{height, ?HEIGHT},
 		{view_width,?WIDTH},
@@ -526,7 +562,14 @@ init(Options) ->
     Env = proplists:get_value(profile, Options, []),
     FontName = proplists:get_value(font_name, Env, ?FONT_NAME),
     FontSize = proplists:get_value(font_size, Env, ?FONT_SIZE),
+    TopFontName = proplists:get_value(top_font_name, Env, ?TOP_FONT_NAME),
+    TopFontSize = proplists:get_value(top_font_size, Env, ?TOP_FONT_SIZE),
     {ok,Font} = epx_font:match([{name,FontName},{size,FontSize}]),
+    {ok,TopFont} = epx_font:match([{name,TopFontName},{size,TopFontSize},
+				   {weight,bold}]),
+    epx_gc:set_font(TopFont),
+    {TW,TH}  = epx_font:dimension(TopFont,"0"),
+
     epx_gc:set_font(Font),
     {W,H}  = epx_font:dimension(Font,"0"),
 
@@ -550,12 +593,16 @@ init(Options) ->
     {IF,
      [{listen_only,LISTEN},{fd,FD},
       {bitrate,BitRate0}, {bitrates, BitRates0},
-      {datarate,DataRate0}, {datarates, DataRates0}]} =
+      {datarate,DataRate0}, {datarates, DataRates0},
+      {sample_point,SamplePoint0},{data_sample_point,DataSamplePoint0}
+     ]} =
 	case get_can_if() of
 	    {ok,IFCan=#if_can{if_mod=Mod,if_pid=Pid}} when is_pid(Pid) ->
 		{IFCan, Mod:getopts(Pid, [listen_only, fd,
 					  bitrate, bitrates, 
-					  datarate, datarates])};
+					  datarate, datarates,
+					  sample_point,data_sample_point
+					 ])};
 	    {error,_} ->
 		{#if_can{if_mod=undefined,if_id=0,if_pid=undefined},
 		 [{listen_only, false},
@@ -563,13 +610,18 @@ init(Options) ->
 		  {bitrate, hd(Conf_BitRates)},
 		  {bitrates, Conf_BitRates},
 		  {datarate, undefined},
-		  {datarates, Conf_DataRates}]}
+		  {datarates, Conf_DataRates},
+		  {sample_point, undefined},
+		  {data_sample_point, undefined}
+		 ]}
 	end,
-    
     {BitRate, BitRates} = 
 	make_rates(BitRate0, BitRates0, Conf_BitRates),
     {DataRate, DataRates} = 
 	make_rates(DataRate0, DataRates0, Conf_DataRates),
+
+    SamplePoint = sample_point_to_percent(SamplePoint0),
+    DataSamplePoint = sample_point_to_percent(DataSamplePoint0),
 
     S1 = S0#s {
 	   app_name = AppName,
@@ -581,12 +633,21 @@ init(Options) ->
 	   datarates = DataRates,
 	   conf_bitrates = Conf_BitRates,
 	   conf_datarates = Conf_DataRates,
+	   sample_point = trim_sample_point(SamplePoint),
+	   data_sample_point = trim_data_sample_point(DataSamplePoint),
 	   pidmode = PidMode,
 	   if_can = IF,
+
 	   font   = Font,
 	   glyph_width  = W,
 	   glyph_height = H,
 	   glyph_ascent = epx:font_info(Font, ascent),
+
+	   top_font = TopFont,
+	   top_glyph_width = TW,
+	   top_glyph_height = TH,
+	   top_glyph_ascent = epx:font_info(TopFont, ascent),
+
 	   frame         = ets:new(frame, []),
 	   frame_diff    = ets:new(frame_diff, []),
 	   %% frame_layout  = ets:new(frame_layout, []),
@@ -597,12 +658,16 @@ init(Options) ->
 	   menu_profile  = MProfile,
 	   color_profile = CProfile,
 	   help_menu     = HelpMenu,
-	   row_height    = RowHeight,
-	   hide = hide_pixels()
+	   row_height    = RowHeight
 	  },
 
+    ets:insert(S1#s.frame_counter, {all,0}),
+
     D1 = #d{ orig_screen_color = Profile#profile.screen_color,
-	     screen_color = Profile#profile.screen_color },
+	     screen_color = Profile#profile.screen_color,
+	     frame_count  = 0,
+	     frame_time   = erlang:system_time(millisecond)
+	   },
     State = {S1, D1},
     set_status(State),
     {ok, State}.
@@ -642,6 +707,17 @@ load_menu_profile(Profile) ->
        border_color     = Profile#profile.menu_border_color,
        border_width     = Profile#profile.menu_border_width
       }.
+
+trim_sample_point(Pt) when is_float(Pt) ->
+    max(min(Pt, ?MAX_SAMPLE_POINT), ?MIN_SAMPLE_POINT);
+trim_sample_point(_) ->
+    ?DEFAULT_SAMPLE_POINT.
+
+trim_data_sample_point(Pt) when is_float(Pt) ->
+    max(min(Pt, ?MAX_DATA_SAMPLE_POINT), ?MIN_DATA_SAMPLE_POINT);
+trim_data_sample_point(_) ->
+    ?DEFAULT_DATA_SAMPLE_POINT.
+	    
 
 load_color_profile(Profile) ->
     #color {
@@ -731,11 +807,156 @@ close(State={_S,_D}) ->
     erlang:halt(0),   %% temporary hack?
     State.
 
+%%
+%% Draw user content
+%%
 draw(Pixels, Area, State) ->
     ?verbose("DRAW: Area = ~p\n", [Area]),
     redraw_all(Pixels, Area, State),
     State.
 
+%%        +----+-----+       +----+-------+          +------+
+%%   Rate |250k|0.800| DRate | 2M | 0.875 | Frames/s |107.5k| Hz
+%%        +----+-----+       +----+-------+          +------+
+
+-record(tfield,
+	{
+	 label = "" :: string(),
+	 label_color = ?TEXT_BLACK,   %% black
+	 style = none :: none | rect,
+	 width = 0 :: integer(),
+	 border = 0 :: integer(),
+	 border_color = black,
+	 align = left :: left|center|right,
+	 format = "~s" :: string(),
+	 value = "" :: string() | integer() | float(),
+	 value_color = ?TEXT_WHITE,   %% white
+	 pad = $\s :: char() 
+	}).
+
+draw(top, Pixels, _Area, _State={S,D}) ->
+    Time1 = erlang:system_time(millisecond),
+    Count1 = ets:lookup_element(S#s.frame_counter, all, 2),
+    Time0  = D#d.frame_time,
+    Count0 = D#d.frame_count,
+    FrameRate = 
+	case Time1 - Time0 of
+	    0 -> 0.0;
+	    Td -> 1000*(Count1-Count0)/Td
+	end,
+    Fs = 
+	if is_integer(S#s.bitrate) ->
+		[#tfield{label="Rate",
+			 label_color=?TEXT_WHITE,
+			 style=rect,
+			 border=1,
+			 border_color=black,
+			 format=" ~-8s Hz",
+			 value=rate_to_list(S#s.bitrate)}];
+	   true ->
+		[]
+	end ++
+	if is_integer(S#s.sample_point) ->
+		[#tfield{label="",
+			 border=1,
+			 border_color=black,
+			 format="~.1f%",
+			 value=100*(S#s.sample_point / 1000)}];
+	   true ->
+		[]
+	end ++
+	if S#s.fd ->
+		if is_integer(S#s.datarate) ->
+			[#tfield{label="DataRate",
+				 label_color=?TEXT_WHITE,
+				 style=rect,
+				 border=1,
+				 border_color=black,
+				 format=" ~-8s Hz",
+				 value=rate_to_list(S#s.datarate)}];
+		   true ->
+			[]
+		end ++
+		if is_integer(S#s.data_sample_point) ->
+			[#tfield{label="",
+				 border=1,
+				 border_color=black,
+				 format="~.1f%",
+				 value=100*(S#s.data_sample_point/1000)}];
+		   true ->
+			[]
+		end;
+	   true ->
+		[]
+	end ++
+	[#tfield{label="FrameRate ",
+		 label_color=?TEXT_WHITE,
+		 format="~6.1f f/s",
+		 style=rect,
+		 value=FrameRate}],
+    epx_gc:set_font(S#s.top_font),
+    X0 = 4,
+    Y0 = 4,
+    draw_tfields(Pixels,X0,Y0,
+		 S#s.top_glyph_width,S#s.top_glyph_ascent,
+		 S#s.top_glyph_width,S#s.top_glyph_height,
+		 Fs),
+    D1 = D#d { frame_count = Count1, frame_time =Time1 },
+    State1 = {S, D1},
+    State1;
+draw(_Where, _Pixels, _Area, State) ->
+    State.
+
+draw_tfields(Pixels, X, Y, Xs, Ys, Cw, Ch,
+	     [T=#tfield{label=L,width=W,pad=P,format=F,value=V}|Fs]) ->
+    epx_gc:set_foreground_color(T#tfield.label_color),
+    {X1,_Y1} = epx:draw_string(Pixels,X,Y+Ys,L),
+    Value = if F =:= ""; F =:= undefined, is_list(V) ->
+		    V;
+	       true ->
+		    lists:flatten(io_lib:format(F,[V]))
+	    end,
+    N = if W =:= 0 -> 0;
+	   true -> W - length(Value)
+	end,
+    Value1
+	= if N > 0 -> %% pad right/left/center
+		  case T#tfield.align of
+		      left -> padl(N,P,Value);
+		      right -> padr(N,P,Value);
+		      center ->
+			  NL = N div 2,
+			  NR = N - NL,
+			  padl(NL,P,padr(NR,P,Value))
+		  end;
+	     N < 0 -> %% keep field width number of characters
+		  lists:sublist(Value, 1, W);
+	     true ->
+		  Value
+	  end,
+    epx_gc:set_foreground_color(T#tfield.value_color),
+    {X2,_Y2} = epx:draw_string(Pixels,X1,Y+Ys,Value1),
+    case T#tfield.style of
+	none -> 
+	    ok;
+	rect ->
+	    epx_gc:set_border_color(T#tfield.border_color),
+	    epx_gc:set_border_width(T#tfield.border),
+	    epx_gc:set_fill_style(none),
+	    epx:draw_rectangle(Pixels, X1-1, Y, (X2-X1)+2, Ch),
+	    epx_gc:set_border_width(0)
+    end,
+    draw_tfields(Pixels,X2+Xs,Y,Xs,Ys,Cw,Ch,Fs);
+draw_tfields(_Pixels,X,Y,_Xs,_Ys,_Cw,_Ch,[]) ->
+    {X,Y}.
+
+
+padl(0,_Char,Text) -> Text;
+padl(I,Char,Text) -> [Char|padl(I-1,Char,Text)].
+
+padr(N,Char,Text) -> 
+    Text++lists:duplicate(N,Char).
+    
 
 menu({menu,_Pos}, State={S,D}) ->
     if D#d.help ->
@@ -761,23 +982,8 @@ make_rate_menu(S) ->
 		Mod:getopts(Pid, [fd,
 				  bitrate, bitrates, 
 				  datarate, datarates]),
-	    {BitRate1,BitRates1} = 
-		make_rates(BitRate, BitRates0, S#s.conf_bitrates),
-	    {DataRate1,DataRates1} = 
-		make_rates(DataRate, DataRates0, S#s.conf_datarates),
-
-	    [{rate_to_list(R,BitRate1), "Alt+"++ integer_to_list(I,16)} ||
-		{R,I} <- lists:zip(BitRates1,
-				   lists:seq(1, length(BitRates1)))] ++
-		if FD ->
-			[{"---"}] ++
-			    [{rate_to_list(R,DataRate1), "Ctrl+"
-			      ++integer_to_list(I,16)} ||
-				{R,I} <- lists:zip(DataRates1, 
-						   lists:seq(1,
-							     length(DataRates1)))];
-		   true -> []
-		end;
+	    make_bit_rates(BitRate, BitRates0, S) ++
+	    make_data_rates(FD, DataRate, DataRates0, S);
 	_ ->
 	    [{" 125k",    "Alt+1"},
 	     {" 500k",    "Alt+2"},
@@ -785,6 +991,35 @@ make_rate_menu(S) ->
 	     {" 1M",      "Alt+4"}
 	    ]
     end.
+
+make_bit_rates(BitRate, BitRates0, S) ->
+    {BitRate1,BitRates1} = 
+	make_rates(BitRate, BitRates0, S#s.conf_bitrates),
+    [{rate_to_list(R,BitRate1), "Alt+"++ integer_to_list(I,16)} ||
+	{R,I} <- lists:zip(BitRates1,
+			   lists:seq(1, length(BitRates1)))].
+
+make_data_rates(true, DataRate, DataRates0, S) ->
+    case make_rates(DataRate, DataRates0, S#s.conf_datarates) of
+	{_, []} ->
+	    [];
+	{DataRate1,DataRates1} ->
+	    [{"---"}] ++
+		[{rate_to_list(R,DataRate1), "Ctrl+"
+		  ++integer_to_list(I,16)} ||
+		    {R,I} <- lists:zip(DataRates1, 
+				       lists:seq(1,
+						 length(DataRates1)))]
+    end;
+make_data_rates(false, _DataRate, _DataRates0, _S) ->
+    [].
+
+
+rate_and_sample_point_to_list(Rate, undefined) ->
+    rate_to_list(Rate);    
+rate_and_sample_point_to_list(Rate, SamplePoint) ->
+    rate_to_list(Rate)++[$@ | percent_to_list(SamplePoint)].
+
 
 rate_to_list(Rate) ->
     if Rate >= 1000000 ->
@@ -816,9 +1051,9 @@ rate_to_list(Rate,CurrentRate) ->
 	    " " ++ rate_to_list(Rate)
     end.
 
-select({_Phase,Rect}, {S,D}) ->
+select({_Phase, Rect}, {S,D}) ->
     ?verbose("SELECT: ~w\n", [Rect]),
-    {S, D#d { selection = Rect }}.
+    {S, D#d { selection = Rect} }.
 
 motion(_Event={motion,_Button,_Pos}, State) ->
     ?verbose("MOTION: ~w\n", [_Event]),
@@ -826,10 +1061,9 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 
 %%
 %% Commands on Selected elements:
+%%   B              Binary format
 %%   X              Hexadecimal format
 %%   D              Decimal format
-%%   B              Binary format
-%%   O              Octal format
 %%   C              Color format
 %%   --
 %%   G              Group selected bits
@@ -850,11 +1084,12 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   A              Start/Stop auto detect
 %%   T              Select detected frames and filter out frames with no diff.
 %%   F              Filter selected + set filter mode
-%%   U              Undelete hide frames + unset filter mode
+%%   U              Undelete frames + unset filter mode
 %%   
 %% Global commands
 %%   SPACE          Pause can frame reception / (drop frames)
 %%   TAB            Auto key, detect frames the falls during key press
+%%   Delete         Remove selected frames
 %%   Q              Quit application
 %%   R              Refresh screen
 %%   Ctrl+K	    Clear/Kill all frames
@@ -873,13 +1108,17 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%
 command(Key, Mod, State={_,D}) ->
     ?verbose("COMMAND: key=~p, mod=~p\n", [Key, Mod]),
-    case command(Key, D#d.selected, Mod, State) of
+    try command(Key, D#d.selected, Mod, State) of
 	Reply = {reply, _SymMod, _State1} ->
 	    Reply;
 	State1 ->
 	    {noreply, State1}
+    catch
+	error:Reason:Stack ->
+	    io:format("command: ~p\ncrash ~p\n~p\n", 
+		      [Key, Reason, Stack]),
+	    {stop, Reason, State}
     end.
-
 
 command($r, _Selected, _Mod, State) ->
     epxw:invalidate(),
@@ -933,28 +1172,33 @@ command($q, _Selected, Mod, State) when Mod#keymod.ctrl ->
     erlang:halt(0),
     State;
 
-command(I, _Selected, Mod, State) when Mod#keymod.alt, I >= $1, I =< $9 ->
-    bitrate_select(I-$0, State);
-command(I, _Selected, Mod, State) when Mod#keymod.alt, I >= $a, I =< $e ->
-    bitrate_select((I-$a)+10, State);
-command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $1, I =< $9 ->
-    datarate_select(I-$0, State);
-command(I, _Selected, Mod, State) when Mod#keymod.ctrl, I >= $a, I =< $e ->
-    datarate_select((I-$a)+10, State);
 command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
     Keys = lists:usort([Key || {Key,_} <- Selected]),
     lists:foldl(fun(Key,Si) -> split_fid(Key, Selected, I-$0, Si) end, 
 		State, Keys);
+
+command(up, _Selected, Mod, State) when Mod#keymod.shift,Mod#keymod.alt ->
+    command_sample_point_next(State);
+command(down, _Selected, Mod, State) when Mod#keymod.shift,Mod#keymod.alt ->
+    command_sample_point_prev(State);
+
 command(up, _Selected, Mod, State) when Mod#keymod.alt ->
-    bitrate_prev(State);
+    command_bitrate_prev(State);
 command(down, _Selected, Mod, State) when Mod#keymod.alt ->
-    bitrate_next(State);
+    command_bitrate_next(State);
+
+command(up, _Selected, Mod, State) when Mod#keymod.shift,Mod#keymod.ctrl ->
+    command_data_sample_point_next(State);
+command(down, _Selected, Mod, State) when Mod#keymod.shift,Mod#keymod.ctrl ->
+    command_data_sample_point_prev(State);
+
 command(up, _Selected, Mod, State) when Mod#keymod.ctrl ->
-    datarate_prev(State);
+    command_datarate_prev(State);
 command(down, _Selected, Mod, State) when Mod#keymod.ctrl ->
-    datarate_next(State);
+    command_datarate_next(State);
+
 command($l, _Selected, Mod, State) when Mod#keymod.ctrl ->
-    toggle_listen_only(State);
+    command_toggle_listen_only(State);
 command($f, _Selected, Mod, State) when Mod#keymod.ctrl ->
     toggle_fd(State);
 command($a, _Selected, _Mod, _State = {S,D}) ->
@@ -1009,28 +1253,22 @@ command($t, _Selected, _Mod, State={S,_}) ->
     epxw:invalidate(),
     {S1,D1#d{ selected = Selected }};
 
-command($f, Selected, _Mod, State) ->
-    %% "delete" all frames but the selected frames clean up layout
-    Ls =
-	fold_layout(
-	  fun(L,Acc) ->
-		  Key = L#layout.key,
-		  case lists:keyfind(Key, 1, Selected) of
-		      {_,Sel} ->
-			  [{select,Key,Sel}|Acc];
-		      false -> 
-			  [{delete,Key}|Acc]
-		  end
-	  end, [], State),
-    {Selected1,{S1,D1}} = clear_and_select(Ls,[],State),
-    State2 = {S1#s{ canfilter = true },
-	      D1#d{ selected = Selected1 }},
-    set_status(State2),
-    epxw:invalidate(),
-    State2;
+command($f, Selected, Mod, State) ->
+    command_filter(Selected, Mod, State);
+
+command(delete, Selected, Mod, State) ->
+    command_delete(Selected, Mod, State);
+
 command($\s, _Selected, _Mod, {S,D}) ->
     Pause = not S#s.pause,
-    State1 = {S#s { pause = Pause }, D},
+    D1 = if not Pause ->
+		 ets:insert(S#s.frame_counter, {all,0}),
+		 D#d { frame_count = 0, 
+		       frame_time = erlang:system_time(millisecond) };
+	    true ->
+		 D
+	 end,
+    State1 = {S#s { pause = Pause }, D1},
     set_status(State1),
     epxw:invalidate(),
     State1;
@@ -1066,6 +1304,44 @@ set_order_([Key|Keys], Y, Acc, S, D) ->
     set_order_(Keys, Y+L#layout.height+?LAYOUT_Y_PAD, [{Key,L1}|Acc], S, D);
 set_order_([], _Y, Acc, S, D) ->
     {S, D#d { active = maps:from_list(Acc) }}.
+
+%% "delete" all selected frames
+command_delete(Selected, _Mod, State) ->
+    Ls =
+	fold_layout(
+	  fun(L,Acc) ->
+		  Key = L#layout.key,
+		  case lists:member({Key,1}, Selected) of
+		      true ->
+			  [{delete,Key}|Acc];
+		      false -> 
+			  Acc
+		  end
+	  end, [], State),
+    {Selected1,{S1,D1}} = clear(Ls,[],State),
+    State1 = {S1#s{ canfilter = false}, D1#d{ selected = Selected1 }},
+    set_status(State1),
+    epxw:invalidate(),
+    State1.
+
+%% filter "keep" selected frames
+command_filter(Selected, _Mod, State) ->
+    Ls =
+	fold_layout(
+	  fun(L,Acc) ->
+		  Key = L#layout.key,
+		  case lists:keyfind(Key, 1, Selected) of
+		      false -> 
+			  [{delete,Key}|Acc];
+		      _ ->
+			  Acc
+		  end
+	  end, [], State),
+    {_Selected1,{S1,D1}} = clear(Ls,[],State),
+    State1 = {S1#s{ canfilter = true}, D1#d{ selected = Selected }},
+    set_status(State1),
+    epxw:invalidate(),
+    State1.
 
 %%
 %% Command Ctrl-S save candy file
@@ -1336,6 +1612,11 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		    make_rates(maps:get(datarate, IfParam),
 			       maps:get(datarates, IfParam),
 			       S#s.conf_datarates),
+		SamplePoint0 = maps:get(sample_point, IfParam),
+		DataSamplePoint0 = maps:get(data_sample_point, IfParam),
+		SamplePoint = sample_point_to_percent(SamplePoint0),
+		DataSamplePoint = sample_point_to_percent(DataSamplePoint0),
+
 		Mod = maps:get(mod, IfParam),
 		Pid = maps:get(pid, IfParam),
 		IFCan = #if_can{if_mod=Mod, if_id = ID, if_pid=Pid},
@@ -1347,7 +1628,10 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		      bitrate=BitRate, 
 		      bitrates=BitRates,
 		      datarate=DataRate,
-		      datarates=DataRates };
+		      datarates=DataRates,
+		      sample_point = SamplePoint,
+		      data_sample_point = DataSamplePoint
+		    };
 	   true ->
 		S
 	end,
@@ -1483,6 +1767,7 @@ process_frames([#frame{id=FID}|Fs], {S,D},
 process_frames([Frame=#frame{id=FID,pid=PID}|Fs], State={S,D},
 		   Redraw, RedrawSet) ->
     %% filter out extra flags err/fd ...
+    ets:update_counter(S#s.frame_counter, all, 1),
     Key = framekey(FID,PID),
     case ets:lookup(S#s.frame, Key) of
 	[{_,Frame}] -> %% no change
@@ -1632,7 +1917,7 @@ clear_and_select(Ls, Sel, St) ->
 %% clear delete marked layouts
 clear([{delete,Key}|Ls],Acc,St0) ->
     L = lookup_layout(Key, St0),
-    St1 = clear_layout(L, St0),
+    St1 = remove_layout(L, St0),
     clear(Ls,Acc,St1);
 clear([A={select,_Key,_Bs}|Ls],Acc,St0) ->
     clear(Ls, [A|Acc], St0);
@@ -1674,20 +1959,14 @@ cell_hit(Xy, Layout, State={S,D}) ->
     case IFmt  of
 	false ->
 	    deselect(State, []);
-	{_I, Fmt} when Fmt#fmt.field =:= hide ->
-	    St1 = remove_layout(Layout, State),
-	    {Vx,Vy,Vw,Vh} = view_rect(St1),
-	    epxw:set_view_size(max(0,Vx+Vw-1), max(0,Vy+Vh-1)),
-	    epxw:invalidate(),
-	    St1;
 	{I, _Fmt} ->
 	    Mod = epxw:keymod(),
-	    if Mod#keymod.shift ->  
+	    if Mod#keymod.shift -> 
 		    %% add to or remove from selection
 		    Key = Layout#layout.key,
 		    Selected = 
-			case lists:member({Key,I}, D#d.selected) of
-			    true -> 
+			case is_selected({Key,I}, State) of
+			    true ->
 				lists:delete({Key,I},D#d.selected);
 			    false ->
 				[{Key,I} | D#d.selected]
@@ -1701,51 +1980,69 @@ cell_hit(Xy, Layout, State={S,D}) ->
 	    end
     end.
 
-bitrate_next(State0={S,D}) when S#s.if_state =:= up ->
-    I = bitrate_index(State0)-1,
+%% is_key_selected(Key, {_S,D}) ->
+%%    lists:keymember(Key, 1, D#d.selected).
+
+is_selected(KI={_Key,_I}, {_S,D}) ->
+    lists:member(KI, D#d.selected).
+
+command_sample_point_next(State={S,_D}) when  S#s.if_state =:= up ->
+    SamplePoint = if S#s.sample_point =:= undefined ->
+			  ?MIN_SAMPLE_POINT;
+		      true ->
+			  S#s.sample_point + ?SAMPLE_POINT_STEP
+		  end,
+    SamplePoint1 = if SamplePoint > ?MAX_SAMPLE_POINT ->
+			   ?MAX_SAMPLE_POINT;
+		      true ->
+			   SamplePoint
+		   end,
+    command_bitrate(S#s.bitrate, SamplePoint1, State).
+
+command_sample_point_prev(State={S,_D}) when  S#s.if_state =:= up ->
+    SamplePoint = if S#s.sample_point =:= undefined ->
+			  undefined;
+		      true ->
+			  S#s.sample_point - ?SAMPLE_POINT_STEP
+		  end,
+    SamplePoint1 = if SamplePoint < ?MIN_SAMPLE_POINT ->
+			   undefined;
+		      true ->
+			   SamplePoint
+		   end,
+    command_bitrate(S#s.bitrate, SamplePoint1, State).
+    
+command_bitrate_next(State={S,_D}) when S#s.if_state =:= up ->
+    I = bitrate_index(State)-1,
     BitRates = S#s.bitrates,
     N = length(BitRates),
     J = ((I+1) rem N) + 1,
     Rate = lists:nth(J, BitRates),
-    setopts(S#s.if_can, [{bitrate, Rate}]),
-    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
-    State = {S#s { bitrate = Rate1 }, D},
-    set_status(State),
-    epxw:invalidate(),
-    State;
-bitrate_next(State) ->
+    command_bitrate(Rate, S#s.sample_point, State);
+command_bitrate_next(State) ->
     State.
 
-
-bitrate_prev(State0={S,D}) when S#s.if_state =:= up ->
-    I = bitrate_index(State0)-1,
+command_bitrate_prev(State={S,_D}) when S#s.if_state =:= up ->
+    I = bitrate_index(State)-1,
     BitRates = S#s.bitrates,
     N = length(BitRates),
     J = ((I+(N-1)) rem N) + 1,
     Rate = lists:nth(J, BitRates),
-    setopts(S#s.if_can, [{bitrate, Rate}]),
-    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
-    State = {S#s { bitrate = Rate1 }, D},
-    set_status(State),
-    epxw:invalidate(),
-    State;
-bitrate_prev(State) ->
+    command_bitrate(Rate, S#s.sample_point, State);
+command_bitrate_prev(State) ->
     State.
 
-bitrate_select(I, _State0={S,D}) when S#s.if_state =:= up ->
-    BitRates = S#s.bitrates,
-    N = length(BitRates),
-    J = ((I-1) rem N) + 1,
-    Rate = lists:nth(J, BitRates),
-    ?verbose("I=~w, J=~w, Rate=~w\n", [I,J,Rate]),
-    setopts(S#s.if_can, [{bitrate, Rate}]),
-    [{bitrate,Rate1}] = getopts(S#s.if_can, [bitrate]),
-    State = {S#s { bitrate = Rate1 }, D},
-    set_status(State),
+%% set bitrate and sample_point
+command_bitrate(BitRate, SamplePoint, _State={S,D}) ->
+    SamplePoint1 = percent_to_sample_point(SamplePoint),
+    setopts(S#s.if_can, [{bitrate, BitRate}, {sample_point,SamplePoint1}]),
+    [{bitrate,BitRate1},{sample_point,SamplePoint2}] =
+	getopts(S#s.if_can, [bitrate, sample_point]),
+    SamplePoint3 = sample_point_to_percent(SamplePoint2),
+    State1 = {S#s { bitrate = BitRate1, sample_point = SamplePoint3 }, D},
+    set_status(State1),
     epxw:invalidate(),
-    State;
-bitrate_select(_I, State) ->
-    State.
+    State1.
 
 
 bitrate_index({S,_D}) ->
@@ -1754,50 +2051,66 @@ bitrate_index({S,_D}) ->
        true -> index(S#s.bitrate, S#s.bitrates)
     end.
 
-datarate_next(State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
-    I = datarate_index(State0)-1,
+
+command_datarate_next(State={S,_D})  when S#s.if_state =:= up, S#s.fd ->
+    I = datarate_index(State)-1,
     DataRates = S#s.datarates,
     N = length(DataRates),
     J = ((I+1) rem N) + 1,
     Rate = lists:nth(J, DataRates),
-    setopts(S#s.if_can, [{datarate, Rate}]),
-    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
-    State = {S#s { datarate = Rate1 }, D},
-    set_status(State),
-    epxw:invalidate(),
-    State;
-datarate_next(State) ->
+    command_datarate(Rate, S#s.data_sample_point, State);
+command_datarate_next(State) ->
     State.
 
-datarate_prev(State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
-    I = datarate_index(State0)-1,
+command_datarate_prev(State={S,_D}) when S#s.if_state =:= up, S#s.fd ->
+    I = datarate_index(State)-1,
     DataRates = S#s.datarates,
     N = length(DataRates),
     J = ((I+(N-1)) rem N) + 1,
     Rate = lists:nth(J, DataRates),
-    setopts(S#s.if_can, [{datarate, Rate}]),
-    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
-    State = {S#s { datarate = Rate1 }, D},
-    set_status(State),
-    epxw:invalidate(),
-    State;
-datarate_prev(State) ->
+    command_datarate(Rate, S#s.data_sample_point, State);
+command_datarate_prev(State) ->
     State.
 
-datarate_select(I, _State0={S,D})  when S#s.if_state =:= up, S#s.fd ->
-    DataRates = S#s.datarates,
-    N = length(DataRates),
-    J = ((I-1) rem N) + 1,
-    Rate = lists:nth(J, DataRates),
-    ?verbose("I=~w, J=~w, Rate=~w\n", [I,J,Rate]),
-    setopts(S#s.if_can, [{datarate, Rate}]),
-    [{datarate,Rate1}] = getopts(S#s.if_can, [datarate]),
-    State = {S#s { datarate = Rate1 }, D},
-    set_status(State),
+command_data_sample_point_next(State={S,_D}) when  S#s.if_state =:= up ->
+    SamplePoint = if S#s.data_sample_point =:= undefined ->
+			  ?MIN_DATA_SAMPLE_POINT;
+		      true ->
+			  S#s.data_sample_point + ?SAMPLE_POINT_STEP
+		  end,
+    SamplePoint1 = if SamplePoint > ?MAX_SAMPLE_POINT ->
+			   ?MAX_SAMPLE_POINT;
+		      true ->
+			   SamplePoint
+		   end,
+    command_datarate(S#s.datarate, SamplePoint1, State).
+
+command_data_sample_point_prev(State={S,_D}) when  S#s.if_state =:= up ->
+    SamplePoint = if S#s.data_sample_point =:= undefined ->
+			  undefined;
+		      true ->
+			  S#s.data_sample_point - ?SAMPLE_POINT_STEP
+		  end,
+    SamplePoint1 = if SamplePoint < ?MIN_SAMPLE_POINT ->
+			   undefined;
+		      true ->
+			   SamplePoint
+		   end,
+    command_datarate(S#s.datarate, SamplePoint1, State).
+
+%% set bitrate and sample_point
+command_datarate(DataRate, SamplePoint, _State={S,D}) ->
+    SamplePoint1 = percent_to_sample_point(SamplePoint),
+    _R = setopts(S#s.if_can, [{datarate,DataRate},
+			      {data_sample_point,SamplePoint1}]),
+    R1 = getopts(S#s.if_can, [datarate, data_sample_point]),
+    [{datarate,DataRate1},{data_sample_point,SamplePoint2}] = R1,
+    SamplePoint3 = sample_point_to_percent(SamplePoint2),
+    State1 = {S#s { datarate = DataRate1,data_sample_point=SamplePoint3}, D},
+    set_status(State1),
     epxw:invalidate(),
-    State;
-datarate_select(_I, State) ->
-    State.
+    State1.
+
 
 datarate_index({S,_D}) ->
     if S#s.datarate =:= undefined, S#s.datarates =:= [] -> 0;
@@ -1805,14 +2118,13 @@ datarate_index({S,_D}) ->
        true -> index(S#s.datarate, S#s.datarates)
     end.
 
-
 index(E, L) -> index_(E, L, 1).
 index_(E, [E|_], I) -> I;
 index_(E, [_|L], I) -> index_(E, L, I+1);
 index_(_E, [], _) ->  0.
 
 %% toggle Listen-Only
-toggle_listen_only({S,D}) ->
+command_toggle_listen_only({S,D}) ->
     Listen1 =
 	if S#s.listen_only =:= undefined -> undefined;
 	   S#s.listen_only =:= true -> false;
@@ -2044,7 +2356,7 @@ move_restart(State) ->
 
 default_format(IDFmt) ->
     {
-     #fmt { field=hide, type=undefined },
+     #fmt { field=select, type=undefined },  %% must be position 1
      IDFmt,
      #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
      #fmt { field=id,base=0,type={enum,{"-","F"}},bits=[{0,1}]},
@@ -2064,7 +2376,7 @@ default_format(IDFmt) ->
 
 default_fd_format(IDFmt,undefined) ->
     {
-     #fmt { field=hide, type=undefined },
+     #fmt { field=select, type=undefined },  %% must be position 1
      IDFmt,
      #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
      #fmt { field=id,   base=0,type={enum,{"-","F"}},bits=[{0,1}]},
@@ -2104,7 +2416,7 @@ default_fd_format(IDFmt,undefined) ->
     };
 default_fd_format(IDFmt,PIDFmt) ->
     {
-     #fmt { field=hide, type=undefined },
+     #fmt { field=select, type=undefined },  %% must be position 1
      IDFmt,
      PIDFmt,
      #fmt { field=frequency,base=10,type={float,5,1},bits=[]},
@@ -2215,8 +2527,9 @@ redraw_anim_(Pixels,Area,Iter={Key,Pos}, Remove, Update, State={S,_}) ->
 redraw_anim_(_Pixels,_Area,'$end_of_table', Remove, Update, _State) ->
     {Remove, Update}.
 
+
 %% +-----------+---------------+----------------+
-%% | Link: up  | BitRate: 250k | Status: busoff |
+%% | Link: up  | Flags: Flags  | Status: busoff |
 %% +-----------+---------------+----------------+
 set_status(_State={S,_D}) ->
     LinkState = if S#s.pause ->
@@ -2227,18 +2540,6 @@ set_status(_State={S,_D}) ->
 			    down -> "Link: down"
 			end
 		end,
-    LinkBitRate =
-	case S#s.bitrate of
-	    error ->   "Rate: error";
-	    undefined ->   "Rate: undef";
-	    BitRate -> "Rate: " ++ 
-			   rate_to_list(BitRate) ++
-			   if S#s.fd, is_integer(S#s.datarate) ->
-				   "/"++rate_to_list(S#s.datarate);
-			      true ->
-				   ""
-			   end
-	end,
     LinkFlags =
 	"Flags: " ++ 
 	lists:join(",", 
@@ -2265,8 +2566,8 @@ set_status(_State={S,_D}) ->
 	    [] -> "State: ok";
 	    Es -> "State: "++ format_error(Es)
 	end,
-    Status = io_lib:format("~-12s ~-16s ~-16s ~-20s", 
-			   [LinkState,LinkFlags,LinkBitRate,LinkError]),
+    Status = io_lib:format("~-12s ~-20s ~-15s", 
+			   [LinkState,LinkFlags,LinkError]),
     epxw:set_status_text(Status),
 
     AppName = S#s.app_name,
@@ -2280,6 +2581,29 @@ set_status(_State={S,_D}) ->
 		  end,
     Window = epxw:window(),
     epx:window_adjust(Window, [{name, WindowTitle}]).
+
+sample_point_to_percent(Pt) when is_float(Pt), Pt > 0.0, Pt =< 9.999 ->
+    round(1000 * max(0.0, min(Pt, 0.999)));
+sample_point_to_percent(undefined) ->
+    undefined.
+
+percent_to_sample_point(P) when is_integer(P), P > 0, P < 1000 ->
+    P / 1000;
+percent_to_sample_point(undefined) ->
+    undefined.
+
+percent_to_list(undefined) ->
+    "";
+percent_to_list(Pt) when is_integer(Pt), Pt >= 0, Pt < 1000 ->
+    case integer_to_list(1000 + Pt) of
+	[_,$0,B,$0] -> [B,$%];
+	[_,$0,B,C] -> [B,$.,C,$%];
+	[_,A,B,$0] -> [A,B,$%];
+	[_,A,B,C] -> [A,B,$.,C,$%]
+    end.
+
+%% float01_to_list(F) when is_float(F), F >= 0.0, F =< 1.0 ->
+%%    [$0,$.|integer_to_list(round(F * 1000))].
 
 format_error(ErrorList) ->
     string:join([atom_to_list(E) || E <- ErrorList], ",").
@@ -2345,33 +2669,18 @@ move_step_(HTab, Key, N) ->
 move_step__(HTab, Key) ->
     case ets:lookup(HTab, Key) of
 	[{_,Value,Step}] when Value > 0 ->
-	    Value1 = Value - Step,
-	    if Value1 =< 0 -> 
-		    ets:delete(HTab, Key), 
-		    false;
-	       true ->
-		    ets:insert(HTab, {Key,Value1,Step}),
-		    true
-	    end;
+	    Value1 = max(0, Value - Step),
+	    ets:insert(HTab, {Key,Value1,Step});
 	[{_,Value,Step}] when Value < 0 ->
-	    Value1 = Value + Step,
-	    if Value1 >= 0 -> 
-		    ets:delete(HTab, Key), 
-		    false;
-	       true ->
-		    ets:insert(HTab, {Key,Value1,Step}),
-		    true
-	    end
+	    Value1 = min(0, Value + Step),
+	    ets:insert(HTab, {Key,Value1,Step}),
+	    true;
+	[{_,_Value,_Step}] ->
+	    ets:delete(HTab, Key),
+	    false
     end.
 
-%%
-%% dy1 = (Y1 - (Y0 + dy0)) = 
-%%  (Y1 - Y0) - dy0
-%%
-%% Dy = (Y1 - Y0) = dy1 + dy0
-%% dy1 = Dy - dy0
-%% 
-
+%% update move animation delta
 move_update(Key, Dy, _State={S,_D}) when Dy /= 0 ->
     N = ?MOVE_TIME_MS div ?MOVE_INTERVAL,
     T = case ets:lookup(S#s.frame_move, Key) of
@@ -2379,7 +2688,7 @@ move_update(Key, Dy, _State={S,_D}) when Dy /= 0 ->
 		Step = abs(Dy/N),
 		{Key, Dy, Step};
 	    [{_,Dy0,_}] ->
-		Dy1 = Dy-Dy0,
+		Dy1 = Dy0+Dy,
 		Step = abs(Dy1/N),
 		{Key,Dy1,Step}
 	end,
@@ -2405,15 +2714,18 @@ layout_dy(Key, _State={S,_D}) ->
 	[{_,Dy,_}] -> Dy
     end.
 
+layout_y(L, State) ->
+    L#layout.y + layout_dy(L#layout.key, State).
+
 redraw_layout_(Pixels, Layout, State={S,_D}) ->
     #layout{ key=Key, color=Color,format=FmtTuple} = Layout,
-    Dy = layout_dy(Key, State),
-    draw_layout_background(Pixels, Layout, Layout#layout.color, Dy),
+    draw_layout_background(Pixels, Layout, Layout#layout.color, State),
     [{_,Frame}] = ets:lookup(S#s.frame, Key),
 
-    ?verbose("redraw key=~p, dy=~p, rect=~p\n", 
-	     [Key, Dy, {Layout#layout.x,Layout#layout.y,
-			Layout#layout.width,Layout#layout.height}]),
+    ?verbose("redraw key=~p, rect=~p\n", 
+	     [Key, {Layout#layout.x,Layout#layout.y,
+		    Layout#layout.width,Layout#layout.height}]),
+    Dy = layout_dy(Key, State),
     redraw_cells(Pixels,
 		 Layout#layout.x,Layout#layout.y+Dy,
 		 Key,1,Color,FmtTuple,Frame,State).
@@ -2426,32 +2738,47 @@ redraw_cells(Pixels,Lx,Ly,Key,I,Color,FmtTuple,Frame,State) when
 redraw_cells(_Pixels,_Lx,_Ly,_Key,_I,_Color,_FmtTuple,_Frame,State) ->
     State.
 
+redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,_Frame,State={_S,_D}) when
+      Fmt#fmt.field =:= select ->
+    #fmt {x=Dx,y=Dy,width=W,height=H} = Fmt,
+    case is_selected({Key,I}, State) of
+	true ->
+	    epx_gc:set_fill_color(black),
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_border_width(0);
+	false ->
+	    epx_gc:set_fill_color(white),
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_border_color(black),
+	    epx_gc:set_border_width(1)
+    end,
+    X = Lx+Dx, Y = Ly+Dy,
+    epx:draw_ellipse(Pixels, X, Y+2, W-4, H-4),
+    epx_gc:set_fill_style(none),
+    epx_gc:set_border_width(0),
+    false;
 
-redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,Frame,State={S,D}) ->
+redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,Frame,State={S,_D}) ->
     #fmt {x=Dx,y=Dy,width=W,height=H,ci=Ci} = Fmt,
     Color = cell_color(Ci),
     X = Lx+Dx, Y = Ly+Dy,
     Anim = get_anim(Key,I,State),
     {Remove,TextColor} = highlight(Pixels,Anim,Color,{X,Y,W,H},State),
     BitsData = get_bits(Fmt, Frame),
-    %% draw shape
-    if Fmt#fmt.field =/= hide ->
-	    epx_gc:set_fill_style(none),
-	    epx_gc:set_foreground_color(Color#color.border),
-	    epx_gc:set_border_color(Color#color.border),
-	    epx_gc:set_border_style(inside),
-	    case lists:member({Key,I}, D#d.selected) of
-		true ->
-		    epx_gc:set_border_width(?FMT_SELECTED_BORDER_WIDTH);
-		_ ->
-		    epx_gc:set_border_width(?FMT_BORDER_WIDTH)
-	    end,
-	    epx:draw_rectangle(Pixels, {X,Y,W,H}),
-	    epxw:invalidate({X,Y,W,H}),
-	    epx_gc:set_border_width(0);
-       true ->
-	    ok
+    Selected = is_selected({Key,I}, State),
+    epx_gc:set_fill_style(none),
+    epx_gc:set_foreground_color(Color#color.border),
+    epx_gc:set_border_color(Color#color.border),
+    epx_gc:set_border_style(inside),
+    case Selected of
+	true ->
+	    epx_gc:set_border_width(?FMT_SELECTED_BORDER_WIDTH);
+	_ ->
+	    epx_gc:set_border_width(?FMT_BORDER_WIDTH)
     end,
+    epx:draw_rectangle(Pixels, {X,Y,W,H}),
+    epxw:invalidate({X,Y,W,H}),
+    epx_gc:set_border_width(0),
 
     %% draw base indicator, only for data fields
     if Fmt#fmt.field =:= data ->
@@ -2459,10 +2786,6 @@ redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,Frame,State={S,D}) ->
 		2  ->
 		    epx:pixmap_put_pixels(Pixels,
 					  X+1,Y+1,6,7,argb,bin_icon(),blend),
-		    epx:draw_rectangle(Pixels,{X,Y,8,9});
-		8  ->
-		    epx:pixmap_put_pixels(Pixels,
-					  X+1,Y+1,6,7,argb,oct_icon(),blend),
 		    epx:draw_rectangle(Pixels,{X,Y,8,9});
 		16 ->
 		    epx:pixmap_put_pixels(Pixels,
@@ -2508,10 +2831,7 @@ redraw_cell(Pixels,Lx,Ly,Key,I,_LayoutColor,Fmt,Frame,State={S,D}) ->
 	    Ya = Y+1+GA,
 	    Offs = 2,
 	    epx:draw_string(Pixels,X+Offs,Ya,String);
-	hide ->
-	    epx:pixmap_copy_area(S#s.hide, 
-				 Pixels,
-				 0, 0, X+2, Y+2, 16, 16, [blend]);
+
 	_ ->
 	    String = fmt_bits(Fmt#fmt.type, Fmt#fmt.base, BitsData),
 	    GA = glyph_ascent(S),
@@ -2556,11 +2876,11 @@ redraw_pos_(Pixels,Lx,Ly,Key,I,Color,FmtTuple,Frame,State) ->
 	       #color {
 		  layout_background = ?LAYOUT_BACKGROUND_COLOR,
 		  layout_border     = ?LAYOUT_BORDER_COLOR,
-		  background  = ?TEXT_BACKGROUND_COLOR,
-		  foreground  = ?TEXT_COLOR,               %% text color
-		  border      = ?FRAME_BORDER_COLOR,       %% frame border color
-		  background1  = H,
-		  foreground1  = ?TEXT_HIGHLIGHT_COLOR
+		  background        = ?TEXT_BACKGROUND_COLOR,
+		  foreground        = ?TEXT_COLOR,
+		  border            = ?FRAME_BORDER_COLOR,
+		  background1       = H,
+		  foreground1       = ?TEXT_HIGHLIGHT_COLOR
 		 }).
 
 cell_color(I) ->
@@ -2579,23 +2899,21 @@ cell_color(I) ->
 	      ?COLOR(?HIGHLIGHT_COLOR12),
 	      ?COLOR(?HIGHLIGHT_COLOR13)  }).
 
-
-draw_layout_background(Pixels, Layout, Color, Dy) ->
+draw_layout_background(Pixels, Layout, Color, State) ->
     draw_layout_rectangle(Pixels, Layout, 
 			  Color#color.layout_background,
 			  Color#color.layout_border,
-			  Dy, Layout#layout.width).
+			  Layout#layout.width, State).
 
 %% prepare layout by painting the layout background color
 clear_layout_background(Pixels, Layout, State={_S,D}) ->
     ScreenColor = D#d.screen_color,
     Color = Layout#layout.color,
     Border = Color#color.layout_border,
-    Dy = layout_dy(Layout#layout.key, State),
     draw_layout_rectangle(Pixels, Layout, ScreenColor, Border,
-			  Dy, epxw:width()).
+			  epxw:width(), State).
 
-draw_layout_rectangle(Pixels, Layout, Color, Border, Dy, Width) ->
+draw_layout_rectangle(Pixels, Layout, Color, Border, Width, State) ->
     epx_gc:set_fill_style(solid),
     epx_gc:set_fill_color(Color),
     BorderWidth = ?LAYOUT_BORDER_WIDTH,
@@ -2603,7 +2921,7 @@ draw_layout_rectangle(Pixels, Layout, Color, Border, Dy, Width) ->
     epx_gc:set_border_color(Border),
     
     X = Layout#layout.x,
-    Y = Layout#layout.y+Dy,
+    Y = Layout#layout.y+layout_dy(Layout#layout.key, State),
     W = Width,
     H = Layout#layout.height,
     %% epx:draw_rectangle(Pixels, {X,Y,W,H}).
@@ -2669,7 +2987,7 @@ get_bits(#fmt { type={string,NameBits} }, _Frame) ->
     NameBits;
 get_bits(#fmt { field=frequency }, _Frame) -> 
     <<>>;
-get_bits(#fmt { field=hide }, _Frame) -> 
+get_bits(#fmt { field=select }, _Frame) -> 
     <<>>;
 get_bits(Fmt, Frame) ->
     Data = case Fmt#fmt.field of
@@ -2712,7 +3030,7 @@ clear_layout(Layout, State) ->
 %% move hidden frame layouts hidden map
 remove_layout(Layout, State) ->
     #layout { height=H, y=Y } = Layout,
-    State1 = move_layout_up(Y, H, State),
+    State1 = move_layout_up(Y, H+?FMT_VERTICAL_PAD, State),
     State2 = clear_layout(Layout, State1),
     maybe_move_restart(State2).
 
@@ -2722,13 +3040,13 @@ maybe_move_restart(State={S,_D}) ->
 	_ -> move_restart(State)
     end.
 
-%% Move all layouts below layout at Pos with N rows
-%% upwards N steps
+%% Move all layouts below Y up by H pixels
 move_layout_up(Y, H, State={_S,_D}) ->
     %% first collect Frame layouts below Y
     Keys = fold_layout(
 	     fun(L, Acc) ->
-		     if L#layout.y > Y ->
+		     Y1 = L#layout.y, %% layout_y(L, State),
+		     if Y1 > Y ->
 			     [L#layout.key|Acc];
 			true ->
 			     Acc
@@ -2744,12 +3062,12 @@ move_layout_up(Y, H, State={_S,_D}) ->
       end, State, Keys).
 
 %% calculate new view rect
-view_rect(State) ->
-    fold_layout(fun(L1, Ri) ->
-			R = {L1#layout.x,L1#layout.y,
-			     L1#layout.width,L1#layout.height},
-			epx_rect:union(Ri, R)
-		end, {0,0,0,0}, State).
+%% view_rect(State) ->
+%%     fold_layout(fun(L1, Ri) ->
+%%			R = {L1#layout.x,L1#layout.y,
+%%			     L1#layout.width,L1#layout.height},
+%%			epx_rect:union(Ri, R)
+%%		end, {0,0,0,0}, State).
 
 next_xy({_S,D}) ->
     case D#d.active_order of
@@ -2861,9 +3179,6 @@ fmt_num(Base, Size, Number) ->
 hi_digit(2, Size) ->
     N = number_of_digits(2, Size),
     pow(2, N);
-hi_digit(8, Size) ->
-    N = number_of_digits(8, Size),
-    pow(8, N);
 hi_digit(16, Size) ->
     N = number_of_digits(16, Size),
     pow(16, N);
@@ -2933,7 +3248,11 @@ clear_frames(_State={S,D}) ->
     ets:delete_all_objects(S#s.frame_move),
     ets:delete_all_objects(S#s.frame_freq),
     ets:delete_all_objects(S#s.frame_counter),
-    {S, D#d{ active=#{}, hidden=#{}, active_order=[]}}.
+    ets:insert(S#s.frame_counter, {all,0}),
+    {S, D#d{ active=#{}, hidden=#{}, active_order=[],
+	     frame_count = 0,
+	     frame_time = erlang:system_time(millisecond)
+	   }}.
 
 %% FID maybe frame id or internal key (where fd/err is stripped)
 %% lookup_layout(Key,_State={S,_D}) ->
@@ -3074,17 +3393,6 @@ bin_icon() ->
       ?T,?T,?T,?T,?T,?T
     >>.
 
-oct_icon() ->
-    <<
-      ?T,?T,?T,?T,?T,?T,
-      ?T,?X,?X,?X,?X,?T,
-      ?T,?X,?T,?T,?X,?T,
-      ?T,?X,?X,?X,?X,?T,
-      ?T,?X,?T,?T,?X,?T,
-      ?T,?X,?X,?X,?X,?T,
-      ?T,?T,?T,?T,?T,?T
-    >>.
-
 hex_icon() ->
     <<
       ?T,?T,?T,?T,?T,?T,
@@ -3107,19 +3415,8 @@ dec_icon() ->
       ?T,?T,?T,?T,?T,?T
      >>.
 
-hide_pixels() ->
-    Pix = epx:pixmap_create(16, 16, argb),
-    epx:pixmap_fill(Pix, {255,255,255,255}),
-    epx_gc:set_fill_color(red),
-    epx_gc:set_fill_style(solid),
-    epx:draw_ellipse(Pix, {0,0,15,15}),
-    epx_gc:set_foreground_color(white),
-    epx:draw_line(Pix, {3,3}, {11,11}),
-    epx:draw_line(Pix, {11,3}, {3,11}),
-    Pix.
-
 %%
-%% GET and SET can bitrate on the can_usb backend
+%% GET and SET can bitrate on the can backend
 %%
 setopts(#if_can{if_mod=Mod,if_pid=Pid}, Opts) when is_pid(Pid), is_list(Opts) ->
     Mod:setopts(Pid, Opts);
@@ -3132,24 +3429,29 @@ getopts(_, Opts) ->
     [{Opt,undefined} || Opt <- Opts].
     
 get_can_if() ->
-    get_can_if_(can_router:interfaces()).
+    IFs = can_router:interfaces(),
+    get_can_if_(IFs).
 
 %% fixme export can_if from can_router!?
 get_can_if_(IFs) ->
     get_can_if_(IFs, undefined).
 
-get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
-	      _Param=#{mod:=can_usb},
-	      _Atime,_State} | _IFs], _Default) ->
+get_can_if_([#can_if { mod=can_usb,pid=IfPid,id=IfID, 
+		       state=up } | _IFs], _) ->
     {ok,#if_can{if_mod=can_usb,if_id=IfID,if_pid=IfPid}};
-get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
-	      _Param=#{mod:=can_sock},
-	      _Atime,_State} | _IFs], _Default) ->
+
+get_can_if_([#can_if { mod=can_sock,pid=IfPid,id=IfID,
+		       state=up } | _IFs], _) ->
     {ok,#if_can{if_mod=can_sock,if_id=IfID,if_pid=IfPid}};
-get_can_if_([{can_if,IfPid,IfID,_Name,_Mon,
-	      _Param=#{mod:=Mod},
-	      _Atime,_State}|IFs], undefined) ->
+
+get_can_if_([#can_if { mod=Mod,pid=IfPid,id=IfID,
+		       state=up } | IFs], _) ->
     get_can_if_(IFs, #if_can{if_mod=Mod,if_id=IfID,if_pid=IfPid});
+
+get_can_if_([#can_if{mod=Mod,pid=IfPid,id=IfID}|IFs], 
+	    undefined) ->
+    get_can_if_(IFs, #if_can{if_mod=Mod,if_id=IfID,if_pid=IfPid});
+
 get_can_if_([_|IFs], Default) ->
     get_can_if_(IFs, Default);
 get_can_if_([], undefined) ->
