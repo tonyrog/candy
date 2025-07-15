@@ -155,7 +155,7 @@
 -define(APPDSK, ?APPSTR++".desktop").
 
 -define(verbose(F,A), ok).
-%% -define(verbose(F,A), io:format((F),(A))).
+%% -define(verbose(F,A), io:format("candy: " F,(A))).
 
 -record(fmt,
 	{
@@ -220,7 +220,7 @@
 -define(MAX_DATA_SAMPLE_POINT, 900).
 
 -define(WIDTH, 640).
--define(HEIGHT, 480).
+-define(HEIGHT, 640).
 
 -record(frame,
 	{
@@ -1171,6 +1171,30 @@ command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
 command($q, _Selected, Mod, State) when Mod#keymod.ctrl ->
     erlang:halt(0),
     State;
+
+command(I, _Selected, Mod, State={S,_D}) when Mod#keymod.ctrl,I >= $1,I =< $8 ->
+    J = I-$0,
+    Rates = S#s.datarates,
+    N = length(Rates),
+    if not S#s.fd; J > N ->
+	    State;
+       true ->
+	    Rate = lists:nth(J, Rates),
+	    ?verbose("SET DATARATE=~w", [Rate]),
+	    command_datarate(Rate, S#s.data_sample_point, State)
+    end;
+
+command(I, _Selected, Mod, State={S,_D}) when Mod#keymod.alt,I >= $1,I =< $8 ->
+    J = I-$0,
+    Rates = S#s.bitrates,
+    N = length(Rates),
+    if J > N ->
+	    State;
+       true ->
+	    Rate = lists:nth(J, Rates),
+	    ?verbose("SET DATARATE=~w", [Rate]),
+	    command_bitrate(Rate, S#s.sample_point, State)
+    end;
 
 command(I, Selected, _Mod, State) when I >= $1, I =< $8 ->
     Keys = lists:usort([Key || {Key,_} <- Selected]),
