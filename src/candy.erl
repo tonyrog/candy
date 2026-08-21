@@ -29,7 +29,7 @@
 -export([start0/0]).  %% make app image target
 -export([start/0, start/1]).
 -export([status/0]).
--export([install/0, install_cmds/0]).
+-export([install/0, install_cmds/0, install_config/0]).
 
 %% debug
 -export([select_rate/2]).
@@ -119,7 +119,6 @@
 
 -define(TOP_FONT_NAME, "Arial").
 -define(TOP_FONT_SIZE, 12).
-
 
 %% profile with default values
 -record(profile,
@@ -270,7 +269,7 @@
 	 top_glyph_ascent,
 	 %%
 	 frame,          %% ets: {framekey(),#frame{}}
-	 frame_diff,     %% ets: {framekey(),[BitOffset]}
+	 frame_diff,     %% ets: {framekey(),[Cnt0,Cnt1,Cnt2]}
 	 frame_counter,  %% ets: {framekey(),Counter}
 	 frame_freq,     %% ets: {framekey(),Time,OldCounter,String}
 	 frame_anim,     %% ets: {{framekey(),FmtPos},Counter}
@@ -300,13 +299,16 @@
 	 hidden = #{} :: #{ framekey() => #layout{}},
 	 active_order = [] :: [ Key::framekey() ],  %% current display order
 	 frame_count  :: integer(),  %% previous frame count
-	 frame_time   :: integer()   %% previous frame time
+	 frame_time   :: integer(),  %% previous frame time
+	 stat_tmr  = undefined :: undefined | reference(),
+	 frame_rate :: float()
 	}).
 -type state() :: {#s{},#d{}}.
 
 -define(TICK_INTERVAL, 100).
 -define(MOVE_INTERVAL, 20).
 -define(MOVE_TIME_MS,  500).
+-define(STAT_INTERVAL, 2000).
 
 -define(AUTO_DETECT_INIT_INTERVAL, 3000).
 -define(AUTO_DETECT_HIGH_INTERVAL, 2000).
@@ -326,6 +328,7 @@ install() ->
     if APPIMAGE =:= undefined ->
 	    ok;    
        true ->
+	    install_config(),
 	    Home = os:getenv("HOME"),
 	    {ok,Vsn} = application:get_key(?APP, vsn),
 	    VsnNL = Vsn++"\n",
@@ -363,6 +366,22 @@ install_(Home,Vsn) ->
 	    log_commands(Dir,["# ADMIN0"|Admin0]),
 	    log_commands(Dir,["# ADMIN1"|Admin1]),
 	    ok
+    end.
+
+%% install $HOME/.candy/user.config file if it does
+%% not exist. default is just empty list
+install_config() ->
+    Home = os:getenv("HOME"),
+    UserConfigFile = filename:join([Home, ".candy", "user.config"]),
+    case filelib:is_regular(UserConfigFile) of
+	true ->
+	    ok;
+	false ->
+	    file:write_file(UserConfigFile, 
+			    "%% -*- erlang -*-\n"
+			    "%% override config for candy\n"
+			    "[\n"
+			    "].\n")
     end.
 
 install_cmds() ->
@@ -585,8 +604,8 @@ init(Options) ->
     AppName = proplists:get_value(title, Env, "Candy"),
     HelpMenu = epx_menu:create(MProfile, help_menu()),
 
-    Window = epxw:window(),
-    epx:window_enable_events(Window, no_auto_repeat),
+    %% Window = epxw:window(),
+    %% epx:window_enable_events(Window, no_auto_repeat),
 
     RowHeight = H + 2,
 
@@ -661,12 +680,15 @@ init(Options) ->
 	   row_height    = RowHeight
 	  },
 
+    TRef = erlang:start_timer(?STAT_INTERVAL, self(), stat),
     ets:insert(S1#s.frame_counter, {all,0}),
 
     D1 = #d{ orig_screen_color = Profile#profile.screen_color,
 	     screen_color = Profile#profile.screen_color,
 	     frame_count  = 0,
-	     frame_time   = erlang:system_time(millisecond)
+	     frame_time   = erlang:system_time(millisecond),
+	     frame_rate   = 0.0,
+	     stat_tmr = TRef
 	   },
     State = {S1, D1},
     set_status(State),
@@ -735,7 +757,11 @@ configure(_Rect,State) ->
     State.
 
 key_press(_Event={_, $\t, _Mod, _Code}, _State={S,D}) ->
-    D1 = D#d{auto_key = pressed},
+    D1 = D#d{auto_key = pressed, screen_color = ?SCREEN_COLOR },
+    Window = epxw:window(),
+    epx:window_enable_events(Window, no_auto_repeat),
+    epxw:profile_set(screen_color, ?LOW_COLOR),
+    epxw:invalidate(),
     ?verbose("KEY_PRESS: AutoKey pressed\n", []),
     {S,D1};
 
@@ -752,8 +778,12 @@ key_release(_Event={_, $\e, _Mod, _Code}, _State={S,D}) ->
     ?verbose("KEY_RELEASE: help deactivated\n", []),
     {S, D#d{ help = false }};
 key_release(_Event={_, $\t, _Mod, _Code}, _State={S,D}) ->
-    D1 = D#d{auto_key = released },
+    D1 = D#d{auto_key = released,screen_color = D#d.orig_screen_color},
     ?verbose("KEY_RLEASE: AutoKey released\n", []),
+    Window = epxw:window(),
+    epx:window_disable_events(Window, no_auto_repeat),
+    epxw:profile_set(screen_color, D#d.orig_screen_color),
+    epxw:invalidate(),
     auto_key_detect({S,D1});
 key_release(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
     ?verbose("KEY_RELEASE: ~w\n", [_Event]),
@@ -834,21 +864,12 @@ draw(Pixels, Area, State) ->
 	 pad = $\s :: char() 
 	}).
 
-draw(top, Pixels, _Area, _State={S,D}) ->
-    Time1 = erlang:system_time(millisecond),
-    Count1 = ets:lookup_element(S#s.frame_counter, all, 2),
-    Time0  = D#d.frame_time,
-    Count0 = D#d.frame_count,
-    FrameRate = 
-	case Time1 - Time0 of
-	    0 -> 0.0;
-	    Td -> 1000*(Count1-Count0)/Td
-	end,
+draw(top, Pixels, _Area, State={S,D}) ->
     Fs = 
 	if is_integer(S#s.bitrate) ->
 		[#tfield{label="Rate",
 			 label_color=?TEXT_WHITE,
-			 style=rect,
+			 style=none, %% rect,
 			 border=1,
 			 border_color=black,
 			 format=" ~-8s Hz",
@@ -869,7 +890,7 @@ draw(top, Pixels, _Area, _State={S,D}) ->
 		if is_integer(S#s.datarate) ->
 			[#tfield{label="DataRate",
 				 label_color=?TEXT_WHITE,
-				 style=rect,
+				 style=none, %% rect,
 				 border=1,
 				 border_color=black,
 				 format=" ~-8s Hz",
@@ -892,8 +913,8 @@ draw(top, Pixels, _Area, _State={S,D}) ->
 	[#tfield{label="FrameRate ",
 		 label_color=?TEXT_WHITE,
 		 format="~6.1f f/s",
-		 style=rect,
-		 value=FrameRate}],
+		 style=none, %% rect,
+		 value=D#d.frame_rate}],
     epx_gc:set_font(S#s.top_font),
     X0 = 4,
     Y0 = 4,
@@ -901,9 +922,7 @@ draw(top, Pixels, _Area, _State={S,D}) ->
 		 S#s.top_glyph_width,S#s.top_glyph_ascent,
 		 S#s.top_glyph_width,S#s.top_glyph_height,
 		 Fs),
-    D1 = D#d { frame_count = Count1, frame_time =Time1 },
-    State1 = {S, D1},
-    State1;
+    State;
 draw(_Where, _Pixels, _Area, State) ->
     State.
 
@@ -1268,9 +1287,9 @@ command($t, _Selected, _Mod, State={S,_}) ->
 	  fun(L,Acc) ->
 		  Key = L#layout.key,
 		  case ets:lookup(S#s.frame_diff, Key) of
-		      [] -> [{delete,Key}|Acc]; 
+		      []       -> [{delete,Key}|Acc]; 
 		      [{_,[]}] -> [{delete,Key}|Acc];
-		      [{_,D}] -> [{select,Key,D}|Acc]
+		      [{_,D}]  -> [{select,Key,D}|Acc]
 		  end
 	  end, [], State),
     {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
@@ -1405,12 +1424,19 @@ format_candy(ID, undefined, BitPos, S) ->
     Bitrate = S#s.bitrate,
     Datarate = S#s.datarate,
     Filter   = S#s.canfilter,
+    BytePos  = BitPos div 8,
+    ByteBit0 = BitPos rem 8,
+    ByteBit  = 7-ByteBit0,
     ["0x",integer_to_list(ID,16),
-     " ", integer_to_list(BitPos div 8, 16),  %% hex without 0x (old version)
+     if BytePos < 8 -> %% 0..7 are formatted backwards compatible (decimal)
+	     [" ", integer_to_list(BytePos, 10)];
+	true ->
+	     [" 0x", integer_to_list(BytePos, 16)]  %% hex
+     end,
      %% byte mask
-     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     " 0x", integer_to_list((1 bsl ByteBit), 16),
      %% byte match value HIGH
-     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     " 0x", integer_to_list((1 bsl ByteBit), 16),
      %% byte match value LOW
      " 0x00", "\n",
      "> canmode=0\n",
@@ -1429,13 +1455,20 @@ format_candy(ID, PID, BitPos, S) ->
     Bitrate = S#s.bitrate,
     Datarate = S#s.datarate,
     Filter   = S#s.canfilter,
+    BytePos  = BitPos div 8,
+    ByteBit0 = BitPos rem 8,
+    ByteBit  = 7-ByteBit0,
     %% PidMode = S#s.pidmode,  only one mode for now
     ["0x",integer_to_list(ID,16),
-     " ", integer_to_list(BitPos div 8, 16), %% hex without 0x (old version)
+     if BytePos < 8 -> %% 0..7 are formatted backwards compatible (decimal)
+	     [" ", integer_to_list(BytePos, 10)];
+	true ->
+	     [" 0x", integer_to_list(BytePos, 16)]  %% hex
+     end,
      %% byte mask
-     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     " 0x", integer_to_list((1 bsl ByteBit), 16),
      %% byte match value HIGH
-     " 0x", integer_to_list((1 bsl (7-(BitPos rem 8))), 16),
+     " 0x", integer_to_list((1 bsl ByteBit), 16),
      %% byte match value LOW
      " 0x00", "\n",
      "> canmode=0\n",
@@ -1576,7 +1609,6 @@ handle_info({timeout,Ref,tick}, State={S,D}) when D#d.tick =:= Ref ->
 	true ->
 	    {noreply, tick_start(State)}
     end;
-
 handle_info({timeout,Ref,move}, State={S,D}) when D#d.move =:= Ref ->
     case move_step(State) of
 	0 ->
@@ -1601,6 +1633,23 @@ handle_info({timeout,Ref,low}, {S, D}) when Ref =:= D#d.auto_detect_tmr ->
     epxw:invalidate(),
     State1 = {S, D#d { auto_detect = low, auto_detect_tmr = TRef,
 		       screen_color = ?LOW_COLOR }},
+    {noreply, State1};
+
+handle_info({timeout,Ref,stat}, {S, D}) when Ref =:= D#d.stat_tmr ->
+    Time1 = erlang:system_time(millisecond),
+    Count1 = ets:lookup_element(S#s.frame_counter, all, 2),
+    Time0  = D#d.frame_time,
+    Count0 = D#d.frame_count,
+    FrameRate = 
+	case Time1 - Time0 of
+	    0 -> 0.0;
+	    Td -> 1000*(Count1-Count0)/Td
+	end,
+    TRef = erlang:start_timer(?STAT_INTERVAL, self(), stat),
+    epxw:invalidate(),
+    State1 = {S, D#d { stat_tmr = TRef, frame_rate = FrameRate,
+		       frame_count = Count1, frame_time =Time1
+		     }},
     {noreply, State1};
 
 %%
@@ -1886,28 +1935,20 @@ auto_detect_bits(Key, Frame, OldFrame, State={S,_D}) ->
 		true -> %% Frame was received inside detection "window"
 		    case ets:lookup(S#s.frame_diff,Key) of
 			[] -> %% no bits yet, regard all switched bits
-			    X1 = diff_bits(Frame,OldFrame),
-			    D2 = X1,
-			    ets:insert(S#s.frame_diff, {Key,D2}),
+			    C0 = frame_to_number(OldFrame),
+			    Cnt = bump_frame(Frame, {C0,0,0}),
+			    ets:insert(S#s.frame_diff, {Key,Cnt}),
 			    State;
-			[{_,0}] -> %% disabled
-			    State;
-			[{_,D2}] ->
-			    X2 = diff_bits(Frame,OldFrame),
-			    D3 = subtract_bits(D2, X2),
-			    ets:insert(S#s.frame_diff, {Key,D3}),
+			[{_,Cnt}] ->
+			    Cnt1 = bump_frame(Frame, Cnt),
+			    ets:insert(S#s.frame_diff, {Key,Cnt1}),
 			    State
 		    end;
 		false -> %% NewFrame was received outside detection "window"
 		    case ets:lookup(S#s.frame_diff,Key) of
 			[] -> %% no bits detected sofar
 			    State;
-			[{_,0}] -> %% all bits are discarded already
-			    State;
-			[{_,D2}] ->
-			    X2 = diff_bits(Frame,OldFrame),
-			    D3 = subtract_bits(D2, X2),
-			    ets:insert(S#s.frame_diff, {Key,D3}),
+			[{_,_Cnt}] ->
 			    State
 		    end
 	    end
@@ -1957,24 +1998,50 @@ select([{select,Key,Bs}|Ls],Selected,St0) ->
 select([],Selected,St) ->
     {Selected, St}.
 
+-define(MIN_BIT_FLIPS, 2).
+-define(MAX_BIT_FLIPS, 4).
+
 %% Filter frames not flipped during key press
+%% Iterate over all frames ignore hidden frames
+%% check frame_diff
 auto_key_detect(State = {S,_D}) ->
-    Ls = auto_key_detect(ets:first(S#s.frame_diff), S#s.frame_diff, []),
+    Ls = auto_key_detect(State,ets:first(S#s.frame),[]),
     ets:delete_all_objects(S#s.frame_diff),
     {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
     epxw:invalidate(),
     {S1,D1#d{ selected = Selected }}.
 
-auto_key_detect('$end_of_table', _Tab, Ls) -> 
+auto_key_detect(_State,'$end_of_table',Ls) -> 
     Ls;
-auto_key_detect(Key, Tab, Ls) -> 
-    case ets:lookup(Tab, Key) of
-	[] -> %% never flipped
-	    auto_key_detect(ets:next(Tab, Key),Tab,[{delete,Key}|Ls]);
-	[{_,0}] -> %% flipped
-	    auto_key_detect(ets:next(Tab, Key),Tab,[{delete,Key}|Ls]);
-	[{_,D2}] -> %% bits flipped (once) during key press
-	    auto_key_detect(ets:next(Tab, Key),Tab,[{select,Key,D2}|Ls])
+auto_key_detect(State={S,D},Key,Ls) -> 
+    Next = ets:next(S#s.frame,Key),
+    case maps:is_key(Key, D#d.hidden) of
+	true -> %% not active
+	    auto_key_detect(State,Next,Ls);
+	false ->
+	    case ets:lookup(S#s.frame_diff,Key) of
+		[] -> %% never flipped, hide and filter out
+		    auto_key_detect(State,Next,[{delete,Key}|Ls]);
+		[{_,Cnt}] ->
+		    %% Accept at least on bit flip 0->1 | 1->0
+		    %% or at most 3 flips 0->1->0->1 | 1->0->1->0
+		    case ets:lookup(S#s.frame,Key) of
+			[] ->
+			    %% io:format("auto-select key=~p, not found\n", [Key]),
+			    auto_key_detect(State,Next,[{delete,Key}|Ls]);
+			[{_,#frame{data=Data}}] ->
+			    N = byte_size(Data)*8,
+			    case bitflips(N,Cnt,?MIN_BIT_FLIPS,
+					  ?MAX_BIT_FLIPS) of
+				[] ->
+				    %% io:format("auto-select key=~p, deleted\n", [Key]),
+				    auto_key_detect(State,Next,[{delete,Key}|Ls]);
+				_Ds=[D2|_] ->
+				    %% io:format("auto-select key=~p, ds=~w\n", [Key,Ds]),
+				    auto_key_detect(State,Next,[{select,Key,D2}|Ls])
+			    end
+		    end
+	    end
     end.
 
 cell_hit(Xy, Layout, State={S,D}) ->
@@ -2480,17 +2547,43 @@ diff_frames_(I,Format,New,Old,Acc,State) when I =< tuple_size(Format) ->
 diff_frames_(_I,_Format,_New,_Old,Acc,_State) ->
     Acc.
 
-%% return the flipped bits between two frames
-diff_bits(#frame{data=Data1}, #frame{data=Data2}) ->
-    L1 = byte_size(Data1),
-    L2 = byte_size(Data2),
-    <<D1:L1/little-unit:8>> = Data1,
-    <<D2:L2/little-unit:8>> = Data2,
-    D1 bxor D2.
+bump_frame(#frame{data=Data}, Cnt) ->
+    C = bin_to_number(Data),
+    bump(C, Cnt).
 
-%% remove bits from A that are set in B
-subtract_bits(A, B) ->
-    A band (bnot B).
+bump(C, {C0, C1, C2}) ->
+    T0 = C0 band C, N0 = C0 bxor C,
+    T1 = C1 band T0,  N1 = C1 bxor T0,
+    T2 = C2 band T1,  N2 = C2 bxor T1,
+    {N0 bor T2, N1 bor T2, N2 bor T2}.
+
+%% 00 11 22 33
+%% 7,6,5,4,3,2,1,0  15,14,13,12,11,10,9,8
+
+bitflips(N, {C0,C1,C2}, Low, High) ->
+    bitflips(N, 0, 7, C0,C1,C2, Low, High, []).
+
+bitflips(0, _, -1, _C0,_C1,_C2, _Low, _High, Acc) ->
+    lists:reverse(Acc);
+bitflips(N, Byte, -1, C0,C1,C2, Low, High, Acc) ->
+    bitflips(N-1, Byte+1, 7, C0,C1,C2, Low, High, Acc);
+bitflips(N, Byte, Bit, C0,C1,C2, Low, High, Acc) ->
+    Flips = (C0 band 1)+(C1 band 1)*2+(C2 band 1)*4, %% read 3-bit counter
+    if Flips < Low; Flips > High -> %% reject
+	    bitflips(N,Byte,Bit-1,C0 bsr 1,C1 bsr 1,C2 bsr 1,Low,High,Acc);
+       true ->
+	    bitflips(N,Byte,Bit-1,C0 bsr 1,C1 bsr 1,C2 bsr 1,Low,High,
+		     [(Byte*8+Bit) | Acc])
+    end.
+
+frame_to_number(#frame{data=Data}) ->
+    bin_to_number(Data).
+
+bin_to_number(Bin) when is_binary(Bin) ->
+    Len = byte_size(Bin),
+    <<D:Len/little-unit:8>> = Bin,
+    D.
+
 
 %% return bit position list
 %% bit 0 is the right most bit in the first frame byte
