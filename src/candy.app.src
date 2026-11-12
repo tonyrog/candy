@@ -4,5 +4,5 @@
   {modules, ["@@MODULES@@"]},
   {registered, []},
   {env, []},
-  {applications,[kernel,stdlib,can,epx]}
+  {applications,[kernel,stdlib,can,epx,servator]}
   ]}.

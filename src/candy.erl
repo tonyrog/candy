@@ -250,6 +250,10 @@
 	 data_sample_point = undefined,   %% in percent (integer 50..90)
 	 conf_bitrates = ?DEFAULT_BITRATES,
 	 conf_datarates = ?DEFAULT_DATARATES,
+	 user_bitrates = [] :: [integer()],   %% user config + entered
+	 user_datarates = [] :: [integer()],  %% user config + entered
+	 any_bitrate = false :: boolean(),    %% driver may set any bitrate
+	 any_datarate = false :: boolean(),   %% driver may set any datarate
 	 pidmode = off,  %% off|pid24
 	 canfilter = false,  %% toggle with "F"
 	 pause = false :: boolean(),  %% pause frame reception
@@ -282,8 +286,32 @@
 	}).
 
 %% dynamic state elements
+%% manual rate input (Alt+0 / Ctrl+0)
+-record(input,
+	{
+	 kind :: bitrate | datarate,
+	 text = "" :: string(),
+	 error = "" :: string(),
+	 busy = false :: boolean()   %% waiting for driver
+	}).
+
+-define(RATE_TIMEOUT, 8000).     %% max time to wait for driver
+-define(MESSAGE_TIME, 4000).     %% show messages for 4s
+-define(RECORD_FILE, "candy.trc").
+
 -record(d,
 	{
+	 input = undefined :: undefined | #input{},
+	 %% pending (async) rate request {Ref, Kind, Rate, FromInput}
+	 rate_req = undefined,
+	 %% transient message in top bar {Text, ExpireTimeMs}
+	 message = undefined,
+	 %% recording {Pid, StartMs}
+	 rec = undefined,
+	 %% playback {Pid, StartMs, PausedAtMs | undefined, PausedTotalMs}
+	 play = undefined,
+	 %% tool buttons in window coordinates [{Name, {X,Y,W,H}}]
+	 tools = [],
 	 tick :: undefined | reference(),
 	 move :: undefined | reference(),
 	 selection,                 %% current selection rect
@@ -331,15 +359,9 @@ install() ->
 	    install_config(),
 	    Home = os:getenv("HOME"),
 	    {ok,Vsn} = application:get_key(?APP, vsn),
-	    VsnNL = Vsn++"\n",
-	    case file:read_file(filename:join([Home,?DOTAPP,"installed"])) of
-		{ok,BinVsn} ->
-		    case binary_to_list(BinVsn) of
-			Vsn -> ok; %% already installed
-			VsnNL -> ok; %% already installed
-			_ -> install_(Home, Vsn)
-		    end;
-		{error,enoent} -> install_(Home,Vsn)
+	    case servator_rt:installed_version(?APP) of
+		{ok,Vsn} -> ok; %% already installed
+		_ -> install_(Home,Vsn)
 	    end
     end.
 
@@ -371,18 +393,7 @@ install_(Home,Vsn) ->
 %% install $HOME/.candy/user.config file if it does
 %% not exist. default is just empty list
 install_config() ->
-    Home = os:getenv("HOME"),
-    UserConfigFile = filename:join([Home, ".candy", "user.config"]),
-    case filelib:is_regular(UserConfigFile) of
-	true ->
-	    ok;
-	false ->
-	    file:write_file(UserConfigFile, 
-			    "%% -*- erlang -*-\n"
-			    "%% override config for candy\n"
-			    "[\n"
-			    "].\n")
-    end.
+    servator_rt:install_user_config(?APP).
 
 install_cmds() ->
     Home = os:getenv("HOME"),
@@ -425,14 +436,9 @@ install_cmd_(Home, Vsn, AppDir,AppImg) ->
      ["echo \"", Vsn, "\" > ", filename:join([Home,?DOTAPP,"installed"])]
     ].
 
-%% log each command, one by one
-log_commands(Dir, [Cmd|Cmds]) ->
-    {ok,Fd} = file:open(filename:join(Dir,"install_log.txt"), [write,append]),
-    io:put_chars(Fd, [Cmd,"\n"]),
-    file:close(Fd),
-    log_commands(Dir, Cmds);
-log_commands(_Dir, []) ->
-    ok.
+%% log commands to $HOME/.candy/install_log.txt
+log_commands(_Dir, Cmds) ->
+    servator_rt:install_log(?APP, Cmds).
 
 %%%===================================================================
 %%% API
@@ -449,6 +455,8 @@ start() ->
 start(Options) ->
     application:load(?APP),
     install(),
+    %% merge $HOME/.candy/user.config section by section
+    servator_rt:load_user_config(?APP),
     low_latency(),
     application:ensure_all_started(?APP),
     start_it(Options, start).
@@ -484,6 +492,12 @@ help_menu() ->
      {"---"},
      {"Toggle Listen mode", "Ctrl+L"},
      {"Toggle FD mode",     "Ctrl+F"},
+     {"Set bitrate...",     "Alt+0"},
+     {"Set datarate...",    "Ctrl+0"},
+     {"---"},
+     {"Record start/stop",  "Ctrl+R"},
+     {"Play start/stop",    "Ctrl+P"},
+     {"Play pause",         "Ctrl+Space"},
      {"---"},
      %% Save information to /home/$USER/candy.txt
      {"Save",               "Ctrl+S"},
@@ -596,6 +610,8 @@ init(Options) ->
 					?DEFAULT_BITRATES),
     Conf_DataRates = proplists:get_value(datarates, Options,
 					 ?DEFAULT_DATARATES),
+    User_BitRates = proplists:get_value(user_bitrates, Options, []),
+    User_DataRates = proplists:get_value(user_datarates, Options, []),
     PidMode = proplists:get_value(pidmode, Options, off),
 
     Profile = load_profile(Env),
@@ -635,9 +651,9 @@ init(Options) ->
 		 ]}
 	end,
     {BitRate, BitRates} = 
-	make_rates(BitRate0, BitRates0, Conf_BitRates),
+	make_rates(BitRate0, BitRates0, Conf_BitRates++User_BitRates),
     {DataRate, DataRates} = 
-	make_rates(DataRate0, DataRates0, Conf_DataRates),
+	make_rates(DataRate0, DataRates0, Conf_DataRates++User_DataRates),
 
     SamplePoint = sample_point_to_percent(SamplePoint0),
     DataSamplePoint = sample_point_to_percent(DataSamplePoint0),
@@ -652,6 +668,10 @@ init(Options) ->
 	   datarates = DataRates,
 	   conf_bitrates = Conf_BitRates,
 	   conf_datarates = Conf_DataRates,
+	   user_bitrates = User_BitRates,
+	   user_datarates = User_DataRates,
+	   any_bitrate = can:any_rate(BitRates0),
+	   any_datarate = can:any_rate(DataRates0),
 	   sample_point = trim_sample_point(SamplePoint),
 	   data_sample_point = trim_data_sample_point(DataSamplePoint),
 	   pidmode = PidMode,
@@ -789,8 +809,15 @@ key_release(_Event={_, _Sym, _Mod, _Code}, State={_S,_D}) ->
     ?verbose("KEY_RELEASE: ~w\n", [_Event]),
     State.
 
-button_press(_Event={button_press, Buttons,XY={_X,_Y}}, State) ->
+button_press(_Event={button_press, Buttons,XY={X,Y}}, State={_S,D}) ->
     ?verbose("BUTTON_PRESS: ~w\n", [_Event]),
+    WXY = {epxw:view_to_window_x(X), epxw:view_to_window_y(Y)},
+    case Buttons =:= [left] andalso tool_hit(WXY, D) of
+	false -> button_press_(Buttons, XY, State);
+	Tool -> tool_command(Tool, State)
+    end.
+
+button_press_(Buttons, XY, State) ->
     case Buttons of
 	[left] ->
 	    case layout_from_coord(XY, State) of
@@ -864,7 +891,7 @@ draw(Pixels, Area, State) ->
 	 pad = $\s :: char() 
 	}).
 
-draw(top, Pixels, _Area, State={S,D}) ->
+draw(top, Pixels, Area, State={S,D}) ->
     Fs = 
 	if is_integer(S#s.bitrate) ->
 		[#tfield{label="Rate",
@@ -915,16 +942,219 @@ draw(top, Pixels, _Area, State={S,D}) ->
 		 format="~6.1f f/s",
 		 style=none, %% rect,
 		 value=D#d.frame_rate}],
+    Fs1 = case D#d.input of
+	      undefined -> Fs;
+	      In -> input_fields(In)
+	  end,
     epx_gc:set_font(S#s.top_font),
     X0 = 4,
     Y0 = 4,
     draw_tfields(Pixels,X0,Y0,
 		 S#s.top_glyph_width,S#s.top_glyph_ascent,
 		 S#s.top_glyph_width,S#s.top_glyph_height,
-		 Fs),
-    State;
+		 Fs1),
+    draw_tools(Pixels, Area, State);
 draw(_Where, _Pixels, _Area, State) ->
     State.
+
+%%
+%% Tool buttons, right part of top bar
+%%   record (red dot)  play (triangle) / stop (square)  pause (bars)
+%%
+-define(TOOL_SIZE, 20).
+-define(TOOL_PAD,  6).
+
+draw_tools(Pixels, {_X0,_Y0,W,H}, {S,D}) ->
+    Sz = ?TOOL_SIZE,
+    Y = max(0, (H - Sz) div 2),
+    Names = [record, play, pause],
+    N = length(Names),
+    X1 = W - N*(Sz+?TOOL_PAD) - 2*?TOOL_PAD,
+    Tools = [{Name, {X1 + I*(Sz+?TOOL_PAD), Y, Sz, Sz}} ||
+		{Name,I} <- lists:zip(Names, lists:seq(0, N-1))],
+    [draw_tool(Pixels, Name, Rect, D) || {Name,Rect} <- Tools],
+    {S, D#d { tools = Tools }}.
+
+draw_tool(Pixels, record, {X,Y,W,H}, D) ->
+    tool_frame(Pixels, {X,Y,W,H}, D#d.rec =/= undefined),
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(if D#d.rec =/= undefined -> {255,40,40};
+			     true -> {160,30,30}
+			  end),
+    epx_gc:set_border_width(0),
+    epx:draw_ellipse(Pixels, X+4, Y+4, W-8, H-8);
+draw_tool(Pixels, play, {X,Y,W,H}, D) ->
+    Playing = D#d.play =/= undefined,
+    tool_frame(Pixels, {X,Y,W,H}, Playing),
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_border_width(0),
+    epx_gc:set_fill_color({40,200,40}),
+    if Playing ->  %% stop
+	    epx:draw_rectangle(Pixels, X+5, Y+5, W-10, H-10);
+       true ->
+	    epx:draw_triangle(Pixels, {X+6,Y+4}, {X+6,Y+H-4},
+			      {X+W-4,Y+(H div 2)})
+    end;
+draw_tool(Pixels, pause, {X,Y,W,H}, D) ->
+    Paused = case D#d.play of
+		 {_,_,PausedAt,_} -> PausedAt =/= undefined;
+		 _ -> false
+	     end,
+    tool_frame(Pixels, {X,Y,W,H}, Paused),
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_border_width(0),
+    epx_gc:set_fill_color(if D#d.play =:= undefined -> {120,120,120};
+			     true -> {230,230,230}
+			  end),
+    BW = (W - 10) div 3,
+    epx:draw_rectangle(Pixels, X+5, Y+4, BW, H-8),
+    epx:draw_rectangle(Pixels, X+W-5-BW, Y+4, BW, H-8).
+
+tool_frame(Pixels, Rect, Active) ->
+    epx_gc:set_fill_style(solid),
+    epx_gc:set_fill_color(if Active -> {90,90,90}; true -> {50,50,50} end),
+    epx_gc:set_border_width(1),
+    epx_gc:set_border_color({200,200,200}),
+    epx:draw_rectangle(Pixels, Rect),
+    epx_gc:set_border_width(0).
+
+tool_status(D) ->
+    Now = erlang:monotonic_time(millisecond),
+    case {D#d.rec, D#d.play} of
+	{{_Pid, Start}, _} ->
+	    "REC " ++ format_mmss(Now - Start);
+	{_, {_Pid, Start, undefined, PausedTotal}} ->
+	    "PLAY " ++ format_mmss(Now - Start - PausedTotal);
+	{_, {_Pid, Start, PausedAt, PausedTotal}} ->
+	    "PAUSE " ++ format_mmss(PausedAt - Start - PausedTotal);
+	_ ->
+	    ""
+    end.
+
+format_mmss(Ms) ->
+    Sec = max(0, Ms) div 1000,
+    lists:flatten(io_lib:format("~2..0w:~2..0w", [Sec div 60, Sec rem 60])).
+
+%% check if window position hit a tool button
+tool_hit({X,Y}, D) ->
+    case [Name || {Name,{Xt,Yt,Wt,Ht}} <- D#d.tools,
+		  X >= Xt, X < Xt+Wt, Y >= Yt, Y < Yt+Ht] of
+	[Name|_] -> Name;
+	[] -> false
+    end.
+
+tool_command(record, State) -> toggle_record(State);
+tool_command(play, State) -> toggle_play(State);
+tool_command(pause, State) -> toggle_play_pause(State).
+
+%%
+%% Recording to $HOME/.candy/candy.trc
+%%
+record_file() ->
+    servator_rt:user_file(?APP, ?RECORD_FILE).
+
+toggle_record(State={_S,D}) when D#d.rec =/= undefined ->
+    {Pid,_} = D#d.rec,
+    {S1,D1} = State,
+    State1 = {S1, D1#d { rec = undefined }},
+    case candy_record:stop(Pid) of
+	{ok, N} ->
+	    show_message(integer_to_list(N)++" frames recorded", State1);
+	{error, Reason} ->
+	    show_message("record: "++format_reason(Reason), State1)
+    end;
+toggle_record(State0) ->
+    State = stop_play(State0),
+    File = record_file(),
+    filelib:ensure_dir(File),
+    case candy_record:start(File) of
+	{ok, Pid} ->
+	    {S,D} = State,
+	    epxw:invalidate(),
+	    self() ! clock,
+	    {S, D#d { rec = {Pid, erlang:monotonic_time(millisecond)} }};
+	{error, Reason} ->
+	    show_message("record: "++format_reason(Reason), State)
+    end.
+
+%%
+%% Playback of $HOME/.candy/candy.trc
+%% While playing candy is detached from the CAN router so only
+%% recorded frames are shown.
+%%
+toggle_play(State={_S,D}) when D#d.play =/= undefined ->
+    stop_play(State);
+toggle_play(State0={_,D0}) ->
+    State = if D0#d.rec =/= undefined -> toggle_record(State0);
+	       true -> State0
+	    end,
+    File = record_file(),
+    case filelib:is_regular(File) of
+	false ->
+	    show_message("nothing recorded", State);
+	true ->
+	    can_router:detach(),
+	    %% keep layouts, deleted/filtered frames and filter mode
+	    {S,D} = reset_counters(State),
+	    {ok, Pid} = candy_play:start(File, self()),
+	    epxw:invalidate(),
+	    self() ! clock,
+	    {S, D#d { play = {Pid, erlang:monotonic_time(millisecond),
+			      undefined, 0} }}
+    end.
+
+toggle_play_pause(State={S,D}) ->
+    Now = erlang:monotonic_time(millisecond),
+    epxw:invalidate(),
+    case D#d.play of
+	{Pid, Start, undefined, Total} ->
+	    candy_play:pause(Pid),
+	    {S, D#d { play = {Pid, Start, Now, Total} }};
+	{Pid, Start, PausedAt, Total} ->
+	    candy_play:resume(Pid),
+	    {S, D#d { play = {Pid, Start, undefined, Total+(Now-PausedAt)} }};
+	undefined ->
+	    State
+    end.
+
+stop_play(State={_S,D}) when D#d.play =/= undefined ->
+    {Pid,_,_,_} = D#d.play,
+    candy_play:stop(Pid),
+    play_stopped(State);
+stop_play(State) ->
+    State.
+
+%% playback ended, attach to live traffic again
+play_stopped({S,D}) ->
+    can_router:attach(),
+    can_router:error_reception(on),
+    epxw:invalidate(),
+    {S, D#d { play = undefined }}.
+
+input_fields(#input { kind = Kind, text = Text, error = Error,
+		      busy = Busy }) ->
+    Label = case Kind of
+		bitrate -> "Set bitrate ";
+		datarate -> "Set datarate "
+	    end,
+    [#tfield{label=Label,
+	     label_color=?TEXT_WHITE,
+	     style=rect,
+	     border=1,
+	     border_color=white,
+	     format="~s",
+	     value=" "++Text++"_ ",
+	     value_color=?TEXT_YELLOW}] ++
+	case Error of
+	    "" when Busy ->
+		[#tfield{label="setting...",
+			 label_color=?TEXT_WHITE, value=""}];
+	    "" ->
+		[#tfield{label="Enter=set Esc=cancel",
+			 label_color=?TEXT_WHITE, value=""}];
+	    _ ->
+		[#tfield{label="", value=Error, value_color=?TEXT_RED}]
+	end.
 
 draw_tfields(Pixels, X, Y, Xs, Ys, Cw, Ch,
 	     [T=#tfield{label=L,width=W,pad=P,format=F,value=V}|Fs]) ->
@@ -1013,14 +1243,22 @@ make_rate_menu(S) ->
 
 make_bit_rates(BitRate, BitRates0, S) ->
     {BitRate1,BitRates1} = 
-	make_rates(BitRate, BitRates0, S#s.conf_bitrates),
+	make_rates(BitRate, BitRates0, conf_rates(bitrate, S)),
     [{rate_to_list(R,BitRate1), "Alt+"++ integer_to_list(I,16)} ||
 	{R,I} <- lists:zip(BitRates1,
-			   lists:seq(1, length(BitRates1)))].
+			   lists:seq(1, length(BitRates1)))] ++
+	case can:any_rate(BitRates0) of
+	    true -> [{" Bitrate...", "Alt+0"}];
+	    false -> []
+	end.
 
 make_data_rates(true, DataRate, DataRates0, S) ->
-    case make_rates(DataRate, DataRates0, S#s.conf_datarates) of
-	{_, []} ->
+    Other = case can:any_rate(DataRates0) of
+		true -> [{" Datarate...", "Ctrl+0"}];
+		false -> []
+	    end,
+    case make_rates(DataRate, DataRates0, conf_rates(datarate, S)) of
+	{_, []} when Other =:= [] ->
 	    [];
 	{DataRate1,DataRates1} ->
 	    [{"---"}] ++
@@ -1028,10 +1266,15 @@ make_data_rates(true, DataRate, DataRates0, S) ->
 		  ++integer_to_list(I,16)} ||
 		    {R,I} <- lists:zip(DataRates1, 
 				       lists:seq(1,
-						 length(DataRates1)))]
+						 length(DataRates1)))] ++
+		Other
     end;
 make_data_rates(false, _DataRate, _DataRates0, _S) ->
     [].
+
+%% configured rates + user rates (config and entered in this session)
+conf_rates(bitrate, S) -> S#s.conf_bitrates ++ S#s.user_bitrates;
+conf_rates(datarate, S) -> S#s.conf_datarates ++ S#s.user_datarates.
 
 
 rate_and_sample_point_to_list(Rate, undefined) ->
@@ -1116,6 +1359,12 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %%   Ctrl+L         Listen mode toggle
 %%   Ctrl+F         FD allow toggle
 %%   Alt+1-9        Set bitrate 
+%%   Alt+0          Enter bitrate manually (83.3k, 125000, 500k@87.5)
+%%   Ctrl+0         Enter datarate manually (FD)
+%%
+%%   Ctrl+R         Record start/stop  ($HOME/.candy/candy.trc)
+%%   Ctrl+P         Play start/stop    ($HOME/.candy/candy.trc)
+%%   Ctrl+Space     Play pause/resume
 %%   Alt+up         Bitrate up
 %%   Alt+down       Bitrate down
 %%   Ctrl+1-9[A-E]  Set datarate (FD)
@@ -1125,6 +1374,8 @@ motion(_Event={motion,_Button,_Pos}, State) ->
 %% Debug
 %%   Ctrl+D         Dump internal frame list onto candy.dump
 %%
+command(Key, Mod, State={_,D}) when D#d.input =/= undefined ->
+    {noreply, input_key(Key, Mod, State)};
 command(Key, Mod, State={_,D}) ->
     ?verbose("COMMAND: key=~p, mod=~p\n", [Key, Mod]),
     try command(Key, D#d.selected, Mod, State) of
@@ -1139,6 +1390,12 @@ command(Key, Mod, State={_,D}) ->
 	    {stop, Reason, State}
     end.
 
+command($r, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    toggle_record(State);
+command($p, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    toggle_play(State);
+command($\s, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    toggle_play_pause(State);
 command($r, _Selected, _Mod, State) ->
     epxw:invalidate(),
     State;
@@ -1190,6 +1447,13 @@ command($s, Selected, Mod, State) when Mod#keymod.ctrl ->
 command($q, _Selected, Mod, State) when Mod#keymod.ctrl ->
     erlang:halt(0),
     State;
+
+command($0, _Selected, Mod, State) when Mod#keymod.alt ->
+    start_input(bitrate, State);
+command($0, _Selected, Mod, State={S,_D}) when Mod#keymod.ctrl ->
+    if S#s.fd -> start_input(datarate, State);
+       true -> State
+    end;
 
 command(I, _Selected, Mod, State={S,_D}) when Mod#keymod.ctrl,I >= $1,I =< $8 ->
     J = I-$0,
@@ -1293,8 +1557,10 @@ command($t, _Selected, _Mod, State={S,_}) ->
 		  end
 	  end, [], State),
     {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
+    State1 = {S1#s{ canfilter = true }, D1#d{ selected = Selected }},
+    set_status(State1),
     epxw:invalidate(),
-    {S1,D1#d{ selected = Selected }};
+    State1;
 
 command($f, Selected, Mod, State) ->
     command_filter(Selected, Mod, State);
@@ -1316,15 +1582,19 @@ command($\s, _Selected, _Mod, {S,D}) ->
     epxw:invalidate(),
     State1;
 command(Symbol, _Selected, Mod, State) ->
-    io:format("unhandled command ~p\n", [Symbol]),
+    ?verbose("unhandled command ~p\n", [Symbol]),
     {reply,{Symbol,Mod},State}.
 
 %%
 %% Command $h sort layouts
 %%
-command_sort(_Selected, Mod, State = {_S, D}) ->
+command_sort(_Selected, Mod, State) ->
+    sort_frames(Mod#keymod.ctrl, State).
+
+%% sort active frames by frame id (Reverse = high to low)
+sort_frames(Reverse, State = {_S, D}) ->
     Order = D#d.active_order,
-    NewOrder = if Mod#keymod.ctrl ->
+    NewOrder = if Reverse ->
 		       lists:reverse(lists:sort(Order));
 		  true ->
 		       lists:sort(Order)
@@ -1362,7 +1632,7 @@ command_delete(Selected, _Mod, State) ->
 		  end
 	  end, [], State),
     {Selected1,{S1,D1}} = clear(Ls,[],State),
-    State1 = {S1#s{ canfilter = false}, D1#d{ selected = Selected1 }},
+    State1 = {S1, D1#d{ selected = Selected1 }},
     set_status(State1),
     epxw:invalidate(),
     State1.
@@ -1593,6 +1863,37 @@ handle_cast(_Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
+handle_info({rate_result, Ref, Result}, State={_S,D})
+  when element(1, D#d.rate_req) =:= Ref ->
+    {noreply, rate_result(Result, State)};
+handle_info({rate_timeout, Ref}, State={_S,D})
+  when element(1, D#d.rate_req) =:= Ref ->
+    {noreply, rate_result({error, timeout}, State)};
+handle_info({rate_result, _Ref, _Result}, State) -> %% late result
+    {noreply, State};
+handle_info({rate_timeout, _Ref}, State) ->
+    {noreply, State};
+handle_info(message_expire, State) ->
+    set_status(State),
+    {noreply, State};
+handle_info(clock, State={_S,D}) when D#d.rec =/= undefined;
+				      D#d.play =/= undefined ->
+    erlang:send_after(1000, self(), clock),
+    set_status(State),
+    epxw:invalidate(),
+    {noreply, State};
+handle_info(clock, State) ->
+    {noreply, State};
+handle_info({candy_play, Pid, {done, Result}}, State={_S,D})
+  when element(1, D#d.play) =:= Pid ->
+    State1 = play_stopped(State),
+    Text = case Result of
+	       {error, Reason} -> "play: "++format_reason(Reason);
+	       _ -> "playback done"
+	   end,
+    {noreply, show_message(Text, State1)};
+handle_info({candy_play, _Pid, _}, State) ->
+    {noreply, State};
 handle_info(_Frame=#can_frame{}, State={S,_D}) when S#s.pause ->
     {noreply, State};    
 handle_info(Frame=#can_frame{}, State) ->
@@ -1660,7 +1961,15 @@ handle_info({if_state_event, {ID,_IfEnt}, IfParam}, {S,D}) when
     ?verbose("Got if_state if=~w, param=~p\n", [ID,IfParam]),
     if ID =:= (S#s.if_can)#if_can.if_id, S#s.if_state =:= up ->
 	    S1 = S#s { if_param = maps:merge(S#s.if_param, IfParam) },
-	    {noreply, {S1,D}};
+	    %% driver may report the real rate (requested rate failed)
+	    S2 = update_rate(bitrate, maps:get(bitrate, IfParam, undefined),
+			     S1),
+	    S3 = update_rate(datarate, maps:get(datarate,IfParam,undefined),
+			     S2),
+	    if S3 =/= S1 -> epxw:invalidate();
+	       true -> ok
+	    end,
+	    {noreply, {S3,D}};
        true -> %% ignore
 	    {noreply, {S,D}}
     end;
@@ -1677,14 +1986,14 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		%% new interface
 		LISTEN = maps:get(listen_only, IfParam),
 		FD = maps:get(fd, IfParam),
+		DrvBitRates = maps:get(bitrates, IfParam),
+		DrvDataRates = maps:get(datarates, IfParam),
 		{BitRate, BitRates} = 
 		    make_rates(maps:get(bitrate, IfParam),
-			       maps:get(bitrates, IfParam),
-			       S#s.conf_bitrates),
+			       DrvBitRates, conf_rates(bitrate, S)),
 		{DataRate,DataRates} = 
 		    make_rates(maps:get(datarate, IfParam),
-			       maps:get(datarates, IfParam),
-			       S#s.conf_datarates),
+			       DrvDataRates, conf_rates(datarate, S)),
 		SamplePoint0 = maps:get(sample_point, IfParam),
 		DataSamplePoint0 = maps:get(data_sample_point, IfParam),
 		SamplePoint = sample_point_to_percent(SamplePoint0),
@@ -1702,6 +2011,8 @@ handle_info({if_state_event, {ID,IfParam}, IfState}, {S,D}) ->
 		      bitrates=BitRates,
 		      datarate=DataRate,
 		      datarates=DataRates,
+		      any_bitrate = can:any_rate(DrvBitRates),
+		      any_datarate = can:any_rate(DrvDataRates),
 		      sample_point = SamplePoint,
 		      data_sample_point = DataSamplePoint
 		    };
@@ -1746,13 +2057,44 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-make_rates(Rate, Rates, ConfRates) ->
-    Rates1 = ordsets:intersection(sort_rates(Rates), ConfRates),
-    Rate1 = select_rate(Rate, Rates1),
-    {Rate1, Rates1}.
+%% Rates from driver (DrvRates) and configured rates (ConfRates)
+%% may contain 0, meaning any rate. (see can:any_rate/1)
+%%   driver any, conf any   => union
+%%   driver any             => configured rates
+%%   conf any               => driver rates
+%%   otherwise              => intersection
+%% The current rate is always present (if valid for the driver)
+make_rates(Rate, DrvRates0, ConfRates0) ->
+    DrvAny = can:any_rate(DrvRates0),
+    DrvRates = can:rates(DrvRates0),
+    ConfAny = can:any_rate(ConfRates0),
+    ConfRates = can:rates(ConfRates0),
+    Rates1 = if DrvAny, ConfAny -> ordsets:union(DrvRates, ConfRates);
+		DrvAny -> ConfRates;
+		ConfAny -> DrvRates;
+		true -> ordsets:intersection(DrvRates, ConfRates)
+	     end,
+    Rates2 = case is_integer(Rate) andalso Rate > 0 andalso
+		 (DrvAny orelse lists:member(Rate, DrvRates)) of
+		 true -> ordsets:add_element(Rate, Rates1);
+		 false -> Rates1
+	     end,
+    Rate1 = select_rate(Rate, Rates2),
+    {Rate1, Rates2}.
 
-sort_rates(Rates) ->
-    lists:sort(Rates).
+%% update current rate reported from driver
+update_rate(_Kind, undefined, S) -> S;
+update_rate(bitrate, Rate, S) when is_integer(Rate), Rate > 0 ->
+    if Rate =:= S#s.bitrate -> S;
+       true -> S#s { bitrate = Rate,
+		     bitrates = ordsets:add_element(Rate, S#s.bitrates) }
+    end;
+update_rate(datarate, Rate, S) when is_integer(Rate), Rate > 0 ->
+    if Rate =:= S#s.datarate -> S;
+       true -> S#s { datarate = Rate,
+		     datarates = ordsets:add_element(Rate, S#s.datarates) }
+    end;
+update_rate(_Kind, _Rate, S) -> S.
 
 %% select Rate if present or next larger
 select_rate(undefined, _) -> undefined;
@@ -1871,6 +2213,10 @@ process_frames([Frame=#frame{id=FID,pid=PID}|Fs], State={S,D},
 	    case maps:is_key(Key, D#d.hidden) of
 		true -> 
 		    process_frames(Fs, State, Redraw, RedrawSet);
+		false when S#s.canfilter ->
+		    %% filter mode: new frames are hidden (U shows them)
+		    State1 = add_hidden_frame(FID, PID, Key, State),
+		    process_frames(Fs, State1, Redraw, RedrawSet);
 		false ->
 		    State1 = add_frame(FID, PID, Key, State),
 		    process_frames(Fs, tick_restart(State1),
@@ -1896,7 +2242,20 @@ process_frames([], State, Redraw, RedrawSet) ->
     end.
 
 %% note that FID is filtered by framekey/1
-add_frame(FID,PID,Key,_State={S,D}) ->
+add_frame(FID,PID,Key,State={S,_D}) ->
+    L1 = new_frame_layout(FID,PID,Key,State),
+    [ ets:insert(S#s.frame_anim,{{Key,Pos},255}) ||
+	Pos <- lists:seq(1,tuple_size(L1#layout.format))  ],
+    add_layout(L1, State).
+
+%% add a frame directly to the hidden frames
+add_hidden_frame(FID,PID,Key,State={S,D}) ->
+    L = new_frame_layout(FID,PID,Key,State),
+    {Width,Height,FmtTuple} = position_cells(L#layout.format, State),
+    L1 = L#layout { x=0, y=0, width=Width, height=Height, format=FmtTuple },
+    {S, D#d { hidden = maps:put(Key, L1, D#d.hidden) }}.
+
+new_frame_layout(FID,PID,Key,_State={S,_D}) ->
     IDFmt =
 	if FID band ?CAN_EFF_FLAG =/= 0 ->
 		#fmt {field=id,base=16,type=unsigned,bits=[{4,29}]};
@@ -1915,12 +2274,10 @@ add_frame(FID,PID,Key,_State={S,D}) ->
 	   true ->
 		default_format(IDFmt)
 	end,
-    [ ets:insert(S#s.frame_anim,{{Key,Pos},255}) ||
-	Pos <- lists:seq(1,tuple_size(Format))  ],
     L1 = #layout { key=Key, format=Format, color=S#s.color_profile},
     ets:insert(S#s.frame_counter, {Key, 1}),
     ets:insert(S#s.frame_freq, {Key,erlang:system_time(millisecond),1,""}),
-    add_layout(L1, {S, D}).
+    L1.
 
 
 is_auto_detect({_,#d { auto_detect = Detect, auto_key = Key }}) -> 
@@ -2008,8 +2365,11 @@ auto_key_detect(State = {S,_D}) ->
     Ls = auto_key_detect(State,ets:first(S#s.frame),[]),
     ets:delete_all_objects(S#s.frame_diff),
     {Selected,{S1,D1}} = clear_and_select(Ls,[],State),
+    %% sort and scroll to top so the detected frames are in view
+    State1 = sort_frames(false, {S1,D1#d{ selected = Selected }}),
+    epxw:set_view_ypos(0),
     epxw:invalidate(),
-    {S1,D1#d{ selected = Selected }}.
+    State1.
 
 auto_key_detect(_State,'$end_of_table',Ls) -> 
     Ls;
@@ -2123,18 +2483,9 @@ command_bitrate_prev(State={S,_D}) when S#s.if_state =:= up ->
 command_bitrate_prev(State) ->
     State.
 
-%% set bitrate and sample_point
-command_bitrate(BitRate, SamplePoint, _State={S,D}) ->
-    SamplePoint1 = percent_to_sample_point(SamplePoint),
-    setopts(S#s.if_can, [{bitrate, BitRate}, {sample_point,SamplePoint1}]),
-    [{bitrate,BitRate1},{sample_point,SamplePoint2}] =
-	getopts(S#s.if_can, [bitrate, sample_point]),
-    SamplePoint3 = sample_point_to_percent(SamplePoint2),
-    State1 = {S#s { bitrate = BitRate1, sample_point = SamplePoint3 }, D},
-    set_status(State1),
-    epxw:invalidate(),
-    State1.
-
+%% set bitrate and sample_point (async)
+command_bitrate(BitRate, SamplePoint, State) ->
+    request_rate(bitrate, BitRate, SamplePoint, false, State).
 
 bitrate_index({S,_D}) ->
     if S#s.bitrate =:= undefined, S#s.bitrates =:= [] -> 0;
@@ -2189,18 +2540,276 @@ command_data_sample_point_prev(State={S,_D}) when  S#s.if_state =:= up ->
 		   end,
     command_datarate(S#s.datarate, SamplePoint1, State).
 
-%% set bitrate and sample_point
-command_datarate(DataRate, SamplePoint, _State={S,D}) ->
-    SamplePoint1 = percent_to_sample_point(SamplePoint),
-    _R = setopts(S#s.if_can, [{datarate,DataRate},
-			      {data_sample_point,SamplePoint1}]),
-    R1 = getopts(S#s.if_can, [datarate, data_sample_point]),
-    [{datarate,DataRate1},{data_sample_point,SamplePoint2}] = R1,
-    SamplePoint3 = sample_point_to_percent(SamplePoint2),
-    State1 = {S#s { datarate = DataRate1,data_sample_point=SamplePoint3}, D},
+%% set datarate and data_sample_point (async)
+command_datarate(DataRate, SamplePoint, State) ->
+    request_rate(datarate, DataRate, SamplePoint, false, State).
+
+%%
+%% Rates are set from a separate process. The driver may block for
+%% a long time (or forever) when the link is down, the GUI must not.
+%%
+request_rate(_Kind, _Rate, _SamplePoint, _FromInput, State={_S,D})
+  when D#d.rate_req =/= undefined ->
+    State;  %% busy, ignore
+request_rate(Kind, Rate, SamplePoint, FromInput, State={S,D}) ->
+    case precheck_rate(Kind, S) of
+	ok ->
+	    Ref = make_ref(),
+	    Self = self(),
+	    IfCan = S#s.if_can,
+	    SamplePoint1 = percent_to_sample_point(SamplePoint),
+	    spawn(fun() ->
+			  Result = try set_rate(IfCan, Kind, Rate, SamplePoint1)
+				   catch
+				       exit:{timeout,_} -> {error, timeout};
+				       C:R -> {error, {C,R}}
+				   end,
+			  Self ! {rate_result, Ref, Result}
+		  end),
+	    erlang:send_after(?RATE_TIMEOUT, self(), {rate_timeout, Ref}),
+	    D1 = D#d { rate_req = {Ref, Kind, Rate, FromInput} },
+	    D2 = case D1#d.input of
+		     In = #input{} when FromInput ->
+			 D1#d { input = In#input { busy = true, error = "" }};
+		     _ -> D1
+		 end,
+	    epxw:invalidate(),
+	    {S, D2};
+	{error, Reason} ->
+	    rate_error(Reason, FromInput, State)
+    end.
+
+%% fast checks, done in the GUI process
+precheck_rate(_Kind, S) when S#s.if_state =/= up ->
+    {error, link_down};
+precheck_rate(datarate, S) when S#s.fd =/= true ->
+    {error, fd_not_enabled};
+precheck_rate(_Kind, S) ->
+    case S#s.if_can of
+	#if_can{if_pid=Pid} when is_pid(Pid) -> ok;
+	_ -> {error, link_down}
+    end.
+
+%% run in a separate process
+set_rate(IfCan=#if_can{if_mod=Mod,if_pid=Pid}, Kind, Rate, SamplePoint) ->
+    {RateOpt,RatesOpt,PointOpt} =
+	case Kind of
+	    bitrate -> {bitrate, bitrates, sample_point};
+	    datarate -> {datarate, datarates, data_sample_point}
+	end,
+    case Mod:ifstatus(Pid) of
+	{ok, active} ->
+	    [{RatesOpt,Rates}] = getopts(IfCan, [RatesOpt]),
+	    case can:rate_supported(Rate, Rates) of
+		false ->
+		    {error, not_supported};
+		true ->
+		    Res = setopts(IfCan, [{RateOpt,Rate},
+					  {PointOpt,SamplePoint}]),
+		    [{RateOpt,Rate1},{PointOpt,SamplePoint1}] =
+			getopts(IfCan, [RateOpt, PointOpt]),
+		    {setopts_result(Res, Rate, Rate1), Rate1, SamplePoint1}
+	    end;
+	{ok, paused} ->
+	    {error, link_paused};
+	_ ->
+	    {error, link_down}
+    end.
+
+%% check result from setopts
+setopts_result(Res, Rate, Rate1) when is_list(Res) ->
+    case [E || {_,E={error,_}} <- Res] of
+	[E|_] -> E;
+	[] when Rate =:= Rate1 -> ok;
+	[] -> {error, not_accepted}
+    end;
+setopts_result(_Res, _Rate, _Rate1) ->
+    {error, link_down}.
+
+%% result from set_rate process
+rate_result(Result, {S,D}) ->
+    {_Ref, Kind, Rate, FromInput} = D#d.rate_req,
+    D1 = D#d { rate_req = undefined },
+    {Status, S1} =
+	case Result of
+	    {Status0, Rate1, SamplePoint1} ->
+		Point = sample_point_to_percent(SamplePoint1),
+		{Status0,
+		 case Kind of
+		     bitrate ->
+			 S#s { bitrate = Rate1, sample_point = Point };
+		     datarate ->
+			 S#s { datarate = Rate1, data_sample_point = Point }
+		 end};
+	    Status0 ->
+		{Status0, S}
+	end,
+    State1 = {S1, D1},
+    set_status(State1),
+    epxw:invalidate(),
+    case Status of
+	ok when FromInput ->
+	    stop_input({add_user_rate(Kind, Rate, S1), D1});
+	ok ->
+	    State1;
+	{error, Reason} ->
+	    rate_error(Reason, FromInput, State1)
+    end.
+
+rate_error(Reason, true, {S,D=#d{input=In=#input{}}}) ->
+    epxw:invalidate(),
+    {S, D#d { input = In#input { busy = false,
+				 error = format_reason(Reason) }}};
+rate_error(Reason, _FromInput, State) ->
+    show_message("rate: "++format_reason(Reason), State).
+
+%% show message in status bar for a while
+show_message(Text, {S,D}) ->
+    Expire = erlang:monotonic_time(millisecond) + ?MESSAGE_TIME,
+    State1 = {S, D#d { message = {Text, Expire} }},
+    erlang:send_after(?MESSAGE_TIME, self(), message_expire),
     set_status(State1),
     epxw:invalidate(),
     State1.
+
+message_text(#d { message = {Text, Expire} }) ->
+    case erlang:monotonic_time(millisecond) < Expire of
+	true -> Text;
+	false -> ""
+    end;
+message_text(_) ->
+    "".
+
+%%
+%% Manual rate input (Alt+0 bitrate, Ctrl+0 datarate)
+%%   Syntax: <rate>[k|M][@<sample-point-percent>]
+%%   Examples: 83.3k  83333  2M  500k@87.5
+%%   Enter = set, Esc = cancel, Backspace = erase
+%%
+start_input(Kind, {S,D}) ->
+    epxw:invalidate(),
+    {S, D#d { input = #input { kind = Kind } }}.
+
+stop_input({S,D}) ->
+    epxw:invalidate(),
+    {S, D#d { input = undefined }}.
+
+input_key(Key, _Mod, State={_S,D}) when (D#d.input)#input.busy ->
+    if Key =:= 27; Key =:= escape -> stop_input(State);
+       true -> State   %% wait for driver
+    end;
+input_key(Key, _Mod, State={S,D}) ->
+    In = D#d.input,
+    Text = In#input.text,
+    case Key of
+	27 ->
+	    stop_input(State);
+	escape ->
+	    stop_input(State);
+	K when K =:= $\r; K =:= $\n; K =:= enter; K =:= kp_enter ->
+	    apply_input(State);
+	K when K =:= $\b; K =:= 127; K =:= delete; K =:= backspace ->
+	    Text1 = case Text of
+			"" -> "";
+			_ -> lists:droplast(Text)
+		    end,
+	    epxw:invalidate(),
+	    {S, D#d { input = In#input { text = Text1, error = "" }}};
+	C when is_integer(C), length(Text) < 16,
+	       ((C >= $0 andalso C =< $9) orelse
+		C =:= $. orelse C =:= $, orelse C =:= $@ orelse C =:= $% orelse
+		C =:= $k orelse C =:= $K orelse C =:= $m orelse C =:= $M) ->
+	    epxw:invalidate(),
+	    {S, D#d { input = In#input { text = Text++[C], error = "" }}};
+	_ ->
+	    State
+    end.
+
+apply_input(State={S,D}) ->
+    In = #input { kind = Kind, text = Text } = D#d.input,
+    case parse_rate(Text) of
+	{ok, Rate, SamplePoint0} ->
+	    SamplePoint = case SamplePoint0 of
+			      undefined when Kind =:= bitrate ->
+				  S#s.sample_point;
+			      undefined when Kind =:= datarate ->
+				  S#s.data_sample_point;
+			      _ ->
+				  SamplePoint0
+			  end,
+	    request_rate(Kind, Rate, SamplePoint, true, State);
+	error ->
+	    epxw:invalidate(),
+	    {S, D#d { input = In#input { error = "use e.g. 83.3k, 2M, "
+					 "500k@87.5" }}}
+    end.
+
+format_reason(Reason) when is_atom(Reason) ->
+    atom_to_list(Reason);
+format_reason(Reason) when is_list(Reason) ->
+    Reason;
+format_reason(Reason) ->
+    lists:flatten(io_lib:format("~p", [Reason])).
+
+%% add rate entered by user (kept during session)
+add_user_rate(bitrate, Rate, S) ->
+    S#s { user_bitrates = ordsets:add_element(Rate, S#s.user_bitrates),
+	  bitrates = ordsets:add_element(Rate, S#s.bitrates) };
+add_user_rate(datarate, Rate, S) ->
+    S#s { user_datarates = ordsets:add_element(Rate, S#s.user_datarates),
+	  datarates = ordsets:add_element(Rate, S#s.datarates) }.
+
+%% parse "83.3k", "500000", "2M", "500k@87.5" "1M@80%"
+%% return {ok, Rate, SamplePoint (per mille) | undefined} | error
+parse_rate(Text) ->
+    case string:split(string:trim(Text), "@") of
+	[RateText] ->
+	    case parse_rate_(RateText) of
+		{ok, Rate} -> {ok, Rate, undefined};
+		error -> error
+	    end;
+	[RateText, PtText] ->
+	    case {parse_rate_(RateText), parse_number(string:trim(PtText,
+								 trailing,
+								 "%"))} of
+		{{ok,Rate}, {ok,Pt}} when Pt >= ?MIN_SAMPLE_POINT/10,
+					  Pt =< ?MAX_SAMPLE_POINT/10 ->
+		    {ok, Rate, round(Pt*10)};
+		_ ->
+		    error
+	    end
+    end.
+
+parse_rate_(Text) ->
+    {Num, Mult} = case lists:reverse(Text) of
+		      [K|R] when K =:= $k; K =:= $K -> {lists:reverse(R), 1000};
+		      [M|R] when M =:= $m; M =:= $M -> {lists:reverse(R), 1000000};
+		      _ -> {Text, 1}
+		  end,
+    case parse_number(Num) of
+	{ok, N} when N > 0 ->
+	    Rate = round(N*Mult),
+	    if Rate >= 1000, Rate =< 20000000 -> {ok, Rate};
+	       true -> error
+	    end;
+	_ ->
+	    error
+    end.
+
+parse_number(Text0) ->
+    Text = [if C =:= $, -> $.; true -> C end || C <- Text0],
+    case string:to_float(Text) of
+	{F, ""} -> {ok, F};
+	_ ->
+	    case string:to_integer(Text) of
+		{I, ""} -> {ok, I};
+		_ ->
+		    case string:to_float(Text++"0") of  %% "83." 
+			{F, ""} -> {ok, F};
+			_ -> error
+		    end
+	    end
+    end.
 
 
 datarate_index({S,_D}) ->
@@ -2648,7 +3257,7 @@ redraw_anim_(_Pixels,_Area,'$end_of_table', Remove, Update, _State) ->
 %% +-----------+---------------+----------------+
 %% | Link: up  | Flags: Flags  | Status: busoff |
 %% +-----------+---------------+----------------+
-set_status(_State={S,_D}) ->
+set_status(_State={S,D}) ->
     LinkState = if S#s.pause ->
 			"Link: pause";
 		   true ->
@@ -2683,8 +3292,9 @@ set_status(_State={S,_D}) ->
 	    [] -> "State: ok";
 	    Es -> "State: "++ format_error(Es)
 	end,
-    Status = io_lib:format("~-12s ~-20s ~-15s", 
-			   [LinkState,LinkFlags,LinkError]),
+    Status = io_lib:format("~-12s ~-20s ~-15s ~s ~s", 
+			   [LinkState,LinkFlags,LinkError,
+			    tool_status(D), message_text(D)]),
     epxw:set_status_text(Status),
 
     AppName = S#s.app_name,
@@ -3358,6 +3968,18 @@ collect_bits_([], _Data, Acc) ->
     Acc.
 
 %% remove all frames
+%% reset frame counters and frequencies, keep frames and layouts
+reset_counters(_State={S,D}) ->
+    ets:delete_all_objects(S#s.frame_counter),
+    ets:delete_all_objects(S#s.frame_freq),
+    ets:insert(S#s.frame_counter, {all,0}),
+    Now = erlang:system_time(millisecond),
+    ets:foldl(fun({Key,_Frame}, _) ->
+		      ets:insert(S#s.frame_counter, {Key, 0}),
+		      ets:insert(S#s.frame_freq, {Key,Now,0,""})
+	      end, ok, S#s.frame),
+    {S, D#d{ frame_count = 0, frame_time = Now }}.
+
 clear_frames(_State={S,D}) ->
     ets:delete_all_objects(S#s.frame),
     %% ets:delete_all_objects(S#s.frame_layout),

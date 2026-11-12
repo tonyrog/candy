@@ -13,6 +13,7 @@
 -export([sleep/3]).
 -export([split_pid_data/1]).
 -export([mersa/1]).
+-export([start/2, start/3, stop/1, pause/1, resume/1]).
 
 -include_lib("can/include/can.hrl").
 
@@ -59,6 +60,64 @@ fold_file(File, Play, Params) ->
 	    end;
 	Error ->
 	    Error
+    end.
+
+%%
+%% Play File to process Target in a separate process (Target get
+%% #can_frame{} messages). Target get {candy_play, Pid, {done,Result}}
+%% when the file is played. Playback may be paused/resumed/stopped.
+%%
+-spec start(File::string(), Target::pid()) -> {ok, pid()}.
+start(File, Target) ->
+    start(File, Target, #{}).
+
+start(File, Target, Params) ->
+    Pid = spawn_link(fun() ->
+			     Result = fold_file(File, fun play_to/6,
+						Params#{ target => Target }),
+			     Target ! {candy_play, self(), {done, Result}}
+		     end),
+    {ok, Pid}.
+
+stop(Pid) -> Pid ! {candy_play, stop}, ok.
+pause(Pid) -> Pid ! {candy_play, pause}, ok.
+resume(Pid) -> Pid ! {candy_play, resume}, ok.
+
+%% Acc is the total paused time in microseconds
+play_to(Frame, rx, _Hw, Params, Time0, Acc) ->
+    Paused0 = if is_integer(Acc) -> Acc; true -> 0 end,
+    TimeScale = maps:get(time_scale, Params, 1),
+    Ts = Frame#can_frame.ts,
+    Offset = if is_number(Ts), Ts > 0 -> round(1000*Ts*TimeScale);
+		true -> 0
+	     end,
+    Paused1 = wait_until(Time0 + Offset, Paused0),
+    maps:get(target, Params) ! Frame#can_frame { ts=?CAN_NO_TIMESTAMP },
+    Paused1;
+play_to(_Frame, _Dir, _Hw, _Params, _Time0, Acc) ->
+    Acc.
+
+%% wait until time T (+ paused time) while handling control messages
+wait_until(T, Paused) ->
+    Now = current_time(),
+    Wait = (T + Paused - Now) div 1000,
+    receive
+	{candy_play, stop} ->
+	    exit(normal);
+	{candy_play, pause} ->
+	    wait_until(T, Paused + paused());
+	{candy_play, resume} ->
+	    wait_until(T, Paused)
+    after max(0, Wait) ->
+	    Paused
+    end.
+
+%% wait for resume, return time paused
+paused() ->
+    T0 = current_time(),
+    receive
+	{candy_play, stop} -> exit(normal);
+	{candy_play, resume} -> current_time() - T0
     end.
 
 %% callback to playback a rx frame followed by a delay

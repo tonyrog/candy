@@ -8,6 +8,7 @@
 -module(candy_record).
 
 -export([file/1]).
+-export([start/1, stop/1]).
 -export([format_ts/2, format_type/1, format_id/1, format_data/1]).
 -compile(export_all).
 
@@ -40,6 +41,55 @@ file(Filename, TimeoutMs) ->
 	    end;
 	Error ->
 	    Error
+    end.
+
+%%
+%% Start a recorder process writing all received frames to File.
+%% The file is truncated. Time offsets are taken from the time of
+%% arrival (driver timestamps are not used).
+%%
+-spec start(File::string()) -> {ok, pid()} | {error, term()}.
+start(File) ->
+    Parent = self(),
+    Pid = spawn_link(fun() -> rec_init(Parent, File) end),
+    receive
+	{Pid, Result} -> Result
+    end.
+
+%% stop recorder, return number of recorded frames
+-spec stop(Pid::pid()) -> {ok, non_neg_integer()} | {error, term()}.
+stop(Pid) ->
+    Pid ! {stop, self()},
+    receive
+	{Pid, Result} -> Result
+    after 5000 ->
+	    exit(Pid, kill),
+	    {error, timeout}
+    end.
+
+rec_init(Parent, File) ->
+    case file:open(File, [write, {delayed_write, 65536, 500}]) of
+	{ok, Fd} ->
+	    can_router:attach(),
+	    StartTime = erlang:system_time(),
+	    save_header(Fd, StartTime, filename:rootname(File)),
+	    Parent ! {self(), {ok, self()}},
+	    rec_loop(Fd, 1, StartTime);
+	Error ->
+	    Parent ! {self(), Error}
+    end.
+
+rec_loop(Fd, I, Time) ->
+    receive
+	Frame = #can_frame{} ->
+	    save_frame(Fd, I, Time, Frame#can_frame { ts=?CAN_NO_TIMESTAMP }),
+	    rec_loop(Fd, I+1, Time);
+	{stop, From} ->
+	    can_router:detach(),
+	    file:close(Fd),
+	    From ! {self(), {ok, I-1}};
+	_Other ->
+	    rec_loop(Fd, I, Time)
     end.
 
 save_header(Fd, StartTime, Filename) ->
